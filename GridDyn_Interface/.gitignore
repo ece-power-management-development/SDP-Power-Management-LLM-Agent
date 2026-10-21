@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+cases/*
+reports/*
+!reports/.gitkeep
