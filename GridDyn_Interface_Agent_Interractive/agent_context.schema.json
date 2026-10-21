@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/griddyn-helics-agent-context.schema.json",
+  "title": "GridDyn HELICS Agent Context",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "packet_type",
+    "packet_id",
+    "generated_at_utc",
+    "source",
+    "simulation",
+    "observations",
+    "events",
+    "quality",
+    "unknowns",
+    "decision_boundary"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "packet_type": {"const": "grid_state_context"},
+    "packet_id": {"type": "string"},
+    "generated_at_utc": {"type": "string", "format": "date-time"},
+    "source": {
+      "type": "object",
+      "required": ["federate", "mode", "system", "gateway_status"],
+      "properties": {
+        "federate": {"type": "string"},
+        "mode": {"type": "string"},
+        "system": {"type": "string"},
+        "helics_version": {"type": ["string", "null"]},
+        "gateway_status": {"type": "string"},
+        "gateway_status_detail": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "simulation": {
+      "type": "object",
+      "required": ["time_s", "time_unit", "time_known"],
+      "properties": {
+        "time_s": {"type": ["number", "null"]},
+        "time_unit": {"const": "s"},
+        "time_known": {"type": "boolean"}
+      }
+    },
+    "observations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["observation_id", "value", "unit", "data_type", "source_kind", "quality", "evidence_id"],
+        "properties": {
+          "observation_id": {"type": "string"},
+          "semantic": {"type": "string"},
+          "asset_id": {"type": ["string", "null"]},
+          "value": {},
+          "unit": {"type": "string"},
+          "data_type": {"type": "string"},
+          "source_kind": {"type": "string"},
+          "source_interface": {"type": "string"},
+          "helics_key": {"type": "string"},
+          "sim_time_s": {"type": ["number", "null"]},
+          "last_update_time_s": {"type": ["number", "null"]},
+          "updated_at_utc": {"type": "string", "format": "date-time"},
+          "quality": {"enum": ["fresh", "held", "stale", "missing", "invalid"]},
+          "evidence_id": {"type": "string"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["event_id", "source_endpoint", "destination_endpoint", "payload", "sim_time_s", "received_at_utc", "evidence_id"],
+        "properties": {
+          "event_id": {"type": "string"},
+          "source_endpoint": {"type": "string"},
+          "destination_endpoint": {"type": "string"},
+          "payload": {},
+          "payload_encoding": {"type": "string"},
+          "sim_time_s": {"type": ["number", "null"]},
+          "received_at_utc": {"type": "string", "format": "date-time"},
+          "source_kind": {"type": "string"},
+          "evidence_id": {"type": "string"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "alerts": {"type": "array"},
+    "quality": {
+      "type": "object",
+      "required": ["overall", "stale_observation_count", "missing_observation_count", "conflict_count"],
+      "properties": {
+        "overall": {"type": "string"},
+        "stale_observation_count": {"type": "integer", "minimum": 0},
+        "missing_observation_count": {"type": "integer", "minimum": 0},
+        "conflict_count": {"type": "integer", "minimum": 0}
+      }
+    },
+    "unknowns": {"type": "array", "items": {"type": "string"}},
+    "decision_boundary": {
+      "type": "object",
+      "required": ["mode", "read_operations", "write_operations", "must_not_infer"],
+      "properties": {
+        "mode": {"const": "advisory_only"},
+        "read_operations": {"type": "array", "items": {"type": "string"}},
+        "write_operations": {"type": "array", "maxItems": 0},
+        "must_not_infer": {"type": "array", "items": {"type": "string"}},
+        "required_for_any_recommendation": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  },
+  "additionalProperties": true
+}

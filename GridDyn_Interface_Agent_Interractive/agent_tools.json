@@ -1,0 +1,52 @@
+{
+  "protocol": "local-http-json",
+  "base_url": "http://127.0.0.1:8766",
+  "service": "GridDyn HELICS Agent Gateway",
+  "read_only": true,
+  "tools": [
+    {
+      "name": "get_grid_context",
+      "method": "GET",
+      "path": "/v1/context",
+      "description": "Return the latest typed GridDyn/HELICS context packet, including observations, simulation time, events, data quality, unknowns, and decision boundaries."
+    },
+    {
+      "name": "get_grid_events",
+      "method": "GET",
+      "path": "/v1/events?limit=50",
+      "description": "Return recent HELICS endpoint messages with source, destination, simulation time, payload, and evidence IDs."
+    },
+    {
+      "name": "get_gateway_health",
+      "method": "GET",
+      "path": "/v1/health",
+      "description": "Return connection state, HELICS version, simulation time, counts, last update, and read-only status."
+    },
+    {
+      "name": "validate_agent_claims",
+      "method": "POST",
+      "path": "/v1/agent/validate",
+      "description": "Check that each proposed agent claim cites evidence_ids that exist in the current context packet. Body: {\"claims\":[{\"text\":\"...\",\"evidence_ids\":[\"obs:...\"]}]}"
+    },
+    {
+      "name": "preview_control_request",
+      "method": "POST",
+      "path": "/v1/command/preview",
+      "description": "Explicitly reject actuation attempts and return the safety boundary. This endpoint never sends a HELICS command."
+    },
+    {
+      "name": "get_context_schema",
+      "method": "GET",
+      "path": "/v1/schema",
+      "description": "Return the JSON Schema for the agent context packet."
+    }
+  ],
+  "agent_rules": [
+    "Use only evidence present in the latest context packet.",
+    "Do not convert missing, stale, or held values into current observations.",
+    "Keep observed, simulated, inferred, and recommended content separate.",
+    "Cite one or more evidence_ids for every numerical or causal claim.",
+    "If evidence is missing or contradictory, return insufficient_evidence.",
+    "Do not issue control actions through this gateway; require a separate human-approved control service."
+  ]
+}
