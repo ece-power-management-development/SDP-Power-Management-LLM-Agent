@@ -1,0 +1,199 @@
+version: 2.1
+
+commands:
+  setup_helics:
+    description: Configure and build HELICS with the job's CMake options.
+    steps:
+      - run:
+          name: setup_helics
+          command: |
+            mkdir -p build
+            cd build
+            eval cmake .. ${CMAKE_FLAGS}
+            make -j 4
+
+  run_helics_tests:
+    description: Run the CircleCI HELICS test suite.
+    steps:
+      - run:
+          name: run_helics_tests
+          command: |
+            scripts/run-circleci-tests.sh build
+            RESULT=$?
+            exit $RESULT
+
+  run_installer_tests:
+    description: Install HELICS and run package-discovery tests.
+    steps:
+      - run:
+          name: run_installer_tests
+          command: |
+            cd build
+            make install
+            ctest -V -R find-package-tests
+            ctest -V -R package-config-tests
+
+  run_benchmarks:
+    description: Run benchmark targets and collect their output.
+    steps:
+      - run:
+          name: run_benchmarks
+          command: |
+            mkdir /tmp/bm_results
+            cd build
+            make RUN_KEY_BENCHMARKS
+
+jobs:
+  helicsInstall1:
+    docker:
+      - image: helics/buildenv:ubuntu24.04-default-builder
+    environment:
+      CMAKE_FLAGS: "-DHELICS_BUILD_CXX_SHARED_LIB=ON -DHELICS_BUILD_TESTS=ON -DHELICS_BUILD_BENCHMARKS=ON -DHELICS_INSTALL_PACKAGE_TESTS=ON"
+    steps:
+      - checkout
+      - setup_helics
+      - run_installer_tests
+
+  helicsNoZmq:
+    docker:
+      - image: helics/buildenv:gcc13-builder
+    environment:
+      CMAKE_FLAGS: "-DHELICS_BUILD_CXX_SHARED_LIB=ON -DHELICS_ENABLE_ZMQ_CORE=OFF -DHELICS_ENABLE_IPC_CORE=OFF -DHELICS_BUILD_TESTS=ON"
+    steps:
+      - checkout
+      - setup_helics
+      - run_helics_tests
+
+  helicsTumbleweed:
+    docker:
+      - image: helics/buildenv:tumbleweed-builder
+    environment:
+      CMAKE_FLAGS: "-DHELICS_BUILD_CXX_SHARED_LIB=ON -DHELICS_ENABLE_ZMQ_CORE=OFF -DHELICS_ENABLE_IPC_CORE=OFF -DHELICS_ENABLE_UDP_CORE=OFF -DHELICS_BUILD_TESTS=ON -DCMAKE_CXX_STANDARD=20"
+    steps:
+      - checkout
+      - setup_helics
+
+  helicsInstall2:
+    docker:
+      - image: helics/buildenv:ubuntu24.04-default-builder
+    environment:
+      CMAKE_FLAGS: "-DHELICS_BUILD_TESTS=ON -DHELICS_INSTALL_PACKAGE_TESTS=ON"
+    steps:
+      - checkout
+      - setup_helics
+      - run_installer_tests
+
+  gcc14:
+    docker:
+      - image: helics/buildenv:gcc14-builder
+    resource_class: large
+    environment:
+      CMAKE_FLAGS: '-DHELICS_EXTRA_COMPILE_FLAGS=-Wredundant-tags -DCMAKE_CXX_FLAGS="-pedantic-errors" -DHELICS_BUILD_CXX_SHARED_LIB=ON -DHELICS_BUILD_TESTS=ON -DCMAKE_CXX_STANDARD=20'
+    steps:
+      - checkout
+      - setup_helics
+      - run_helics_tests
+
+  clang18:
+    docker:
+      - image: helics/buildenv:clang18-builder
+    environment:
+      CMAKE_FLAGS: '-DCMAKE_CXX_FLAGS="-pedantic-errors" -DHELICS_BUILD_CXX_SHARED_LIB=ON -DHELICS_BUILD_TESTS=ON -DCMAKE_CXX_STANDARD=20'
+    steps:
+      - checkout
+      - setup_helics
+      - run_helics_tests
+
+  clang18_cxx23:
+    docker:
+      - image: helics/buildenv:clang18-builder
+    environment:
+      CMAKE_FLAGS: "-DHELICS_BUILD_CXX_SHARED_LIB=ON -DHELICS_BUILD_TESTS=ON -DHELICS_BUILD_EXAMPLES=ON -DCMAKE_CXX_STANDARD=23"
+    steps:
+      - checkout
+      - setup_helics
+
+  benchmarkjob:
+    docker:
+      - image: helics/buildenv:ubuntu24.04-default-builder
+    environment:
+      CMAKE_FLAGS: "-DHELICS_BUILD_BENCHMARKS=ON -DBM_RESULT_DIR=/tmp/bm_results/ -DHELICS_DISABLE_C_SHARED_LIB=ON"
+    steps:
+      - checkout
+      - setup_helics
+      - run_benchmarks
+
+      - store_artifacts:
+          path: /tmp/bm_results
+
+  arm64:
+    machine:
+      image: ubuntu-2404:current
+    resource_class: arm.medium
+    environment:
+      CMAKE_FLAGS: "-DHELICS_BUILD_CXX_SHARED_LIB=OFF -DHELICS_BUILD_TESTS=ON -DHELICS_ZMQ_SUBPROJECT=ON -DHELICS_ZMQ_FORCE_SUBPROJECT=ON -DHELICS_DISABLE_BOOST=ON"
+    steps:
+      - checkout
+      - setup_helics
+      - run_helics_tests
+      - run:
+          name: system info
+          command: build/bin/helics_app --system
+
+workflows:
+  helics_test:
+    jobs:
+      - helicsInstall1:
+          filters:
+            branches:
+              ignore: /pre-commit\/.*/
+      - helicsInstall2:
+          filters:
+            branches:
+              ignore: /pre-commit\/.*/
+      - gcc14:
+          filters:
+            branches:
+              ignore: /pre-commit\/.*/
+      - clang18:
+          filters:
+            branches:
+              ignore: /pre-commit\/.*/
+      - clang18_cxx23:
+          filters:
+            branches:
+              ignore: /pre-commit\/.*/
+  dailies:
+    jobs:
+      - helicsTumbleweed:
+          filters:
+            branches:
+              only:
+                - dailies_tests
+      - helicsNoZmq:
+          filters:
+            branches:
+              only:
+                - dailies_tests
+  nightly:
+    triggers:
+      - schedule:
+          cron: "0 8 * * *"
+          filters:
+            branches:
+              only:
+                - main
+    jobs:
+      - helicsTumbleweed
+      - helicsNoZmq
+      - arm64
+  benchmark:
+    triggers:
+      - schedule:
+          cron: "17 9 * * 0,2,5"
+          filters:
+            branches:
+              only:
+                - main
+    jobs:
+      - benchmarkjob

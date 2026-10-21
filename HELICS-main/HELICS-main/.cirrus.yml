@@ -1,0 +1,14 @@
+freebsd_instance:
+  image_family: freebsd-15-0-amd64-ufs
+
+task:
+  skip: $CIRRUS_BRANCH == 'pre-commit/.*'
+  install_script: |
+    pkg install -y cmake libzmq4 ninja git
+  build_script: |
+    mkdir build && cd build
+    cmake -GNinja -DHELICS_BUILD_TESTS=ON -DHELICS_BUILD_EXAMPLES=ON -DCMAKE_CXX_STANDARD=20 ..
+    cmake --build .
+  test_script: |
+    cd build
+    ctest --output-on-failure --timeout 480 -C Release -L "SystemCI"

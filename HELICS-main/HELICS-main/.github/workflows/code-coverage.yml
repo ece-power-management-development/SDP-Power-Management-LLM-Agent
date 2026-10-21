@@ -1,0 +1,114 @@
+name: Code Coverage
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '15 09 * * *' # Run in the early hours of the morning (UTC)
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'coverage_')
+    runs-on: ubuntu-latest
+    container: helics/buildenv:ubuntu26.04-default-builder
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUILD_TYPE: Coverage
+      GCOV_TOOL: gcov
+      CMAKE_GENERATOR: Unix Makefiles
+      MAKEFLAGS: '-j 4'
+      DISABLE_INTERFACES: 'Java'
+      DISABLE_EXAMPLES: 'true'
+      DISABLE_CXX_SHARED: 'true'
+      
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+        submodules: recursive
+      if: github.event_name != 'schedule'
+
+    - name: Checkout main branch
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+        submodules: recursive
+        ref: main
+      if: github.event_name == 'schedule'
+
+    - name: Build HELICS
+      run: |
+        unset VCPKG_ROOT
+        git config --global --add safe.directory ${GITHUB_WORKSPACE}
+        source scripts/setup-helics-ci-options.sh
+        mkdir -p build && cd build
+        ../scripts/ci-build.sh
+
+    - name: Run tests
+      working-directory: build
+      run: ../scripts/run-coverage-tests.sh
+
+    - name: Prepare coverage report
+      working-directory: build
+      run: |
+        lcov \
+          --rc geninfo_unexecuted_blocks=1 \
+          --ignore-errors gcov,mismatch,inconsistent,negative \
+          --capture \
+          --initial \
+          --directory . \
+          --output-file coverage.base
+        lcov \
+          --gcov-tool ${GCOV_TOOL} \
+          --rc geninfo_unexecuted_blocks=1 \
+          --ignore-errors gcov,mismatch,inconsistent,negative \
+          --capture \
+          --directory . \
+          --output-file coverage.info
+        lcov \
+          -a coverage.base \
+          -a coverage.info \
+          --ignore-errors inconsistent,corrupt \
+          --output-file coverage.total
+        lcov \
+          --remove coverage.total \
+          --ignore-errors inconsistent,unused,negative,corrupt,mismatch \
+          '/usr/*' \
+          '*/test/*' \
+          '*/tests/*' \
+          '*/ThirdParty/*' \
+          '*/dependencies/*' \
+          '*/examples/*' \
+          '*/interfaces/*' \
+          '*/benchmarks/*' \
+          '*/scripts/*' \
+          --output-file coverage.info.cleaned
+        lcov --list coverage.info.cleaned
+
+    - name: Upload coverage artifact
+      uses: actions/upload-artifact@v7
+      with:
+        if-no-files-found: error
+        name: coverage-report
+        path: build/coverage.info.cleaned
+
+    - name: Upload coverage results
+      uses: codecov/codecov-action@v7
+      with:
+        disable_search: true
+        files: build/coverage.info.cleaned
+        fail_ci_if_error: true
+        name: coverage-ubuntu2604
+        token: ${{ secrets.CODECOV_TOKEN }}
