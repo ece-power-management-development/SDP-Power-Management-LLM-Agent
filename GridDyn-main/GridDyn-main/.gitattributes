@@ -1,0 +1,26 @@
+* text=input
+
+*.bat text eol=crlf
+*.md text eol=lf
+*.json text eol=lf
+*.player text eol=lf
+
+*.jpg binary
+*.JPG binary
+*.png binary
+*.mat binary
+*.pdf binary
+*.fmu binary
+*.pptx binary
+
+*.cpp  diff=cpp
+*.hpp  diff=cpp
+*.c    diff=cpp
+*.h    diff=cpp
+*.py   diff=python
+*.m    diff=matlab
+*.cs   diff=csharp
+
+# Exclude dependencies and bundled test inputs from GitHub language statistics.
+/ThirdParty/** linguist-vendored=true
+/test/test_files/** linguist-vendored=true

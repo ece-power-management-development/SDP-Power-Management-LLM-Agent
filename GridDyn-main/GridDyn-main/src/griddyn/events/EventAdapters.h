@@ -1,0 +1,369 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "../gridDynDefinitions.hpp"
+#include "EventInterface.hpp"
+#include "core/CoreObject.h"
+#include "core/ObjectInterpreter.h"
+#include "core/ObjectOperatorInterface.hpp"
+#include <algorithm>
+#include <functional>
+#include <iostream>
+#include <memory>
+#include <type_traits>
+#include <utility>
+
+namespace griddyn {
+// template<class T>
+// struct is_shared_ptr : std::false_type {};
+
+// template<class T>
+// struct is_shared_ptr<std::shared_ptr<T>> : std::true_type {};
+/** @brief class for managing events of many types
+ class is a wrapper around a number of different kinds of discrete events
+*/
+class EventAdapter {
+  public:
+    id_type_t eventID;  //!< eventID for searching
+    bool m_remove_event = false;  //!< flag to remove the event after execution
+    bool two_part_execute = false;  //!< flag if the event has two parts
+    bool partB_turn = false;  //!< if we need to execute the second part only
+    bool partB_only = false;  //!< flag indicating we only run when partB runs
+    CoreTime m_period;  //!< the period of the event;
+    CoreTime m_nextTime;  //!< the next time the event is scheduled to execute
+    CoreTime partBdelay = timeZero;  //!< the delay between the first and second parts
+  private:
+    static std::atomic<id_type_t> eventCounter;  //!< counter for generating the unique event ID
+  public:
+    /** @brief constructor
+    @param[in] nextTime the trigger time for the event
+    @param[in] period the period of the event  (the event will trigger once per period starting at
+    nextTime
+    */
+    EventAdapter(CoreTime nextTime = maxTime, CoreTime period = timeZero);
+
+    /** @brief destructor*/
+    virtual ~EventAdapter();
+    /** do not allow copy construction (or any other automatic defined functions*/
+    EventAdapter(const EventAdapter& ev) = delete;
+    /** make a copy of the eventAdapter
+   @return a unique pointer to the clone
+    */
+    virtual std::unique_ptr<EventAdapter> clone() const;
+
+    /** clone the eventAdapter onto another object
+    @param[in] eA  the pointer to copy the event adapter information to (may be nullptr)
+    */
+    virtual void cloneTo(EventAdapter* eA) const;
+
+    /** Execute the pre-event portion of the event for two part execution events
+    @param[in] cTime the current execution time
+    */
+    virtual void executeA(CoreTime cTime);
+
+    /** Execute the event or partB of the event
+    @param[in] cTime the current execution time
+    */
+    virtual ChangeCode execute(CoreTime cTime);
+
+    /** @brief update the next event time*/
+    virtual void updateTime();
+    /** @brief update the target CoreObject
+    @param[in] newObject the new object
+    @param[in] mode update_mode direct or match
+    */
+    virtual void updateObject(CoreObject* newObject,
+                              ObjectUpdateMode mode = ObjectUpdateMode::DIRECT);
+    /** @brief get a list of all referenced objects*/
+    virtual void getObjects(std::vector<CoreObject*>& objects) const;
+    /** initialize the event if needed*/
+    virtual void initialize();
+    /** get the event code*/
+    virtual int eventCode() const;
+};
+
+bool compareEventAdapters(const std::shared_ptr<EventAdapter>& e1,
+                          const std::shared_ptr<EventAdapter>& e2);
+
+// TODO(pt): try to merge this adapter with the shared_ptr one
+template<class Y>
+class EventTypeAdapter: public EventAdapter {
+    static_assert(std::is_base_of<EventInterface, Y>::value,
+                  "classes must be inherited from EventInterface");
+
+  private:
+    Y* m_eventObj = nullptr;
+
+  public:
+    EventTypeAdapter() = default;
+    explicit EventTypeAdapter(Y* ge): m_eventObj(ge)
+    {
+        m_nextTime = ge->nextTriggerTime();
+        switch (ge->executionMode()) {
+            case EventExecutionMode::NORMAL:
+                break;
+            case EventExecutionMode::TWO_PART_EXECUTION:
+                two_part_execute = true;
+                break;
+            case EventExecutionMode::DELAYED:
+                two_part_execute = true;
+                partB_only = true;
+                break;
+            default:
+                break;
+        }
+    }
+
+    virtual void cloneTo(EventAdapter* eA) const override
+    {
+        EventAdapter::cloneTo(eA);
+        auto eta = dynamic_cast<EventTypeAdapter*>(eA);
+        if (eta == nullptr) {
+            return;
+        }
+        eta->m_eventObj = m_eventObj->clone();
+    }
+
+    virtual std::unique_ptr<EventAdapter> clone() const override
+    {
+        std::unique_ptr<EventAdapter> newAdapter = std::make_unique<EventTypeAdapter>();
+        EventTypeAdapter::cloneTo(newAdapter.get());
+        return newAdapter;
+    }
+
+    virtual void updateObject(CoreObject* newObject, ObjectUpdateMode mode) override
+    {
+        m_eventObj->updateObject(newObject, mode);
+        updateTime();
+    }
+    virtual void getObjects(std::vector<CoreObject*>& objects) const override
+    {
+        m_eventObj->getObjects(objects);
+    }
+    virtual ChangeCode execute(CoreTime cTime) override
+    {
+        ChangeCode retval = ChangeCode::NOT_TRIGGERED;  // EVENT_NOT_TRIGGERED
+        int excnt = 0;
+        while (m_nextTime <= cTime) {
+            auto ret = m_eventObj->trigger(cTime);
+            retval = (std::max)(ret, retval);
+            if (!(m_eventObj->isArmed())) {
+                m_remove_event = true;
+                break;
+            }
+            auto lastTime = m_nextTime;
+            updateTime();
+            excnt = (lastTime == m_nextTime) ? excnt + 1 : 0;
+            if (excnt > 4) {
+                std::cerr << "Event time not updating\n";
+                m_remove_event = true;
+                break;
+            }
+        }
+        return retval;
+    }
+    virtual void updateTime() override { m_nextTime = m_eventObj->nextTriggerTime(); }
+
+    virtual void initialize() override { m_eventObj->initialize(); }
+    virtual int eventCode() const override { return m_eventObj->eventCode(); }
+};
+
+template<class Y>
+class EventTypeAdapter<std::shared_ptr<Y>>: public EventAdapter {
+    static_assert(std::is_base_of<EventInterface, Y>::value,
+                  "classes must be inherited from EventInterface");
+
+  private:
+    std::shared_ptr<Y> m_eventObj;
+
+  public:
+    EventTypeAdapter() = default;
+    explicit EventTypeAdapter(std::shared_ptr<Y> ge): m_eventObj(std::move(ge))
+    {
+        m_nextTime = m_eventObj->nextTriggerTime();
+        switch (m_eventObj->executionMode()) {
+            case EventExecutionMode::NORMAL:
+                break;
+            case EventExecutionMode::TWO_PART_EXECUTION:
+                two_part_execute = true;
+                break;
+            case EventExecutionMode::DELAYED:
+                two_part_execute = true;
+                partB_only = true;
+                break;
+            default:
+                break;
+        }
+    }
+
+    virtual void cloneTo(EventAdapter* eA) const override
+    {
+        EventAdapter::cloneTo(eA);
+        auto eta = dynamic_cast<EventTypeAdapter*>(eA);
+        if (eta == nullptr) {
+            return;
+        }
+        auto evO = m_eventObj->clone();
+        eta->m_eventObj = std::shared_ptr<Y>(static_cast<Y*>(evO.release()));
+    }
+
+    virtual std::unique_ptr<EventAdapter> clone() const override
+    {
+        std::unique_ptr<EventAdapter> newAdapter = std::make_unique<EventTypeAdapter>();
+        EventTypeAdapter::cloneTo(newAdapter.get());
+        return newAdapter;
+    }
+
+    virtual void updateObject(CoreObject* newObject, ObjectUpdateMode mode) override
+    {
+        m_eventObj->updateObject(newObject, mode);
+        updateTime();
+    }
+
+    virtual void getObjects(std::vector<CoreObject*>& objects) const override
+    {
+        m_eventObj->getObjects(objects);
+    }
+    ChangeCode execute(CoreTime cTime) override
+    {
+        ChangeCode retval = ChangeCode::NOT_TRIGGERED;  // EVENT_NOT_TRIGGERED
+        int excnt = 0;  //!< counter for protection against an event not behaving properly
+        while (m_nextTime <= cTime) {
+            auto ret = m_eventObj->trigger(cTime);
+            retval = (std::max)(ret, retval);
+            if (!(m_eventObj->isArmed())) {
+                m_remove_event = true;
+                break;
+            }
+            auto lastTime = m_nextTime;
+            updateTime();
+            excnt = (lastTime == m_nextTime) ? excnt + 1 : 0;
+            if (excnt > 4) {
+                std::cerr << "Event time not updating\n";
+                m_remove_event = true;
+                break;
+            }
+        }
+        return retval;
+    }
+
+    virtual void updateTime() override { m_nextTime = m_eventObj->nextTriggerTime(); }
+    virtual void initialize() override { m_eventObj->initialize(); }
+    virtual int eventCode() const override { return m_eventObj->eventCode(); }
+};
+
+class CoreObject;
+
+template<>
+class EventTypeAdapter<CoreObject>: public EventAdapter {
+  private:
+    CoreObject* targetObject = nullptr;
+    int evCode_ = 0;
+
+  public:
+    EventTypeAdapter() = default;
+    explicit EventTypeAdapter(CoreObject* gco): targetObject(gco)
+    {
+        m_nextTime = targetObject->getNextUpdateTime();
+        two_part_execute = true;
+        evCode_ = gco->getInt("eventcode");
+    }
+
+    virtual void updateObject(CoreObject* newObject, ObjectUpdateMode mode) override
+    {
+        if (mode == ObjectUpdateMode::DIRECT) {
+            targetObject = newObject;
+        } else if (mode == ObjectUpdateMode::MATCH) {
+            auto searchRes = findMatchingObject(targetObject, newObject);
+            if (searchRes) {
+                targetObject = searchRes;
+            } else {
+                throw(ObjectUpdateFailException());
+            }
+        }
+        m_nextTime = (targetObject) ? targetObject->getNextUpdateTime() : maxTime;
+    }
+
+    virtual void cloneTo(EventAdapter* eA) const override
+    {
+        EventAdapter::cloneTo(eA);
+        auto eca = dynamic_cast<EventTypeAdapter<CoreObject>*>(eA);
+        if (eca == nullptr) {
+            return;
+        }
+        eca->targetObject = targetObject;
+    }
+
+    virtual std::unique_ptr<EventAdapter> clone() const override
+    {
+        std::unique_ptr<EventAdapter> newAdapter = std::make_unique<EventTypeAdapter<CoreObject>>();
+        EventTypeAdapter<CoreObject>::cloneTo(newAdapter.get());
+        return newAdapter;
+    }
+
+    virtual void executeA(CoreTime cTime) override { targetObject->updateA(cTime); }
+
+    virtual ChangeCode execute(CoreTime cTime) override
+    {
+        targetObject->updateB();
+        CoreTime time = targetObject->getNextUpdateTime();
+        if ((time <= cTime) && (time <= m_nextTime)) {
+            m_nextTime = maxTime;
+        } else {
+            m_nextTime = time;
+        }
+        return ChangeCode::NO_CHANGE;
+    }
+
+    virtual void updateTime() override { m_nextTime = targetObject->getNextUpdateTime(); }
+
+    virtual int eventCode() const override { return evCode_; }
+
+    CoreObject* getTarget() const { return targetObject; }
+};
+/** eventAdapter with a custom function call
+ */
+class FunctionEventAdapter: public EventAdapter {
+  public:
+    using ccode_function_t = std::function<ChangeCode()>;
+
+  private:
+    ccode_function_t fptr;  //!< the function to execute
+    int evCode_ = 0;  //!< the event return code
+  public:
+    /**default constructor*/
+    FunctionEventAdapter() = default;
+    /** constructor with explicit function*/
+    explicit FunctionEventAdapter(ccode_function_t fcal);
+
+    /** constructor from function, time and period
+    @param[in] fcal the function to execute at the trigger time
+    @param triggerTime the time to execute the function
+    @param period if greater than 0 the function will execute with the specified period after
+    triggerTIme
+    */
+    FunctionEventAdapter(ccode_function_t fcal, CoreTime triggerTime, CoreTime period = 0.0);
+
+    virtual std::unique_ptr<EventAdapter> clone() const override;
+
+    virtual void cloneTo(EventAdapter* ea) const override;
+
+    virtual ChangeCode execute(CoreTime cTime) override;
+
+    /** @brief set the function of the event adapter
+     *@param[in] nfptr  a std::function which returns a change code and takes 0 arguments*/
+    void setfunction(ccode_function_t nfptr);
+    /** set the event code*/
+    void setEventCode(int evCode) { evCode_ = evCode; }
+    virtual int eventCode() const override { return evCode_; }
+    /** set the mode of execution of the event
+     */
+    void setExecutionMode(EventExecutionMode newMode);
+};
+
+}  // namespace griddyn

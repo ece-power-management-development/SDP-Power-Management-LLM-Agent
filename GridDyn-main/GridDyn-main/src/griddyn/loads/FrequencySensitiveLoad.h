@@ -1,0 +1,80 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "../Load.h"
+#include <string>
+namespace griddyn::loads {
+/** primary load class supports 3 main types of loads  constant power, constant impedance,
+constant current these loads should for the basis of most non dynamic load models following the ZIP
+model Z-constant impedance, I-constant current, P- constant Power
+*/
+class FrequencySensitiveLoad: public GridLoad {
+  private:
+    double dPdf = 0.0;  //!< factor for determining how sensitive Pout is to frequency
+    double Pout = 0.0;  //!< Pout before applying frequency variation
+    double Qout = 0.0;  //!< Qout before applying frequency variation
+  protected:
+    model_parameter M = 0.0;  //!< load droop factor
+    model_parameter H = 0.0;  //!< load inertia used in computing dPdf
+    // TODO(Design): This wrapper is not fully wired up yet. The ownership and lifecycle of
+    // subLoad, along with how this class should behave before a wrapped load is attached,
+    // needs to be defined and implemented consistently.
+    GridLoad* subLoad = nullptr;  //!< pointer to the subload type
+  public:
+    explicit FrequencySensitiveLoad(const std::string& objName = "load_$");
+
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+    virtual void pFlowObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+
+    virtual void dynObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+
+    virtual void timestep(CoreTime time, const IOdata& inputs, const SolverMode& sMode) override;
+    virtual void getParameterStrings(stringVec& pstr, ParamStringType pstype) const override;
+
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+    virtual void setFlag(std::string_view flag, bool val = true) override;
+
+    virtual double get(std::string_view param,
+                       units::unit unitType = units::defunit) const override;
+
+    virtual void updateLocalCache(const IOdata& inputs,
+                                  const StateData& stateData,
+                                  const SolverMode& sMode) override;
+    /** update the actual outputs with a frequency related calculation*/
+    virtual void updateOutputs(double frequency);
+    virtual void setState(CoreTime time,
+                          const double state[],
+                          const double dstateDt[],
+                          const SolverMode& sMode) override;
+
+    virtual void ioPartialDerivatives(const IOdata& inputs,
+                                      const StateData& sD,
+                                      MatrixData<double>& md,
+                                      const IOlocs& inputLocs,
+                                      const SolverMode& sMode) override;
+    virtual void outputPartialDerivatives(const IOdata& inputs,
+                                          const StateData& stateData,
+                                          MatrixData<double>& matrixData,
+                                          const SolverMode& sMode) override;
+    virtual count_t outputDependencyCount(index_t num, const SolverMode& sMode) const override;
+
+    virtual double getRealPower(const IOdata& inputs,
+                                const StateData& stateData,
+                                const SolverMode& sMode) const override;
+    virtual double getReactivePower(const IOdata& inputs,
+                                    const StateData& stateData,
+                                    const SolverMode& sMode) const override;
+    virtual double getRealPower(double V) const override;
+    virtual double getReactivePower(double V) const override;
+    virtual double getRealPower() const override;
+    virtual double getReactivePower() const override;  // for saving the state
+};
+
+}  // namespace griddyn::loads

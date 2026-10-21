@@ -1,0 +1,44 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "../griddyn/GridBus.h"
+#include <string>
+namespace griddyn::helicsLib {
+class HelicsCoordinator;
+/** class meant to implement a Ghost Bus
+@details the bus gets its voltage from another simulation, otherwise it acts pretty much like an
+infinite bus*/
+class HelicsGhostBus: public GridBus {
+  protected:
+    std::string voltageKey;  //!< the key to send voltage
+    std::string loadKey;  //!< time series containing the load information
+    int32_t voltageIndex;  //!< reference indices for the voltage
+    int32_t loadIndex;  //!< reference indices for the load
+    units::unit outUnits = units::defunit;
+    HelicsCoordinator* coordinator_ = nullptr;
+
+  public:
+    explicit HelicsGhostBus(const std::string& objName = "helicsGhostbus_$");
+
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+    virtual void pFlowObjectInitializeA(CoreTime time0, uint32_t flags) override;
+    virtual void pFlowObjectInitializeB() override;
+
+    virtual void updateA(CoreTime time) override;
+    virtual CoreTime updateB() override;
+    virtual void timestep(CoreTime ttime, const IOdata& inputs, const SolverMode& sMode) override;
+    virtual void setFlag(const std::string& param, bool val = true) override;
+    virtual void set(const std::string& param, const std::string& val) override;
+    virtual void
+        set(const std::string& param, double val, units::unit unitType = units::defunit) override;
+
+  private:
+    void updateSubscription();
+};
+
+}  // namespace griddyn::helicsLib

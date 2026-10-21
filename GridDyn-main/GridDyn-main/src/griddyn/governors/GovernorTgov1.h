@@ -1,0 +1,82 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "GovernorIeeeSimple.h"
+#include "blocks/LeadLag.h"
+#include <string>
+#include <vector>
+
+namespace griddyn::governors {
+/**
+ * @brief PSS/e TGOV1 turbine governor.
+ *
+ * The valve state follows \f$\dot v=(-v+P_{ref}-\Delta\omega/R)/T_1\f$,
+ * with the PSS/e VMIN/VMAX limits.  ANDES publishes the turbine section in
+ * its output-state form,
+ * \f[
+ * T_3\dot p_m=v-p_m-T_2\dot v,
+ * \f]
+ * which has transfer function \f$(1-sT_2)/(1+sT_3)\f$ from valve position
+ * \f$v\f$ to turbine output \f$p_m\f$.  The mechanical output is
+ * \f$p_m-D_t\Delta\omega\f$.
+ *
+ * These equations match ANDES v2.0.0
+ * `andes/models/governor/tgov1.py`, TGOV1Model.
+ */
+class GovernorTgov1: public GovernorIeeeSimple {
+  public:
+  protected:
+    double Dt = 0.0;  //!< speed damping constant
+    /** Turbine lead-lag kernel; this governor retains ownership of its output-state realization. */
+    blocks::LeadLagKernel turbineTransfer;
+
+  public:
+    explicit GovernorTgov1(const std::string& objName = "govTgov1_#");
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+    virtual ~GovernorTgov1();
+    virtual void dynObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+    virtual void dynObjectInitializeB(const IOdata& inputs,
+                                      const IOdata& desiredOutput,
+                                      IOdata& fieldSet) override;
+
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+    virtual double get(std::string_view param,
+                       units::unit unitType = units::defunit) const override;
+    virtual index_t findIndex(std::string_view field, const SolverMode& sMode) const override;
+
+    virtual void residual(const IOdata& inputs,
+                          const StateData& stateData,
+                          double resid[],
+                          const SolverMode& sMode) override;
+    virtual void derivative(const IOdata& inputs,
+                            const StateData& stateData,
+                            double deriv[],
+                            const SolverMode& sMode) override;
+    virtual void algebraicUpdate(const IOdata& inputs,
+                                 const StateData& stateData,
+                                 double update[],
+                                 const SolverMode& sMode,
+                                 double alpha) override;
+    virtual void jacobianElements(const IOdata& inputs,
+                                  const StateData& stateData,
+                                  MatrixData<double>& matrixData,
+                                  const IOlocs& inputLocs,
+                                  const SolverMode& sMode) override;
+    virtual void timestep(CoreTime time, const IOdata& inputs, const SolverMode& sMode) override;
+    virtual void rootTest(const IOdata& inputs,
+                          const StateData& stateData,
+                          double roots[],
+                          const SolverMode& sMode) override;
+    virtual void rootTrigger(CoreTime time,
+                             const IOdata& inputs,
+                             const std::vector<int>& rootMask,
+                             const SolverMode& sMode) override;
+};
+}  // namespace griddyn::governors

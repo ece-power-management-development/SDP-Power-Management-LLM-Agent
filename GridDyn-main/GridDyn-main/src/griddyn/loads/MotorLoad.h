@@ -1,0 +1,175 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "../Load.h"
+#include "../griddyn_autogen.h"
+#include <string>
+#include <utility>
+#include <vector>
+namespace griddyn::loads {
+/** @brief class defining operations and equations for an induction motor load
+ */
+class MotorLoad: public GridLoad {
+  public:
+    /** @brief motor load flags*/
+    enum MotorLoadFlags {
+        INIT_TRANSIENT =
+            OBJECT_FLAG8,  //!< flag indicating that the motor starts with a load transient
+        STALLED = OBJECT_FLAG9,  //!< flag indicating that the motor is STALLED
+        RESETTABLE = OBJECT_FLAG10,  //!< flag indicating that the motor can be reset once stalled
+    };
+
+  protected:
+    model_parameter Pmot = -kBigNum;  //!< the mechanical power of the motor
+    model_parameter r = 0.01;  //!< the motor resistance
+    model_parameter x = 0.15;  //!< the motor impedance
+    model_parameter r1 = 0.05;  //!< primary resistance on the motor
+    model_parameter x1 = 0.15;  //!< primary inductance of the motor
+    model_parameter xm = 5.0;  //!< the inductive load of the motor
+    model_parameter H = 3.0;  //!< the inertial constant on the motor
+    model_parameter alpha = 1.0;  //!< alpha parameter for torque conversion
+    model_parameter beta = 0;  //!< beta parameter for torque conversion
+    model_parameter gamma = 0;  //!< gamma parameter for torque conversion
+    model_parameter a = 1.0;  //!< a parameter for torque conversion
+    model_parameter b = 0;  //!< b parameter for torque conversion
+    model_parameter c = 0;  //!< c parameter for torque conversion
+    model_parameter mBase = -100;  //!< system machine base
+    model_parameter Vcontrol =
+        1.0;  //!< whether the motor has some voltage controls for tweaking power (basically
+    //!< a transformer attached motor
+    model_parameter init_slip = -1.0;  //!< the initial slip of the motor
+    model_parameter scale = 1.0;  //!< scaling factor for the motor
+  public:
+    /** @brief constructor
+@param[in] objName  the name of the object
+*/
+    explicit MotorLoad(const std::string& objName = "motor_$");
+
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+
+  protected:
+    virtual void pFlowObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+    virtual void dynObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+    virtual void dynObjectInitializeB(const IOdata& inputs,
+                                      const IOdata& desiredOutput,
+                                      IOdata& fieldSet) override;
+
+  public:
+    virtual void set(std::string_view param, std::string_view val) override;
+
+    virtual double get(std::string_view param,
+                       units::unit unitType = units::defunit) const override;
+
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+
+    virtual void setState(CoreTime time,
+                          const double state[],
+                          const double dstateDt[],
+                          const SolverMode& sMode) override;  // for saving the state
+    virtual void guessState(CoreTime time,
+                            double state[],
+                            double dstateDt[],
+                            const SolverMode& sMode) override;
+    virtual StateSizes localStateSizes(const SolverMode& sMode) const override;
+
+    virtual count_t localJacobianCount(const SolverMode& sMode) const override;
+
+    virtual std::pair<count_t, count_t> LocalRootCount(const SolverMode& sMode) const override;
+
+    virtual void residual(const IOdata& inputs,
+                          const StateData& stateDataValue,
+                          double resid[],
+                          const SolverMode& sMode) override;
+
+    virtual void derivative(const IOdata& inputs,
+                            const StateData& stateDataValue,
+                            double deriv[],
+                            const SolverMode& sMode)
+        override;  // return D[0]=dP/dV D[1]=dP/dtheta,D[2]=dQ/dV,D[3]=dQ/dtheta
+
+    virtual void outputPartialDerivatives(const IOdata& inputs,
+                                          const StateData& stateDataValue,
+                                          MatrixData<double>& matrixDataValue,
+                                          const SolverMode& sMode) override;
+    virtual count_t outputDependencyCount(index_t num, const SolverMode& sMode) const override;
+    virtual void ioPartialDerivatives(const IOdata& inputs,
+                                      const StateData& stateDataValue,
+                                      MatrixData<double>& matrixDataValue,
+                                      const IOlocs& inputLocs,
+                                      const SolverMode& sMode) override;
+    virtual void jacobianElements(const IOdata& inputs,
+                                  const StateData& stateDataValue,
+                                  MatrixData<double>& matrixDataValue,
+                                  const IOlocs& inputLocs,
+                                  const SolverMode& sMode) override;
+    virtual void getStateName(stringVec& stNames,
+                              const SolverMode& sMode,
+                              const std::string& prefix) const override;
+
+    virtual void rootTest(const IOdata& inputs,
+                          const StateData& stateDataValue,
+                          double roots[],
+                          const SolverMode& sMode) override;
+    virtual void rootTrigger(CoreTime time,
+                             const IOdata& inputs,
+                             const std::vector<int>& rootMask,
+                             const SolverMode& sMode) override;
+    virtual ChangeCode rootCheck(const IOdata& inputs,
+                                 const StateData& stateDataValue,
+                                 const SolverMode& sMode,
+                                 CheckLevel level) override;
+
+    /** @brief compute the mechanical torque on the motor as a function of slip
+@param[in]  slip  the slip on the motor
+@return the mechanical output power
+*/
+    virtual double mechPower(double slip) const;
+    /** @brief compute the partial derivative of the torque with respect to the slip
+@param[in]  slip  the slip on the motor
+@return dTorque/dslip
+*/
+    virtual double dmechds(double slip) const;
+
+    virtual index_t findIndex(std::string_view field, const SolverMode& sMode) const override;
+    virtual void timestep(CoreTime time, const IOdata& inputs, const SolverMode& sMode) override;
+
+    virtual double getRealPower(const IOdata& inputs,
+                                const StateData& stateDataValue,
+                                const SolverMode& sMode) const override;
+    virtual double getReactivePower(const IOdata& inputs,
+                                    const StateData& stateDataValue,
+                                    const SolverMode& sMode) const override;
+    virtual double getRealPower(double V) const override;
+    virtual double getReactivePower(double V) const override;
+    virtual double getRealPower() const override;
+    virtual double getReactivePower() const override;
+
+  protected:
+    /** @brief compute the slip based on an elecrical load
+@param[in] ptarget  the electrical load of the motor
+@return the computed slip
+*/
+    double computeSlip(double ptarget) const;
+
+    /** @brief compute the real load of the motor based on voltage and slip
+@param[in] vin  the the motor terminal voltage
+@param[in] slip the slip of the motor
+@return the computed real electrical load
+*/
+    double rPower(double vin, double slip) const;
+
+    /** @brief compute the reactive load of the motor based on voltage and slip
+@param[in] vin  the the motor terminal voltage
+@param[in] slip the slip of the motor
+@return the computed reactive electrical load
+*/
+    double qPower(double vin, double slip) const;
+};
+
+}  // namespace griddyn::loads

@@ -1,0 +1,273 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "ExciterSEXS.h"
+
+#include "../Exciter.h"
+#include "../GridComponentHelperClasses.h"
+#include "../GridPrimary.h"
+#include "../gridDynDefinitions.hpp"
+#include "core/CoreExceptions.h"
+#include "core/CoreObject.h"
+#include "core/CoreObjectTemplates.hpp"
+#include "core/coreDefinitions.hpp"
+#include "solvers/SolverMode.hpp"
+#include "utilities/MatrixData.hpp"
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace griddyn::exciters {
+
+ExciterSEXS::ExciterSEXS(const std::string& objName): Exciter(objName)
+{
+    Ka = 12.0;
+    Ta = 0.1;
+    Tb = 0.46;
+    Te = 0.5;
+    Vrmin = -0.9;
+    Vrmax = 1.0;
+}
+
+CoreObject* ExciterSEXS::clone(CoreObject* obj) const
+{
+    auto* gdE = cloneBase<ExciterSEXS, Exciter>(this, obj);
+    if (gdE == nullptr) {
+        return obj;
+    }
+    gdE->Te = Te;
+    gdE->Tb = Tb;
+    return gdE;
+}
+
+void ExciterSEXS::dynObjectInitializeA(CoreTime /*time0*/, std::uint32_t flags)
+{
+    setInitialLimitPolicy(flags);
+    offsets.local().local.diffSize = 2;
+    offsets.local().local.jacSize = 6;
+    checkForLimits();
+}
+
+void ExciterSEXS::dynObjectInitializeB(const IOdata& inputs,
+                                       const IOdata& desiredOutput,
+                                       IOdata& fieldSet)
+{
+    const double originalUpperLimit = Vrmax;
+    Exciter::dynObjectInitializeB(inputs, desiredOutput, fieldSet);
+
+    auto* stateValues = m_state.data();
+    const auto vErr = Vref + vBias - inputs[VOLTAGE_IN_LOCATION];
+    if (Tb != 0.0) {
+        stateValues[1] = (stateValues[0] / Ka) - ((Ta / Tb) * vErr);
+        if ((stateValues[0] < Vrmin - 1e-7) ||
+            !adjustInitialUpperLimit(stateValues[0], Vrmax, "SEXS initial regulator output")) {
+            throw InvalidParameterValue("SEXS initial regulator output outside limits");
+        }
+        const double correction = std::max(0.0, Vrmax - originalUpperLimit);
+        const double guard = 1e-4 + std::abs(Ka) * 1e-5;
+        if ((Vrmax != 0.0) && (stateValues[0] >= Vrmax)) {
+            const double inputOverdrive = std::max(0.2 * correction, guard) / Ka;
+            vBias += inputOverdrive;
+            stateValues[1] += (1.0 - Ta / Tb) * inputOverdrive;
+            opFlags.set(TRIGGER_HIGH);
+            opFlags.set(OUTSIDE_VOLTAGE_LIMITS);
+        } else if (stateValues[0] <= Vrmin) {
+            const double inputOverdrive = guard / Ka;
+            vBias -= inputOverdrive;
+            stateValues[1] -= (1.0 - Ta / Tb) * inputOverdrive;
+            opFlags.reset(TRIGGER_HIGH);
+            opFlags.set(OUTSIDE_VOLTAGE_LIMITS);
+        }
+    } else {
+        stateValues[1] = 0.0;
+    }
+
+    m_dstate_dt[0] = 0.0;
+    m_dstate_dt[1] = 0.0;
+}
+
+void ExciterSEXS::set(std::string_view param, std::string_view val)
+{
+    Exciter::set(param, val);
+}
+
+void ExciterSEXS::set(std::string_view param, double val, units::unit unitType)
+{
+    if (param == "tb") {
+        Tb = val;
+    } else if (param == "te") {
+        Te = val;
+    } else {
+        Exciter::set(param, val, unitType);
+    }
+}
+
+stringVec ExciterSEXS::localStateNames() const
+{
+    return {"ef", "x"};
+}
+
+double ExciterSEXS::regulatorOutput(const IOdata& inputs, const double stateX) const
+{
+    const auto invTb = (Tb != 0.0) ? (1.0 / Tb) : 0.0;
+    const auto vErr = Vref + vBias - inputs[VOLTAGE_IN_LOCATION];
+    return Ka * (stateX + (Ta * invTb * vErr));
+}
+
+void ExciterSEXS::residual(const IOdata& inputs,
+                           const StateData& stateData,
+                           double resid[],
+                           const SolverMode& SolverMode)
+{
+    if (!hasDifferential(SolverMode)) {
+        return;
+    }
+
+    derivative(inputs, stateData, resid, SolverMode);
+
+    auto offset = offsets.getDiffOffset(SolverMode);
+    const auto* stateDerivatives = stateData.dstate_dt + offset;
+    resid[offset] -= stateDerivatives[0];
+    resid[offset + 1] -= stateDerivatives[1];
+}
+
+void ExciterSEXS::derivative(const IOdata& inputs,
+                             const StateData& stateData,
+                             double deriv[],
+                             const SolverMode& SolverMode)
+{
+    auto locations = offsets.getLocations(stateData, deriv, SolverMode, this);
+    const auto* exciterState = locations.diffStateLoc;
+    auto* derivatives = locations.destDiffLoc;
+
+    const auto invTe = (Te != 0.0) ? (1.0 / Te) : 0.0;
+    const auto invTb = (Tb != 0.0) ? (1.0 / Tb) : 0.0;
+    const auto vErr = Vref + vBias - inputs[VOLTAGE_IN_LOCATION];
+    const double regulatorVoltage = [&]() {
+        if (opFlags[OUTSIDE_VOLTAGE_LIMITS]) {
+            return opFlags[TRIGGER_HIGH] ? Vrmax : Vrmin;
+        }
+        return regulatorOutput(inputs, exciterState[1]);
+    }();
+
+    derivatives[0] = (-exciterState[0] + regulatorVoltage) * invTe;
+    derivatives[1] = (-exciterState[1] + ((1.0 - (Ta * invTb)) * vErr)) * invTb;
+}
+
+void ExciterSEXS::jacobianElements(const IOdata& /*inputs*/,
+                                   const StateData& stateData,
+                                   MatrixData<double>& matrix,
+                                   const IOlocs& inputLocs,
+                                   const SolverMode& SolverMode)
+{
+    if (!hasDifferential(SolverMode)) {
+        return;
+    }
+
+    auto offset = offsets.getDiffOffset(SolverMode);
+    const auto invTe = (Te != 0.0) ? (1.0 / Te) : 0.0;
+    const auto invTb = (Tb != 0.0) ? (1.0 / Tb) : 0.0;
+    matrix.assign(offset, offset, -invTe - stateData.cj);
+
+    if (!opFlags[OUTSIDE_VOLTAGE_LIMITS]) {
+        matrix.assign(offset, offset + 1, Ka * invTe);
+        matrix.assignCheckCol(offset, inputLocs[VOLTAGE_IN_LOCATION], -(Ka * Ta * invTb * invTe));
+    }
+
+    matrix.assign(offset + 1, offset + 1, -invTb - stateData.cj);
+    matrix.assignCheckCol(offset + 1,
+                          inputLocs[VOLTAGE_IN_LOCATION],
+                          -((1.0 - (Ta * invTb)) * invTb));
+}
+
+void ExciterSEXS::rootTest(const IOdata& inputs,
+                           const StateData& stateData,
+                           double root[],
+                           const SolverMode& SolverMode)
+{
+    auto offset = offsets.getDiffOffset(SolverMode);
+    auto rootOffset = offsets.getRootOffset(SolverMode);
+    const auto regulatorVoltage = regulatorOutput(inputs, stateData.state[offset + 1]);
+
+    if (opFlags[OUTSIDE_VOLTAGE_LIMITS]) {
+        root[rootOffset] =
+            opFlags[TRIGGER_HIGH] ? (Vrmax - regulatorVoltage) : (regulatorVoltage - Vrmin);
+    } else {
+        root[rootOffset] = std::min(Vrmax - regulatorVoltage, regulatorVoltage - Vrmin) + 0.00001;
+        if (regulatorVoltage >= Vrmax) {
+            opFlags.set(TRIGGER_HIGH);
+        }
+    }
+}
+
+void ExciterSEXS::rootTrigger(CoreTime time,
+                              const IOdata& inputs,
+                              const std::vector<int>& rootMask,
+                              const SolverMode& SolverMode)
+{
+    auto rootOffset = offsets.getRootOffset(SolverMode);
+    if (rootMask[rootOffset] == 0) {
+        return;
+    }
+
+    if (opFlags[OUTSIDE_VOLTAGE_LIMITS]) {
+        alert(this, JAC_COUNT_INCREASE);
+        opFlags.reset(OUTSIDE_VOLTAGE_LIMITS);
+        opFlags.reset(TRIGGER_HIGH);
+    } else {
+        const auto regulatorVoltage = regulatorOutput(inputs, m_state[1]);
+        opFlags.set(OUTSIDE_VOLTAGE_LIMITS);
+        if (regulatorVoltage >= Vrmax) {
+            opFlags.set(TRIGGER_HIGH);
+        } else {
+            opFlags.reset(TRIGGER_HIGH);
+        }
+        alert(this, JAC_COUNT_DECREASE);
+    }
+
+    const StateData state(time, m_state.data());
+    derivative(inputs, state, m_dstate_dt.data(), SolverMode);
+}
+
+ChangeCode ExciterSEXS::rootCheck(const IOdata& inputs,
+                                  const StateData& /*StateData*/,
+                                  const SolverMode& /*SolverMode*/,
+                                  CheckLevel /*level*/)
+{
+    const auto regulatorVoltage = regulatorOutput(inputs, m_state[1]);
+    auto ret = ChangeCode::NO_CHANGE;
+
+    if (opFlags[OUTSIDE_VOLTAGE_LIMITS]) {
+        if (opFlags[TRIGGER_HIGH]) {
+            if (regulatorVoltage < Vrmax) {
+                opFlags.reset(OUTSIDE_VOLTAGE_LIMITS);
+                opFlags.reset(TRIGGER_HIGH);
+                alert(this, JAC_COUNT_INCREASE);
+                ret = ChangeCode::JACOBIAN_CHANGE;
+            }
+        } else if (regulatorVoltage > Vrmin) {
+            opFlags.reset(OUTSIDE_VOLTAGE_LIMITS);
+            alert(this, JAC_COUNT_INCREASE);
+            ret = ChangeCode::JACOBIAN_CHANGE;
+        }
+    } else if (regulatorVoltage > Vrmax + 0.00001) {
+        opFlags.set(TRIGGER_HIGH);
+        opFlags.set(OUTSIDE_VOLTAGE_LIMITS);
+        alert(this, JAC_COUNT_DECREASE);
+        ret = ChangeCode::JACOBIAN_CHANGE;
+    } else if (regulatorVoltage < Vrmin - 0.00001) {
+        opFlags.reset(TRIGGER_HIGH);
+        opFlags.set(OUTSIDE_VOLTAGE_LIMITS);
+        alert(this, JAC_COUNT_DECREASE);
+        ret = ChangeCode::JACOBIAN_CHANGE;
+    }
+
+    return ret;
+}
+
+}  // namespace griddyn::exciters

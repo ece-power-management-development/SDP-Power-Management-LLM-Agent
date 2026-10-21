@@ -1,0 +1,138 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+// debug
+// #define DEBUG_IDA
+
+// header files
+#include "griddyn/GridDynSimulation.h"
+#include "griddyn/MatPowerCostCurve.h"
+#include "optimizerInterface.h"
+// libraries
+#include <array>
+#include <bitset>
+#include <cstdio>
+#include <fstream>
+#include <list>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace griddyn {
+// definitions for defining solution mode
+enum OptimizationType { DEFAULT_OPTIMIZATION, BIDSTACK, WATER, DCOPF, ACOPF };
+
+// additional flags the controlFlags bitset
+enum GridDynOptimizationFlags {
+
+};
+
+// for the status flags bitset
+
+// extra local flags
+enum GridDynOptimizationExtraFlags {
+
+};
+
+class OptimizationData;
+class GridAreaOpt;
+class GridOptObject;
+
+class GridDynOptimization: public GridDynSimulation, public MatPowerCostCurveProvider {
+  public:
+  protected:
+    // storageSpace for SUNDIALS solverInterface
+    std::vector<std::shared_ptr<OptimizerInterface>> mOptimizerData;
+    GridAreaOpt* mGridAreaOpt = nullptr;
+    std::string mDefaultOptMode;
+    std::string mDefaultOptimizerType = "basic";
+    // ---------------solution mode-------------
+    // total thread count
+
+    // list of object to PreExecute
+    int mConstraintCount = 0;
+    OptimizationType mOptimizationMode;
+
+  public:
+    GridDynOptimization(const std::string& simName = "gridDynOptSim_#");
+    ~GridDynOptimization();
+    CoreObject* clone(CoreObject* obj) const override;
+
+    void setOptimizationMode(OptimizationType omode)
+    {
+        if (omode != DEFAULT_OPTIMIZATION) {
+            mOptimizationMode = omode;
+        }
+    }
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+
+    virtual double get(std::string_view param,
+                       units::unit unitType = units::defunit) const override;
+
+    void setFlag(std::string_view flag, bool val = true) override;
+    void setFlags(size_t param, int val);
+    // void get(std::string param,int &val);
+    // void get(std::string param, double &val);
+
+    virtual CoreObject* find(std::string_view objName) const override;
+    virtual CoreObject* getSubObject(std::string_view typeName, index_t num) const override;
+    virtual CoreObject* findByUserID(std::string_view typeName, index_t searchID) const override;
+    /** find the economic data for a corresponding grid core object
+    @param[in] obj the object for which to find the corresponding economic data
+    */
+    virtual GridOptObject* getOptimizationObject(CoreObject* obj = nullptr);
+    virtual GridOptObject* makeOptimizationObjectPath(CoreObject* obj);
+    const MatPowerCostCurve* matPowerCostCurve(const Generator* generator,
+                                               bool reactive = false) const override;
+    void setGeneratorCostCurve(Generator* generator,
+                               const MatPowerCostCurve& curve,
+                               bool reactive = false);
+    std::shared_ptr<OptimizerInterface> getOptimizerInterface(const OptimizationMode& oMode);
+    std::shared_ptr<const OptimizerInterface>
+        getOptimizerInterface(const OptimizationMode& oMode) const;
+
+  protected:
+    OptimizerInterface* updateOptimizer(const OptimizationMode& oMode);
+
+    // SGS this was unused?
+    // void updateOffsets (const OptimizationMode &oMode);
+
+    // void pFlowJacobian(const double state[]);
+    OptimizerInterface* getOptimizerData(const OptimizationMode& oMode)
+    {
+        return (mOptimizerData[oMode.offsetIndex].get());
+    }
+
+    const OptimizerInterface* getOptimizerData(const OptimizationMode& oMode) const
+    {
+        return (mOptimizerData[oMode.offsetIndex].get());
+    }
+
+    void setMaxJacSize(const OptimizationMode& oMode, count_t ssize)
+    {
+        mOptimizerData[oMode.offsetIndex]->initializeJacArray(ssize);
+    }
+
+  public:
+    // void dynInitializeObjects(double initTime, double absInitTime);
+
+    /**
+     * Construct and initialize the optimization adapter tree from the same
+     * physical GridDyn hierarchy used by power-flow initialization, then size
+     * and distribute the numerical optimization variables and constraints.
+     */
+    void initializeOptimizationModel(const OptimizationMode& oMode,
+                                     int setupMode = 1,
+                                     std::uint32_t flags = 0);
+
+    void setupOptOffsets(const OptimizationMode& oMode, int setupMode);
+};
+
+}  // namespace griddyn

@@ -1,0 +1,118 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "MotorLoad3.h"
+#include <string>
+#include <vector>
+namespace griddyn::loads {
+/** @brief class implementing a model of a 3rd order induction motor
+ */
+class MotorLoad5: public MotorLoad3 {
+  private:
+    /** @brief private enumerations of state variable locations in powerflow*/
+    enum PLocA { irA = 0, imA = 1, slipA = 2, erpA = 3, empA = 4, erppA = 5, emppA = 6 };
+    /** @brief private enumerations of state variable locations in dynamic calculations*/
+    enum PLocD { slipD = 0, erpD = 1, empD = 2, erppD = 3, emppD = 4 };
+
+  protected:
+    int motorType = 1;  //!< PSS/E CIM motor topology: 1 (A) or 2 (B)
+    double r2 = 0.002;  //!< 3rd level loop resistance
+    double x2 = 0.04;  //!< 3 impedance loop reactance
+    double T0pp = 0.0;  //!< subtransient time constant
+    double xpp = 0.0;  //!< subtransient reactance
+    bool useDirectMachineParameters = false;
+    double directX0 = 0.0;
+    double directXp = 0.0;
+    double directXpp = 0.0;
+    double directT0p = 0.0;
+    double directT0pp = 0.0;
+
+  public:
+    /** @brief constructor
+@param[in] objName  the name of the object
+*/
+    explicit MotorLoad5(const std::string& objName = "motor5_$");
+
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+
+  protected:
+    virtual void pFlowObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+    virtual void dynObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+    virtual void dynObjectInitializeB(const IOdata& inputs,
+                                      const IOdata& desiredOutput,
+                                      IOdata& fieldSet) override;
+
+  public:
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+
+    virtual StateSizes localStateSizes(const SolverMode& sMode) const override;
+
+    virtual count_t localJacobianCount(const SolverMode& sMode) const override;
+
+    virtual void residual(const IOdata& inputs,
+                          const StateData& sD,
+                          double resid[],
+                          const SolverMode& sMode) override;
+    virtual void algebraicUpdate(const IOdata& inputs,
+                                 const StateData& sD,
+                                 double update[],
+                                 const SolverMode& sMode,
+                                 double alpha) override;
+
+    virtual void derivative(const IOdata& inputs,
+                            const StateData& sD,
+                            double deriv[],
+                            const SolverMode& sMode) override;
+    virtual void rootTest(const IOdata& inputs,
+                          const StateData& sD,
+                          double roots[],
+                          const SolverMode& sMode) override;
+    virtual void rootTrigger(CoreTime time,
+                             const IOdata& inputs,
+                             const std::vector<int>& rootMask,
+                             const SolverMode& sMode) override;
+    virtual ChangeCode rootCheck(const IOdata& inputs,
+                                 const StateData& sD,
+                                 const SolverMode& sMode,
+                                 CheckLevel level) override;
+
+    virtual void jacobianElements(const IOdata& inputs,
+                                  const StateData& sD,
+                                  MatrixData<double>& md,
+                                  const IOlocs& inputLocs,
+                                  const SolverMode& sMode) override;
+    virtual void getStateName(stringVec& stNames,
+                              const SolverMode& sMode,
+                              const std::string& prefix) const override;
+
+    virtual index_t findIndex(std::string_view field, const SolverMode& sMode) const override;
+    virtual void timestep(CoreTime time, const IOdata& inputs, const SolverMode& sMode) override;
+
+    // TODO(phlpt): Change to algebraic update.
+    virtual void
+        updateCurrents(const IOdata& inputs, const StateData& sD, const SolverMode& sMode) override;
+
+    virtual double mechPower(double slip) const override;
+    virtual double dmechds(double slip) const override;
+
+    /** PSS/E CIM saturation multiplier SE(|E''|)/|E''| and its Cartesian
+        derivatives.  The legacy five-state motor remains unsaturated. */
+    virtual double saturationFactor(double erpp, double empp) const;
+    virtual void saturationFactorDerivatives(double erpp,
+                                             double empp,
+                                             double& derivativeErpp,
+                                             double& derivativeEmpp) const;
+
+  protected:
+    /** @brief estimate the initial state values of the motor
+     */
+    virtual void converge();
+};
+}  // namespace griddyn::loads

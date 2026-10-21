@@ -1,0 +1,383 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "GovernorTgov1.h"
+
+#include "../Generator.h"
+#include "../GridBus.h"
+#include "core/CoreExceptions.h"
+#include "core/CoreObjectTemplates.hpp"
+#include "utilities/MatrixData.hpp"
+#include <algorithm>
+#include <cmath>
+#include <string>
+#include <vector>
+
+namespace griddyn::governors {
+using units::unit;
+namespace {
+    constexpr double powerLimitRootTolerance = 1e-5;
+}
+
+GovernorTgov1::GovernorTgov1(const std::string& objName): GovernorIeeeSimple(objName)
+{
+    // default values
+    K = 16.667;
+    // K = 0.5;
+    T1 = 0.5;
+    T2 = 1.0;
+    T3 = 1.0;
+    offsets.local().local.diffSize = 2;
+    offsets.local().local.algSize = 1;
+    offsets.local().local.jacSize = 10;
+    opFlags.set(IGNORE_DEADBAND);
+    opFlags.set(IGNORE_FILTER);
+    opFlags.set(IGNORE_THROTTLE);
+}
+
+CoreObject* GovernorTgov1::clone(CoreObject* obj) const
+{
+    auto* gov = cloneBase<GovernorTgov1, GovernorIeeeSimple>(this, obj);
+    if (gov == nullptr) {
+        return obj;
+    }
+    gov->Dt = Dt;
+    return gov;
+}
+
+// destructor
+GovernorTgov1::~GovernorTgov1() = default;
+
+void GovernorTgov1::dynObjectInitializeA(CoreTime time0, std::uint32_t flags)
+{
+    // ANDES TGOV1 uses a positive speed-regulation gain and two first-order
+    // lags.  Zero or negative values make the differential equations singular.
+    if (!std::isfinite(K) || !std::isfinite(T1) || !std::isfinite(T2) || !std::isfinite(T3) ||
+        !std::isfinite(Dt) || !std::isfinite(Pmax) || !std::isfinite(Pmin) || (K <= 0.0) ||
+        (T1 <= 0.0) || (T3 <= 0.0) || (Pmax < Pmin)) {
+        throw InvalidParameterValue("TGOV1 R, T1, T3, or valve limits");
+    }
+    // ANDES exposes the turbine output as its state and uses
+    // T3 * pmdot = valve - pm - T2 * valvedot.  This is the output-state
+    // realization of (1 - T2 s)/(1 + T3 s), hence the negative lead time.
+    turbineTransfer.setParameters(-T2, T3);
+    GovernorIeeeSimple::dynObjectInitializeA(time0, flags);
+}
+
+// initial conditions
+void GovernorTgov1::dynObjectInitializeB(const IOdata& /*inputs*/,
+                                         const IOdata& desiredOutput,
+                                         IOdata& fieldSet)
+{
+    const double originalUpperLimit = Pmax;
+    if (desiredOutput.empty() || !std::isfinite(desiredOutput[POUT_LOCATION]) ||
+        !adjustInitialUpperLimit(desiredOutput[POUT_LOCATION], "TGOV1 initial valve")) {
+        throw InvalidParameterValue("TGOV1 initial valve outside upper limit");
+    }
+    m_state[2] = desiredOutput[POUT_LOCATION];
+    m_state[1] = desiredOutput[POUT_LOCATION];
+    m_state[0] = desiredOutput[POUT_LOCATION];
+    fieldSet[govpSetInLocation] = desiredOutput[POUT_LOCATION];
+    if (opFlags[USES_POWER_LIMITS]) {
+        const double correction = std::max(0.0, Pmax - originalUpperLimit);
+        // TGOV1's speed input is scaled by K in the valve equation. Keep the
+        // initialized limit active through small speed perturbations by
+        // providing headroom in the same power-reference units as K*deltaW.
+        const double margin = std::max({0.2 * correction,
+                                        10.0 * powerLimitRootTolerance * K,
+                                        10.0 * powerLimitRootTolerance * T1});
+        if (m_state[1] >= Pmax) {
+            initialSetpointOverdrive = margin;
+            opFlags.set(POWER_LIMIT_HIGH);
+            opFlags.set(POWER_LIMITED);
+        } else if (m_state[1] <= Pmin) {
+            initialSetpointOverdrive = -margin;
+            opFlags.reset(POWER_LIMIT_HIGH);
+            opFlags.set(POWER_LIMITED);
+        }
+    }
+}
+
+// residual
+void GovernorTgov1::residual(const IOdata& inputs,
+                             const StateData& stateData,
+                             double resid[],
+                             const SolverMode& sMode)
+{
+    const double omega = inputs[govOmegaInLocation];
+    const auto loc = offsets.getLocations(stateData, resid, sMode, this);
+    if (hasAlgebraic(sMode)) {
+        loc.destLoc[0] = loc.algStateLoc[0] - loc.diffStateLoc[0] + (Dt * (omega - 1.0));
+        if (isAlgebraicOnly(sMode)) {
+            return;
+        }
+    } else if (!hasDifferential(sMode)) {
+        return;
+    }
+
+    derivative(inputs, stateData, resid, sMode);
+
+    loc.destDiffLoc[0] -= loc.dstateLoc[0];
+    loc.destDiffLoc[1] -= loc.dstateLoc[1];
+}
+
+void GovernorTgov1::derivative(const IOdata& inputs,
+                               const StateData& stateData,
+                               double deriv[],
+                               const SolverMode& sMode)
+{
+    const auto loc = offsets.getLocations(stateData, deriv, sMode, this);
+
+    const double* governorState = loc.diffStateLoc;
+    const double omega = inputs[govOmegaInLocation];
+
+    if (opFlags[POWER_LIMITED]) {
+        loc.destDiffLoc[1] = 0.0;
+    } else {
+        loc.destDiffLoc[1] =
+            (-governorState[1] + effectivePowerSetpoint(inputs) - (K * (omega - 1.0))) / T1;
+    }
+
+    loc.destDiffLoc[0] = turbineTransfer.outputStateDerivative(governorState[1],
+                                                               governorState[0],
+                                                               loc.destDiffLoc[1]);
+}
+
+void GovernorTgov1::algebraicUpdate(const IOdata& inputs,
+                                    const StateData& stateData,
+                                    double update[],
+                                    const SolverMode& sMode,
+                                    double /*alpha*/)
+{
+    if (!hasAlgebraic(sMode)) {
+        return;
+    }
+    const auto loc = offsets.getLocations(stateData, update, sMode, this);
+    loc.destLoc[0] = loc.diffStateLoc[0] - (Dt * (inputs[govOmegaInLocation] - 1.0));
+}
+
+void GovernorTgov1::timestep(CoreTime time, const IOdata& inputs, const SolverMode& /*sMode*/)
+{
+    GovernorTgov1::derivative(inputs, emptyStateData, m_dstate_dt.data(), cLocalSolverMode);
+    const double timeStep = time - prevTime;
+    m_state[1] += timeStep * m_dstate_dt[1];
+    m_state[2] += timeStep * m_dstate_dt[2];
+    const double omega = inputs[govOmegaInLocation];
+    m_state[0] = m_state[1] - (Dt * (omega - 1.0));
+
+    prevTime = time;
+}
+
+void GovernorTgov1::jacobianElements(const IOdata& /*inputs*/,
+                                     const StateData& stateData,
+                                     MatrixData<double>& matrixData,
+                                     const IOlocs& inputLocs,
+                                     const SolverMode& sMode)
+{
+    const auto loc = offsets.getLocations(stateData, nullptr, sMode, this);
+
+    const int referenceIndex = loc.diffOffset;
+    // Use the matrixData.assign macro defined in basicDefs.
+
+    const bool linkOmega = (inputLocs[govOmegaInLocation] != kNullLocation);
+
+    /*
+if (opFlags.test (uses_deadband))
+  {
+    if (!opFlags.test (outside_deadband))
+      {
+        linkOmega = false;
+      }
+  }
+      */
+    if (hasAlgebraic(sMode)) {
+        // Pm
+        if (linkOmega) {
+            matrixData.assign(loc.algOffset, inputLocs[govOmegaInLocation], Dt);
+        }
+        matrixData.assign(loc.algOffset, loc.algOffset, 1);
+        if (isAlgebraicOnly(sMode)) {
+            return;
+        }
+        matrixData.assign(loc.algOffset, referenceIndex, -1);
+    } else if (!hasDifferential(sMode)) {
+        return;
+    }
+
+    if (opFlags[POWER_LIMITED]) {
+        matrixData.assign(referenceIndex + 1, referenceIndex + 1, -stateData.cj);
+        matrixData.assign(referenceIndex,
+                          referenceIndex,
+                          turbineTransfer.derivativeStateJacobian() - stateData.cj);
+        matrixData.assign(referenceIndex,
+                          referenceIndex + 1,
+                          turbineTransfer.derivativeInputJacobian());
+    } else {
+        matrixData.assignCheckCol(referenceIndex + 1, inputLocs[govpSetInLocation], 1 / T1);
+        matrixData.assign(referenceIndex + 1, referenceIndex + 1, -(1 / T1) - stateData.cj);
+        if (linkOmega) {
+            matrixData.assign(referenceIndex + 1, inputLocs[govOmegaInLocation], -K / T1);
+        }
+
+        matrixData.assign(referenceIndex,
+                          referenceIndex + 1,
+                          turbineTransfer.derivativeInputJacobian() -
+                              (turbineTransfer.outputStateInputDerivativeJacobian() / T1));
+        matrixData.assignCheckCol(referenceIndex,
+                                  inputLocs[govpSetInLocation],
+                                  turbineTransfer.outputStateInputDerivativeJacobian() / T1);
+        if (linkOmega) {
+            matrixData.assign(referenceIndex,
+                              inputLocs[govOmegaInLocation],
+                              -K * turbineTransfer.outputStateInputDerivativeJacobian() / T1);
+        }
+        matrixData.assign(referenceIndex,
+                          referenceIndex,
+                          turbineTransfer.derivativeStateJacobian() - stateData.cj);
+    }
+}
+
+void GovernorTgov1::rootTest(const IOdata& inputs,
+                             const StateData& stateData,
+                             double roots[],
+                             const SolverMode& sMode)
+{
+    int rootOffset = offsets.getRootOffset(sMode);
+    /* if (opFlags.test (uses_deadband))
+   {
+     Governor::rootTest (inputs, sD, roots, sMode);
+     ++rootOffset;
+   }*/
+    if (opFlags[USES_POWER_LIMITS]) {
+        const auto loc = offsets.getLocations(stateData, nullptr, sMode, this);
+
+        const double pmech = loc.diffStateLoc[1];
+
+        if (opFlags[POWER_LIMITED]) {
+            const double omega = inputs[govOmegaInLocation];
+            const double releaseRate =
+                (-pmech + effectivePowerSetpoint(inputs) - (K * (omega - 1.0))) / T1;
+            roots[rootOffset] =
+                (opFlags[POWER_LIMIT_HIGH] ? releaseRate : -releaseRate) + powerLimitRootTolerance;
+        } else {
+            roots[rootOffset] = std::min(Pmax - pmech, pmech - Pmin) + powerLimitRootTolerance;
+            if (pmech >= Pmax) {
+                opFlags.set(POWER_LIMIT_HIGH);
+            } else if (pmech <= Pmin) {
+                opFlags.reset(POWER_LIMIT_HIGH);
+            }
+        }
+        ++rootOffset;
+    }
+}
+
+void GovernorTgov1::rootTrigger(CoreTime /*time*/,
+                                const IOdata& inputs,
+                                const std::vector<int>& rootMask,
+                                const SolverMode& sMode)
+{
+    int rootOffset = offsets.getRootOffset(sMode);
+    /*if (opFlags.test (uses_deadband))
+  {
+    if (rootMask[rootOffset])
+      {
+        Governor::rootTrigger (time, inputs, rootMask, sMode);
+      }
+    ++rootOffset;
+  }
+      */
+    if (opFlags[USES_POWER_LIMITS]) {
+        if (rootMask[rootOffset] != 0) {
+            if (opFlags[POWER_LIMITED]) {
+                opFlags.reset(POWER_LIMITED);
+                opFlags.reset(POWER_LIMIT_HIGH);
+                alert(this, JAC_COUNT_INCREASE);
+                logging::debug(this, "at max power limit");
+            } else {
+                if (opFlags[POWER_LIMIT_HIGH]) {
+                    logging::debug(this, "at max power limit");
+                } else {
+                    logging::debug(this, "at min power limit");
+                }
+                opFlags.set(POWER_LIMITED);
+                alert(this, JAC_COUNT_DECREASE);
+            }
+            derivative(inputs, emptyStateData, m_dstate_dt.data(), cLocalSolverMode);
+        }
+        ++rootOffset;
+    }
+}
+
+index_t GovernorTgov1::findIndex(std::string_view field, const SolverMode& sMode) const
+{
+    index_t ret = kInvalidLocation;
+    if ((field == "pm") || (field == "pmech")) {
+        ret = offsets.getAlgOffset(sMode);
+    } else if (field == "v1") {
+        ret = offsets.getDiffOffset(sMode);
+    } else if (field == "v2") {
+        ret = offsets.getDiffOffset(sMode);
+        ret = (ret != kNullLocation) ? ret + 1 : ret;
+    }
+    return ret;
+}
+
+// set parameters
+void GovernorTgov1::set(std::string_view param, std::string_view val)
+{
+    GovernorIeeeSimple::set(param, val);
+}
+
+void GovernorTgov1::set(std::string_view param, double val, unit unitType)
+{
+    if (param == "dt") {
+        if (!std::isfinite(val)) {
+            throw InvalidParameterValue("TGOV1 Dt must be finite");
+        }
+        Dt = val;
+    } else if ((param == "k") || (param == "droop")) {
+        if (!std::isfinite(val) || (val <= 0.0)) {
+            throw InvalidParameterValue("TGOV1 gain must be positive and finite");
+        }
+        GovernorIeeeSimple::set(param, val, unitType);
+    } else if (param == "r") {
+        if (!std::isfinite(val) || (val <= 0.0)) {
+            throw InvalidParameterValue("TGOV1 R must be positive and finite");
+        }
+        GovernorIeeeSimple::set(param, val, unitType);
+    } else if (param == "t1") {
+        if (!std::isfinite(val) || (val <= 0.0)) {
+            throw InvalidParameterValue("TGOV1 T1 must be positive and finite");
+        }
+        GovernorIeeeSimple::set(param, val, unitType);
+    } else if (param == "t2") {
+        if (!std::isfinite(val)) {
+            throw InvalidParameterValue("TGOV1 T2 must be finite");
+        }
+        GovernorIeeeSimple::set(param, val, unitType);
+    } else if (param == "t3") {
+        if (!std::isfinite(val) || (val <= 0.0)) {
+            throw InvalidParameterValue("TGOV1 T3 must be positive and finite");
+        }
+        GovernorIeeeSimple::set(param, val, unitType);
+    } else if ((param == "pmax") || (param == "pmin")) {
+        if (!std::isfinite(val)) {
+            throw InvalidParameterValue("TGOV1 valve limit must be finite");
+        }
+        GovernorIeeeSimple::set(param, val, unitType);
+    } else {
+        GovernorIeeeSimple::set(param, val, unitType);
+    }
+}
+
+double GovernorTgov1::get(std::string_view param, unit unitType) const
+{
+    if (param == "dt") {
+        return Dt;
+    }
+    return GovernorIeeeSimple::get(param, unitType);
+}
+}  // namespace griddyn::governors

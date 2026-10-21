@@ -1,0 +1,38 @@
+name: Static Analyzers
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpplint:
+    runs-on: ubuntu-latest
+    container: helics/buildenv:cpplint
+
+    steps:
+    - uses: actions/checkout@v6
+    - name: Run cpplint
+      run: cpplint --counting=detailed --recursive examples benchmarks src test
+
+  clang-tidy:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    container: helics/buildenv:clang-extra-tools
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+    - name: Run clang-tidy on changed files
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: ./.github/actions/run-clang-tidy-pr.sh

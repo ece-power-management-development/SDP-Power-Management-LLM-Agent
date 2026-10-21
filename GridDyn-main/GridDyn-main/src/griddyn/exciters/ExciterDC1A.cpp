@@ -1,0 +1,388 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "ExciterDC1A.h"
+
+#include "../Generator.h"
+#include "../GridBus.h"
+#include "core/CoreExceptions.h"
+#include "utilities/MatrixData.hpp"
+#include <algorithm>
+#include <cmath>
+#include <string>
+#include <vector>
+namespace griddyn::exciters {
+namespace {
+    constexpr double initialLimitContactTolerance = 1e-7;
+}
+
+ExciterDC1A::ExciterDC1A(const std::string& objName): ExciterIEEEtype1(objName)
+{
+    // default values
+    Ka = 12;
+    Ta = 0.06;
+    Ke = 1.0;
+    Te = .46;
+    Kf = .1;
+    Tf = 1.0;
+    // PSS/E-form saturation points derived from the historic GridDyn
+    // exponential fit's calibration points.
+    E1 = 2.3;
+    Se1 = 0.1;
+    E2 = 3.1;
+    Se2 = 0.33;
+    hasTwoPointSaturationParameters = true;
+    Vrmin = -.9;
+    Vrmax = 1;
+}
+
+// cloning function
+CoreObject* ExciterDC1A::clone(CoreObject* obj) const
+{
+    ExciterDC1A* gdE;
+    if (obj == nullptr) {
+        gdE = new ExciterDC1A();
+    } else {
+        gdE = dynamic_cast<ExciterDC1A*>(obj);
+        if (gdE == nullptr) {
+            Exciter::clone(obj);
+            return obj;
+        }
+    }
+    ExciterIEEEtype1::clone(gdE);
+    gdE->Tc = Tc;
+    gdE->Tb = Tb;
+    return gdE;
+}
+
+void ExciterDC1A::dynObjectInitializeA(CoreTime /*time0*/, std::uint32_t flags)
+{
+    setInitialLimitPolicy(flags);
+    configureSaturation();
+    offsets.local().local.diffSize = (Tr > 0.0) ? 5 : 4;
+    offsets.local().local.jacSize = 24;
+    checkForLimits();
+}
+
+// initial conditions
+void ExciterDC1A::dynObjectInitializeB(const IOdata& inputs,
+                                       const IOdata& desiredOutput,
+                                       IOdata& fieldSet)
+{
+    const double terminalVoltage = inputs[VOLTAGE_IN_LOCATION];
+    const double originalUpperLimit = Vrmax;
+    Exciter::dynObjectInitializeB(inputs,
+                                  desiredOutput,
+                                  fieldSet);  // this will dynInitializeB the field state if need be
+    double* stateValues = m_state.data();
+    stateValues[1] = saturationFeedback(stateValues[0]);  // Vr
+    if (!adjustInitialRegulatorLimit(stateValues[1], terminalVoltage)) {
+        throw InvalidParameterValue("DC1A initial regulator output outside limits");
+    }
+    const double upperBound = initialRegulatorUpperBound(terminalVoltage);
+    const double lowerBound = initialRegulatorLowerBound(terminalVoltage);
+    double overdrive = 0.0;
+    if ((Vrmax != 0.0) && (stateValues[1] >= upperBound - initialLimitContactTolerance)) {
+        overdrive = initialRegulatorOverdrive(originalUpperLimit, terminalVoltage);
+        opFlags.set(TRIGGER_HIGH);
+        opFlags.set(OUTSIDE_VOLTAGE_LIMITS);
+    } else if (stateValues[1] <= lowerBound + initialLimitContactTolerance) {
+        overdrive = -initialRegulatorOverdrive(Vrmax, terminalVoltage);
+        opFlags.reset(TRIGGER_HIGH);
+        opFlags.set(OUTSIDE_VOLTAGE_LIMITS);
+    }
+    stateValues[2] = (stateValues[1] + overdrive) / Ka;  // X
+    stateValues[3] = (stateValues[0] * Kf) / Tf;  // Rf
+    if (Tr > 0.0) {
+        stateValues[4] = inputs[VOLTAGE_IN_LOCATION];
+    }
+
+    vBias = terminalVoltage + stateValues[2] - Vref;
+    fieldSet[1] = Vref;
+}
+
+bool ExciterDC1A::adjustInitialRegulatorLimit(double initialValue, double /*terminalVoltage*/)
+{
+    return (initialValue >= Vrmin - 1e-7) &&
+        adjustInitialUpperLimit(initialValue, Vrmax, "DC1A initial regulator output");
+}
+
+double ExciterDC1A::initialRegulatorUpperBound(double /*terminalVoltage*/) const
+{
+    return regulatorUpperLimit();
+}
+
+double ExciterDC1A::initialRegulatorLowerBound(double /*terminalVoltage*/) const
+{
+    return Vrmin;
+}
+
+double ExciterDC1A::initialRegulatorOverdrive(double originalUpperLimit,
+                                              double /*terminalVoltage*/) const
+{
+    const double correction = std::max(0.0, Vrmax - originalUpperLimit);
+    const double guard = 1e-4 + std::abs(Ka) * std::max(1.0, std::abs(Tc / Tb)) * 1e-5;
+    return std::max(0.2 * correction, guard);
+}
+
+// residual
+void ExciterDC1A::residual(const IOdata& inputs,
+                           const StateData& stateDataValue,
+                           double resid[],
+                           const SolverMode& sMode)
+{
+    if (isAlgebraicOnly(sMode)) {
+        return;
+    }
+    derivative(inputs, stateDataValue, resid, sMode);
+
+    auto offset = offsets.getDiffOffset(sMode);
+    const double* esp = stateDataValue.dstate_dt + offset;
+    resid[offset] -= esp[0];
+    resid[offset + 1] -= esp[1];
+    resid[offset + 2] -= esp[2];
+    resid[offset + 3] -= esp[3];
+    if (Tr > 0.0) {
+        resid[offset + 4] -= esp[4];
+    }
+}
+
+void ExciterDC1A::derivative(const IOdata& inputs,
+                             const StateData& stateDataValue,
+                             double deriv[],
+                             const SolverMode& sMode)
+{
+    auto loc = offsets.getLocations(stateDataValue, deriv, sMode, this);
+    const double* exciterState = loc.diffStateLoc;
+    double* derivatives = loc.destDiffLoc;
+    const double voltage = measuredVoltage(inputs, exciterState);
+    derivatives[0] = (-saturationFeedback(exciterState[0]) + exciterState[1]) / Te;
+    if (opFlags[OUTSIDE_VOLTAGE_LIMITS]) {
+        derivatives[1] = 0;
+    } else {
+        derivatives[1] =
+            (-exciterState[1] +
+             ((((Vref + vBias - voltage) - ((exciterState[0] * Kf) / Tf)) + exciterState[3]) * Ka *
+              Tc / Tb) +
+             ((exciterState[2] * (Tb - Tc) * Ka) / Tb)) /
+            Ta;
+    }
+    derivatives[2] =
+        ((-exciterState[2] + (Vref + vBias - voltage) - ((exciterState[0] * Kf) / Tf)) +
+         exciterState[3]) /
+        Tb;
+    derivatives[3] = (-exciterState[3] + ((exciterState[0] * Kf) / Tf)) / Tf;
+    if (Tr > 0.0) {
+        derivatives[4] = (inputs[VOLTAGE_IN_LOCATION] - exciterState[4]) / Tr;
+    }
+}
+
+// Jacobian
+void ExciterDC1A::jacobianElements(const IOdata& inputs,
+                                   const StateData& stateDataValue,
+                                   MatrixData<double>& matrixDataValue,
+                                   const IOlocs& inputLocs,
+                                   const SolverMode& sMode)
+{
+    if (isAlgebraicOnly(sMode)) {
+        return;
+    }
+    auto offset = offsets.getDiffOffset(sMode);
+    auto refI = offset;
+
+    auto voltageLoc = inputLocs[VOLTAGE_IN_LOCATION];
+    // use the md.assign Macro defined in basicDefs
+    // md.assign(arrayIndex, RowIndex, ColIndex, value)
+
+    // Ef
+    const double temp1 =
+        (-saturationDerivative(stateDataValue.state[offset]) / Te) - stateDataValue.cj;
+    matrixDataValue.assign(refI, refI, temp1);
+    fieldRegulatorJacobian(matrixDataValue, refI, refI + 1, voltageLoc);
+
+    if (opFlags[OUTSIDE_VOLTAGE_LIMITS]) {
+        const int limiterVoltageLoc = (Tr > 0.0) ? (refI + 4) : voltageLoc;
+        limitJacobian(inputs[VOLTAGE_IN_LOCATION],
+                      limiterVoltageLoc,
+                      refI + 1,
+                      stateDataValue.cj,
+                      matrixDataValue);
+    } else {
+        // Vr
+        if ((Tr <= 0.0) && (voltageLoc != kNullLocation)) {
+            matrixDataValue.assign(refI + 1, voltageLoc, -Ka * Tc / (Ta * Tb));
+        }
+        matrixDataValue.assign(refI + 1, refI, -Ka * Kf * Tc / (Tf * Ta * Tb));
+        matrixDataValue.assign(refI + 1, refI + 1, (-1.0 / Ta) - stateDataValue.cj);
+        matrixDataValue.assign(refI + 1, refI + 2, Ka * (Tb - Tc) / (Ta * Tb));
+        matrixDataValue.assign(refI + 1, refI + 3, Ka * Tc / (Ta * Tb));
+        if (Tr > 0.0) {
+            matrixDataValue.assign(refI + 1, refI + 4, -Ka * Tc / (Ta * Tb));
+        }
+    }
+
+    // X
+    if ((Tr <= 0.0) && (voltageLoc != kNullLocation)) {
+        matrixDataValue.assign(refI + 2, voltageLoc, -1.0 / Tb);
+    }
+    matrixDataValue.assign(refI + 2, refI, -Kf / (Tf * Tb));
+    matrixDataValue.assign(refI + 2, refI + 2, (-1.0 / Tb) - stateDataValue.cj);
+    matrixDataValue.assign(refI + 2, refI + 3, 1.0 / Tb);
+    if (Tr > 0.0) {
+        matrixDataValue.assign(refI + 2, refI + 4, -1.0 / Tb);
+    }
+    // Rf
+    matrixDataValue.assign(refI + 3, refI, Kf / (Tf * Tf));
+    matrixDataValue.assign(refI + 3, refI + 3, (-1.0 / Tf) - stateDataValue.cj);
+    if (Tr > 0.0) {
+        matrixDataValue.assign(refI + 4, refI + 4, (-1.0 / Tr) - stateDataValue.cj);
+        matrixDataValue.assignCheckCol(refI + 4, voltageLoc, 1.0 / Tr);
+    }
+
+    // printf("%f--%f--\n",sD.time,sD.cj);
+}
+
+void ExciterDC1A::limitJacobian(double /*V*/,
+                                int /*Vloc*/,
+                                int refLoc,
+                                double cjValue,
+                                MatrixData<double>& matrixDataValue)
+{
+    // At a regulator limit the residual is -dot(V_R), because derivative()
+    // freezes the regulator state.  The DAE Jacobian contribution is
+    // therefore -cj, not +cj.
+    matrixDataValue.assign(refLoc, refLoc, -cjValue);
+}
+
+void ExciterDC1A::fieldRegulatorJacobian(MatrixData<double>& matrixDataValue,
+                                         index_t fieldRow,
+                                         index_t regulatorCol,
+                                         index_t /*voltageCol*/) const
+{
+    matrixDataValue.assign(fieldRow, regulatorCol, 1.0 / Te);
+}
+
+void ExciterDC1A::rootTest(const IOdata& inputs,
+                           const StateData& stateDataValue,
+                           double root[],
+                           const SolverMode& sMode)
+{
+    const auto offset = offsets.getDiffOffset(sMode);
+    const double* exciterState = stateDataValue.state + offset;
+    const double voltage = measuredVoltage(inputs, exciterState);
+
+    const int rootOffset = offsets.getRootOffset(sMode);
+    if (opFlags[OUTSIDE_VOLTAGE_LIMITS]) {
+        const double releaseRoot =
+            ((((Vref + vBias - voltage) - ((exciterState[0] * Kf) / Tf)) + exciterState[3]) * Ka *
+             Tc / Tb) +
+            ((exciterState[2] * (Tb - Tc) * Ka) / Tb) - exciterState[1];
+        root[rootOffset] = opFlags[TRIGGER_HIGH] ? releaseRoot + 0.00001 : releaseRoot - 0.00001;
+    } else {
+        root[rootOffset] =
+            std::min(regulatorUpperLimit() - exciterState[1], exciterState[1] - Vrmin) + 0.00001;
+        if (exciterState[1] > regulatorUpperLimit()) {
+            opFlags.set(TRIGGER_HIGH);
+        }
+    }
+}
+
+void ExciterDC1A::rootTrigger(CoreTime time,
+                              const IOdata& inputs,
+                              const std::vector<int>& rootMask,
+                              const SolverMode& sMode)
+{
+    const auto rootOffset = offsets.getRootOffset(sMode);
+    if ((rootOffset == kNullLocation) || (rootMask[rootOffset] == 0)) {
+        return;
+    }
+
+    // The root function has separate entry and release meanings once the
+    // limiter is active.  Let the model-specific rootCheck() decide which
+    // branch is valid instead of using Exciter::rootTrigger(), which blindly
+    // toggles the branch on every root return.
+    rootCheck(inputs, emptyStateData, sMode, CheckLevel::FULL_CHECK);
+    const StateData stateData(time, m_state.data(), m_dstate_dt.data());
+    derivative(inputs, stateData, m_dstate_dt.data(), cLocalSolverMode);
+}
+
+ChangeCode ExciterDC1A::rootCheck(const IOdata& inputs,
+                                  const StateData& /*sD*/,
+                                  const SolverMode& /*sMode*/,
+                                  CheckLevel /*level*/)
+{
+    double* exciterState = m_state.data();
+    const double voltage = measuredVoltage(inputs, exciterState);
+    double test;
+    ChangeCode ret = ChangeCode::NO_CHANGE;
+    if (opFlags[OUTSIDE_VOLTAGE_LIMITS]) {
+        test = ((((Vref + vBias - voltage) - ((exciterState[0] * Kf) / Tf)) + exciterState[3]) *
+                Ka * Tc / Tb) +
+            ((exciterState[2] * (Tb - Tc) * Ka) / Tb) - exciterState[1];
+        if (opFlags[TRIGGER_HIGH]) {
+            if (test < 0.0) {
+                ret = ChangeCode::JACOBIAN_CHANGE;
+                exciterState[1] = regulatorUpperLimit();
+                opFlags.reset(OUTSIDE_VOLTAGE_LIMITS);
+                opFlags.reset(TRIGGER_HIGH);
+                alert(this, JAC_COUNT_INCREASE);
+            }
+        } else {
+            if (test > 0.0) {
+                ret = ChangeCode::JACOBIAN_CHANGE;
+                exciterState[1] = Vrmin;
+                opFlags.reset(OUTSIDE_VOLTAGE_LIMITS);
+                alert(this, JAC_COUNT_INCREASE);
+            }
+        }
+    } else {
+        if (exciterState[1] > regulatorUpperLimit() + 0.000005) {
+            opFlags.set(TRIGGER_HIGH);
+            opFlags.set(OUTSIDE_VOLTAGE_LIMITS);
+            exciterState[1] = regulatorUpperLimit();
+            ret = ChangeCode::JACOBIAN_CHANGE;
+            alert(this, JAC_COUNT_DECREASE);
+        } else if (exciterState[1] < Vrmin - 0.000005) {
+            opFlags.reset(TRIGGER_HIGH);
+            opFlags.set(OUTSIDE_VOLTAGE_LIMITS);
+            exciterState[1] = Vrmin;
+            ret = ChangeCode::JACOBIAN_CHANGE;
+            alert(this, JAC_COUNT_DECREASE);
+        }
+    }
+
+    return ret;
+}
+
+double ExciterDC1A::measuredVoltage(const IOdata& inputs, const double state[]) const
+{
+    return (Tr > 0.0) ? state[4] : inputs[VOLTAGE_IN_LOCATION];
+}
+
+static const stringVec DC1A_FIELDS{"ef", "vr", "x", "rf"};
+
+stringVec ExciterDC1A::localStateNames() const
+{
+    return (Tr > 0.0) ? stringVec{"ef", "vr", "x", "rf", "vmeas"} : DC1A_FIELDS;
+}
+void ExciterDC1A::set(std::string_view param, std::string_view val)
+{
+    ExciterIEEEtype1::set(param, val);
+}
+
+// set parameters
+void ExciterDC1A::set(std::string_view param, double val, units::unit unitType)
+{
+    if (param == "tb") {
+        Tb = val;
+    } else if (param == "tc") {
+        Tc = val;
+    } else {
+        ExciterIEEEtype1::set(param, val, unitType);
+    }
+}
+
+}  // namespace griddyn::exciters

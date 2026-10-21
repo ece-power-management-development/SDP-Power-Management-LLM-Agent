@@ -1,0 +1,73 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "../gridDynDefinitions.hpp"
+#include "Exciter.h"
+#include "core/coreDefinitions.hpp"
+#include "solvers/SolverMode.hpp"
+#include <string>
+#include <vector>
+
+namespace griddyn::exciters {
+
+/** @brief Simplified excitation system (SEXS) model.
+ *
+ * This model implements a lead-lag regulator with output limits followed by
+ * a first-order field lag.
+ */
+class ExciterSEXS: public Exciter {
+  protected:
+    model_parameter Te = 0.5;  //!< [s] exciter field time constant
+    model_parameter Tb = 0.46;  //!< [s] lead-lag denominator time constant
+
+  public:
+    explicit ExciterSEXS(const std::string& objName = "exciterSEXS_#");
+    CoreObject* clone(CoreObject* obj = nullptr) const override;
+
+    void dynObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+    void dynObjectInitializeB(const IOdata& inputs,
+                              const IOdata& desiredOutput,
+                              IOdata& fieldSet) override;
+
+    void set(std::string_view param, std::string_view val) override;
+    void set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+
+    stringVec localStateNames() const override;
+
+    void residual(const IOdata& inputs,
+                  const StateData& stateData,
+                  double resid[],
+                  const SolverMode& SolverMode) override;
+    void derivative(const IOdata& inputs,
+                    const StateData& stateData,
+                    double deriv[],
+                    const SolverMode& SolverMode) override;
+    void jacobianElements(const IOdata& inputs,
+                          const StateData& stateData,
+                          MatrixData<double>& matrix,
+                          const IOlocs& inputLocs,
+                          const SolverMode& SolverMode) override;
+
+    void rootTest(const IOdata& inputs,
+                  const StateData& stateData,
+                  double root[],
+                  const SolverMode& SolverMode) override;
+    void rootTrigger(CoreTime time,
+                     const IOdata& inputs,
+                     const std::vector<int>& rootMask,
+                     const SolverMode& SolverMode) override;
+    ChangeCode rootCheck(const IOdata& inputs,
+                         const StateData& stateData,
+                         const SolverMode& SolverMode,
+                         CheckLevel level) override;
+
+  private:
+    double regulatorOutput(const IOdata& inputs, const double stateX) const;
+};
+
+}  // namespace griddyn::exciters

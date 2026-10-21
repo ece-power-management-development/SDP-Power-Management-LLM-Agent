@@ -1,0 +1,607 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "gridDynRunner.h"
+
+#include "CLI11/CLI11.hpp"
+#include "core/CoreExceptions.h"
+#include "core/ObjectInterpreter.h"
+#include "coupling/GhostSwingBusManager.h"
+#include "fileInput/fileInput.h"
+#include "gmlc/utilities/stringOps.h"
+#include "griddyn/GridBus.h"
+#include "griddyn/GridDynSimulation.h"
+#include "griddyn/events/Event.h"
+#include "griddyn/measurement/Recorder.h"
+#include "griddyn/simulation/GridDynSimulationFileOps.h"
+#include "utilities/GlobalWorkQueue.hpp"
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <iomanip>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace griddyn {
+GriddynRunner::GriddynRunner() = default;
+
+GriddynRunner::GriddynRunner(std::shared_ptr<GridDynSimulation> sim): m_gds(std::move(sim)) {}
+
+GriddynRunner::~GriddynRunner() = default;
+
+int GriddynRunner::InitializeFromString(const std::string& cmdargs)
+{
+    if (!m_gds) {
+        m_gds = std::make_shared<GridDynSimulation>();
+        // GridDynSimulation::setInstance(m_gds.get());  // peer to GridDynSimulation::GetInstance
+        // ();
+    }
+    m_gds->log(nullptr, PrintLevel::SUMMARY, "GridDyn version:" GRIDDYN_VERSION_STRING);
+
+    mArgValues = nullptr;
+    mArgcValue = 0;
+    mArgumentString = cmdargs;
+    ReaderInfo readerInformation;
+    auto returnCode = loadCommandArgument(readerInformation, false);
+    if (returnCode != FUNCTION_EXECUTION_SUCCESS) {
+        return returnCode;
+    }
+
+    const int areaCount = m_gds->getInt("totalareacount");
+    const int busCount = m_gds->getInt("totalbuscount");
+    const int linkCount = m_gds->getInt("totallinkcount");
+    const int relayCount = m_gds->getInt("totalrelaycount");
+    const int generatorCount = m_gds->getInt("gencount");
+    const int loadCount = m_gds->getInt("loadcount");
+    std::cout << "areas=" << areaCount << " buses=" << busCount << " links=" << linkCount
+              << " relays=" << relayCount << " gens=" << generatorCount << " loads=" << loadCount
+              << '\n';
+
+    // set any flags used by the system
+
+    return FUNCTION_EXECUTION_SUCCESS;
+}
+
+int GriddynRunner::Initialize(int argc,
+                              char* argv[],
+                              ReaderInfo& readerInformation,
+                              bool allowUnrecognized)
+{
+    if (!m_gds) {
+        m_gds = std::make_shared<GridDynSimulation>();
+        // GridDynSimulation::setInstance(m_gds.get());  // peer to GridDynSimulation::GetInstance
+        // ();
+    }
+    m_gds->log(nullptr, PrintLevel::SUMMARY, "GridDyn version:" GRIDDYN_VERSION_STRING);
+    // TODO(phlpt): Do something different with this.
+    GhostSwingBusManager::initialize(&argc, &argv);
+
+    mArgValues = argv;
+    mArgcValue = argc;
+
+    auto returnCode = loadCommandArgument(readerInformation, allowUnrecognized);
+    if (returnCode != FUNCTION_EXECUTION_SUCCESS) {
+        return returnCode;
+    }
+
+    const int areaCount = m_gds->getInt("totalareacount");
+    const int busCount = m_gds->getInt("totalbuscount");
+    const int linkCount = m_gds->getInt("totallinkcount");
+    const int relayCount = m_gds->getInt("totalrelaycount");
+    const int generatorCount = m_gds->getInt("gencount");
+    const int loadCount = m_gds->getInt("loadcount");
+    std::cout << "areas=" << areaCount << " buses=" << busCount << " links=" << linkCount
+              << " relays=" << relayCount << " gens=" << generatorCount << " loads=" << loadCount
+              << '\n';
+
+    // set any flags used by the system
+
+    return FUNCTION_EXECUTION_SUCCESS;
+}
+
+int GriddynRunner::Initialize(int argc, char* argv[], bool allowUnrecognized)
+{
+    ReaderInfo readerInformation;
+    return Initialize(argc, argv, readerInformation, allowUnrecognized);
+}
+
+void GriddynRunner::simInitialize()
+{
+    m_startTime = std::chrono::high_resolution_clock::now();
+    m_gds->dynInitialize();
+    if (!(m_gds->hasDynamics())) {
+        mEventMode = true;
+    }
+}
+
+int GriddynRunner::Reset()
+{
+    if (!isReady()) {
+        throw(ExecutionFailure(m_gds.get(), "asynchronous operation ongoing"));
+    }
+    ReaderInfo readerInformation;
+    return Reset(readerInformation);
+}
+
+int GriddynRunner::Reset(ReaderInfo& readerInformation)
+{
+    if (!isReady()) {
+        throw(ExecutionFailure(m_gds.get(), "asynchronous operation ongoing"));
+    }
+    // make a new simulation object
+    m_gds = std::make_shared<GridDynSimulation>();
+    // reload it from the existing vm
+    auto returnCode = loadCommandArgument(readerInformation, false);
+    if (returnCode != FUNCTION_EXECUTION_SUCCESS) {
+        return returnCode;
+    }
+    m_gds->log(m_gds.get(),
+               PrintLevel::NORMAL,
+               std::string("\nsystem reset of ") + m_gds->getName());
+    return FUNCTION_EXECUTION_SUCCESS;
+}
+
+CoreTime GriddynRunner::Run()
+{
+    if (!isReady()) {
+        throw(ExecutionFailure(m_gds.get(), "asynchronous operation ongoing"));
+    }
+
+    m_startTime = std::chrono::high_resolution_clock::now();
+    const int returnValue = m_gds->run();
+    m_stopTime = std::chrono::high_resolution_clock::now();
+    const std::chrono::duration<double> elapsedT = m_stopTime - m_startTime;
+    m_gds->log(m_gds.get(),
+               PrintLevel::SUMMARY,
+               m_gds->getName() + " executed in " + std::to_string(elapsedT.count()) + " seconds");
+    if (returnValue != FUNCTION_EXECUTION_SUCCESS) {
+        const std::string error = "GridDyn failed to run retval = " + std::to_string(returnValue);
+        throw(ExecutionFailure(m_gds.get(), error));
+    }
+
+    std::vector<GridBus*> buses;
+    m_gds->getBusVector(buses);
+    const auto invalidVoltage = std::find_if(buses.begin(), buses.end(), [](const GridBus* bus) {
+        return !std::isfinite(bus->getVoltage()) || !std::isfinite(bus->getAngle());
+    });
+    if (invalidVoltage != buses.end()) {
+        throw(ExecutionFailure(m_gds.get(), "GridDyn produced a non-finite power-flow state"));
+    }
+    return m_gds->getSimulationTime();
+}
+
+void GriddynRunner::RunAsync()
+{
+    if (!isReady()) {
+        throw(ExecutionFailure(m_gds.get(), "asynchronous operation ongoing"));
+    }
+    mAsyncReturn = std::async(std::launch::async, [this] { return Run(); });
+}
+
+CoreTime GriddynRunner::Step(CoreTime nextStep)
+{
+    if (!isReady()) {
+        throw(ExecutionFailure(m_gds.get(), "asynchronous operation ongoing"));
+    }
+    CoreTime actual = nextStep;
+    if (m_gds) {
+        if (mEventMode) {
+            const int returnValue = m_gds->eventDrivenPowerflow(nextStep);
+            actual = nextStep;
+            if (returnValue < FUNCTION_EXECUTION_SUCCESS) {
+                const std::string error =
+                    "GridDyn failed to advance retval = " + std::to_string(returnValue);
+                throw(std::runtime_error(error));
+            }
+        } else {
+            const int returnValue = m_gds->step(nextStep, actual);
+            if (returnValue < FUNCTION_EXECUTION_SUCCESS) {
+                const std::string error =
+                    "GridDyn failed to advance retval = " + std::to_string(returnValue);
+                throw(std::runtime_error(error));
+            }
+        }
+    }
+
+    return actual;
+}
+
+void GriddynRunner::StepAsync(CoreTime time)
+{
+    if (!isReady()) {
+        throw(ExecutionFailure(m_gds.get(), "asynchronous operation ongoing"));
+    }
+    mAsyncReturn = std::async(std::launch::async, [this, time] { return Step(time); });
+}
+
+std::shared_ptr<GridDynSimulation>& GriddynRunner::getSim()
+{
+    if (!m_gds) {
+        m_gds = std::make_shared<GridDynSimulation>();
+    }
+    return m_gds;
+}
+
+bool GriddynRunner::isReady() const
+{
+    return (mAsyncReturn.valid()) ?
+        (mAsyncReturn.wait_for(std::chrono::seconds(0)) == std::future_status::ready) :
+        true;
+}
+
+int GriddynRunner::getStatus(CoreTime& timeReturn)
+{
+    timeReturn = m_gds->getSimulationTime();
+    return (isReady()) ? static_cast<int>(m_gds->currentProcessState()) : GRIDDYN_PENDING;
+}
+
+CoreTime GriddynRunner::getNextEvent() const
+{
+    return m_gds->getEventTime();
+}
+void GriddynRunner::StopRecording()
+{
+    m_gds->log(m_gds.get(), PrintLevel::NORMAL, "Saving recorders...");
+    m_gds->saveRecorders();
+    m_stopTime = std::chrono::high_resolution_clock::now();
+    const std::chrono::duration<double> elapsedT = m_stopTime - m_startTime;
+    m_gds->log(m_gds.get(),
+               PrintLevel::NORMAL,
+               std::string("\nSimulation ") + m_gds->getName() + " executed in " +
+                   std::to_string(elapsedT.count()) + " seconds");
+}
+
+void GriddynRunner::Finalize()
+{
+    StopRecording();
+    GhostSwingBusManager::instance()->endSimulation();
+}
+
+int GriddynRunner::loadCommandArgument(ReaderInfo& readerInformation, bool allowUnrecognized)
+{
+    m_startTime = std::chrono::high_resolution_clock::now();
+    auto app = generateBaseCommandLineParser(readerInformation);
+    app->allow_extras(allowUnrecognized);
+    auto subApp = generateLocalCommandLineParser(readerInformation);
+    if (subApp) {
+        app->add_subcommand(std::move(subApp));
+    }
+    try {
+        if (mArgcValue > 0) {
+            mExecutablePath = mArgValues[0];
+            app->parse(mArgcValue, mArgValues);
+        } else {
+            app->parse(mArgumentString);
+        }
+    }
+    catch (const CLI::CallForHelp& e) {
+        app->exit(e);
+        return 1;
+    }
+    catch (const CLI::CallForAllHelp& e) {
+        app->exit(e);
+        return 1;
+    }
+    catch (const CLI::Success&) {
+        return 1;
+    }
+    catch (const CLI::Error& e) {
+        return e.get_exit_code();
+    }
+    m_stopTime = std::chrono::high_resolution_clock::now();
+
+    const std::chrono::duration<double> elapsedT = m_stopTime - m_startTime;
+    m_gds->log(m_gds.get(),
+               PrintLevel::NORMAL,
+               std::string("\nInitialization ") + m_gds->getName() + " executed in " +
+                   std::to_string(elapsedT.count()) + " seconds");
+    return FUNCTION_EXECUTION_SUCCESS;
+}
+
+std::shared_ptr<CLI::App>
+    GriddynRunner::generateBaseCommandLineParser(ReaderInfo& readerInformation)
+{
+    auto defineTransform = [&readerInformation](const std::string& input) {
+        return readerInformation.checkDefines(input);
+    };
+
+    // function for loading parameters from strings
+    const CLI::callback_t loadParamString = [this](const CLI::results_t& results) {
+        for (const auto& str : results) {
+            const GridParameter parameterDefinition(str);
+            if (parameterDefinition.valid) {
+                ObjectInfo objectInformation(parameterDefinition.field, m_gds.get());
+                try {
+                    if (parameterDefinition.stringType) {
+                        objectInformation.mObject->set(objectInformation.mField,
+                                                       parameterDefinition.strVal);
+                    } else {
+                        objectInformation.mObject->set(objectInformation.mField,
+                                                       parameterDefinition.value,
+                                                       parameterDefinition.paramUnits);
+                    }
+                }
+                catch (const UnrecognizedParameter&) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
+    // function for loading parameters from strings
+    const CLI::callback_t loadFileCallback = [this,
+                                              &readerInformation](const CLI::results_t& results) {
+        for (const auto& file : results) {
+            loadFile(m_gds.get(), file, &readerInformation);
+            if (m_gds->getErrorCode() != 0) {
+                throw(CLI::Error(m_gds->getName(),
+                                 "Error loading File " + file,
+                                 m_gds->getErrorCode()));
+            }
+        }
+        return true;
+    };
+
+    auto ptr =
+        std::make_shared<CLI::App>("Command line application for GridDyn Power System Simulation");
+    ptr->set_help_flag("--help,-h,-?", "generate help message");
+    ptr->set_config("--config-file", "gridDynConfig.ini", "read a config INI file");
+    ptr->add_flag_callback("--mpicount",
+                           []() {
+                               readerConfig::setPrintMode(READER_NO_PRINT);
+                               readerConfig::setWarnMode(READER_WARN_NONE);
+                           })
+        ->group("");
+    ptr->add_flag_callback("--version", []() {
+        std::cout << GRIDDYN_VERSION_STRING << '\n';
+        throw(CLI::Success());
+    });
+    ptr->add_flag("--test", "Execute a test program");
+    ptr->add_option_function<std::string>(
+           "--powerflow-output,-o,--power_flow_output",
+           [this](const std::string& input) { m_gds->set("powerflowfile", input); },
+           "file output for the powerflow solution")
+        ->ignore_case()
+        ->ignore_underscore()
+        ->transform(defineTransform);
+
+    ptr->add_option_function<std::string>(
+           "--power_flow_input_data",
+           [this](const std::string& input) { m_gds->set("powerflowinputfile", input); },
+           "file output for the power flow data prior to solving")
+        ->ignore_case()
+        ->ignore_underscore()
+        ->transform(defineTransform);
+
+    ptr->add_flag_callback(
+           "--powerflow_only,--powerflow-only",
+           [this]() { m_gds->setFlag("powerflow_only", true); },
+           "set the solver to stop after the power flow solution and use some powerflow specific models")
+        ->ignore_case()
+        ->ignore_underscore();
+
+    // Setup for saving the state
+
+    auto* savestateGroup =
+        ptr->add_option_group("ssgroup", "options related to saving the system state");
+    auto ssdata = std::make_shared<std::pair<int, std::string>>(0, std::string{});
+
+    auto* stateOutputOption =
+        savestateGroup
+            ->add_option("--state-output,--state_output,--state_output_file,--state-output-file",
+                         ssdata->second,
+                         "file for final output state")
+            ->ignore_case()
+            ->transform(defineTransform)
+            ->ignore_underscore();
+    savestateGroup
+        ->add_option("--save-state-period,--save_state_period",
+                     ssdata->first,
+                     "save state every N ms, -1 for saving only at the end")
+        ->ignore_case()
+        ->ignore_underscore()
+        ->needs(stateOutputOption);
+    savestateGroup
+        ->add_option_function<std::string>(
+            "--jac_state,--jac_state_file",
+            [this](const std::string& jacFile) {
+                captureJacState(m_gds.get(), jacFile, m_gds->getSolverMode("pflow"));
+            },
+            "save the jacobian values of the power flow solution to a file")
+        ->transform(defineTransform);
+
+    // group callback to setup state file
+    savestateGroup->callback([this, ssdata]() {
+        m_gds->set("statefile", ssdata->second);
+        if (ssdata->first > 0) {
+            // The command-line option is expressed in milliseconds while the
+            // simulation property is stored in seconds.  Use the property's
+            // canonical spelling so this works independently of reader-side
+            // parameter normalization.
+            m_gds->set("staterecordperiod", 0.001 * ssdata->first);
+        }
+    });
+
+    ptr->add_option_function<std::string>(
+           "--log-file,--log_file,--log",
+           [this](const std::string& file) { m_gds->set("logfile", file); },
+           "log file output")
+        ->transform(defineTransform)
+        ->ignore_case()
+        ->ignore_underscore();
+    //  ptr->add_option ("--jac-output", po::value<std::string> (), "powerflow Jacobian file
+    //  output");
+    ptr->add_flag_function(
+           "--verbose{3},-v{3},--quiet{0},-q{0},--printlevel{2},--summary{1}",
+           [this](int64_t val) {
+               readerConfig::setPrintMode(static_cast<int>(val));
+               m_gds->set("printlevel", static_cast<double>(val));
+           },
+           "specify print output verbosity")
+        ->transform(
+            CLI::Transformer({{"verbose", "3"}, {"normal", "2"}, {"summary", "1"}, {"none", "0"}},
+                             CLI::ignore_case))
+        ->transform(CLI::Bound(0, 3));
+
+    ptr->add_option("--flags,-f", "specify flags to feed to GridDyn")
+        ->delimiter(',')
+        ->type_size(-1)
+        ->each([this](const std::string& val) {
+            try {
+                setMultipleFlags(m_gds.get(), val);
+            }
+            catch (const UnrecognizedParameter&) {
+                throw CLI::ValidationError("flag " + val + " not recognized");
+            }
+        });
+
+    ptr->add_flag_function(
+           "--warn{1},-w{1},--warn-all{2},--no-warn{0},--warn-important{1}",
+           [](int64_t val) { readerConfig::setWarnMode(static_cast<int>(val)); },
+           "specify warning level output")
+        ->disable_flag_override()
+        ->multi_option_policy(CLI::MultiOptionPolicy::TakeLast);
+    ptr->add_option_function<int>(
+           "--threads,-j",
+           [](int val) { griddyn::getGlobalWorkQueue(val); },
+           "specify the number of worker threads to use if multithreading is enabled")
+        ->check(CLI::PositiveNumber);
+
+    // Reader group should run before the main files are processed
+    auto* readerGroup =
+        ptr->add_option_group("reader_flags",
+                              "Flags and options impacting the file parser and reader")
+            ->immediate_callback();
+    readerGroup->add_option("--file-flags", "specify flags to feed to the file reader")
+        ->delimiter(',')
+        ->type_size(-1)
+        ->each(
+            [&readerInformation](const std::string& flag) { addFlags(readerInformation, flag); });
+    readerGroup->add_option("--define,-D", "definition strings for the element file readers")
+        ->type_size(-1)
+        ->each([&readerInformation](const std::string& defstr) {
+            auto splitLocation = defstr.find_first_of('=');
+            auto def = gmlc::utilities::stringOps::trim(defstr.substr(0, splitLocation));
+            auto rep = gmlc::utilities::stringOps::trim(defstr.substr(splitLocation + 1));
+            readerInformation.addLockedDefinition(def, rep);
+        });
+    readerGroup->add_option("--translate,-T", "translation strings for the element file readers")
+        ->type_size(-1)
+        ->each([&readerInformation](const std::string& transstr) {
+            auto splitLocation = transstr.find_first_of('=');
+            auto tran = gmlc::utilities::stringOps::trim(transstr.substr(0, splitLocation));
+            auto rep = gmlc::utilities::stringOps::trim(transstr.substr(splitLocation + 1));
+            readerInformation.addTranslate(tran, rep);
+        });
+
+    readerGroup
+        ->add_option_function<std::string>("--match-type",
+                                           readerConfig::setDefaultMatchType,
+                                           "the default parameter name matching algorithm to use ")
+        ->transform(
+            CLI::IsMember({"strict", "exact", "capital", "caps", "any", "all"}, CLI::ignore_case));
+
+    readerGroup
+        ->add_option_function<std::vector<std::string>>(
+            "--dir",
+            [&readerInformation](const std::vector<std::string>& dirList) {
+                for (const auto& dirname : dirList) {
+                    readerInformation.addDirectory(dirname);
+                }
+            },
+            "add search directory for input files")
+        ->check(CLI::ExistingPath)
+        ->delimiter(',');
+
+    ptr->add_option("input,--input", loadFileCallback, "main input file")
+        ->check(CLI::ExistingFile)
+        ->required()
+        ->type_size(-1);
+    ptr->add_option("--import,-i",
+                    loadFileCallback,
+                    "add import files loaded after the main input file")
+        ->check(CLI::ExistingFile)
+        ->type_size(-1);
+
+    ptr->add_option("--param,-P",
+                    loadParamString,
+                    "override simulation file parameters --param ParamName=<val>")
+        ->delimiter(',')
+        ->type_size(-1);
+
+    ptr->add_option("--event", "add event after all input files")
+        ->type_size(-1)
+        ->each([this](const std::string& event) {
+            EventInfo gdEI;
+            gdEI.loadString(event, m_gds->getRoot());
+            std::shared_ptr<Event> gdE = makeEvent(gdEI, m_gds->getRoot());
+            if (!gdE) {
+                m_gds->log(m_gds.get(),
+                           PrintLevel::WARNING,
+                           "unable to create command-line event '" + event + "'");
+                return;
+            }
+            if (!gdE->isArmed()) {
+                m_gds->log(m_gds.get(),
+                           PrintLevel::WARNING,
+                           "command-line event target was not resolved; ignoring event '" + event +
+                               "'");
+                return;
+            }
+            m_gds->add(std::move(gdE));
+        });
+
+    // Setup for automatic data capture
+    auto acdata = std::make_shared<std::tuple<double, std::string, std::vector<std::string>>>();
+
+    std::get<0>(*acdata) = 0.0;
+    std::get<1>(*acdata) = "auto_capture.bin";
+    std::get<2>(*acdata).emplace_back("auto");
+
+    auto* acGroup =
+        ptr->add_option_group("acgroup", "options related to automatic variable capture");
+    acGroup->option_defaults()->ignore_case()->ignore_underscore();
+    auto* autoCapturePeriodOption =
+        acGroup->add_option("--auto-capture-period,--auto_capture_period",
+                            std::get<0>(*acdata),
+                            "period to capture the automatic recording");
+    acGroup
+        ->add_option("--auto-capture,--auto_capture,--auto_capture_file,--auto-capture-file",
+                     std::get<1>(*acdata),
+                     "file for automatic recording")
+        ->needs(autoCapturePeriodOption);
+    acGroup
+        ->add_option(
+            "--auto-capture-field,--auto-capture-fields,--auto_capture_field,--auto_capture_fields",
+            std::get<2>(*acdata),
+            "fields to automatically capture")
+        ->delimiter(',')
+        ->needs(autoCapturePeriodOption);
+
+    acGroup->callback([this, acdata]() {
+        auto autorec = std::make_shared<Recorder>();
+        autorec->set("file", std::get<1>(*acdata));
+        autorec->set("period", std::get<0>(*acdata));
+        for (auto& field : std::get<2>(*acdata)) {
+            autorec->add(field, m_gds.get());
+        }
+        m_gds->add(autorec);
+    });
+    return ptr;
+}
+
+std::shared_ptr<CLI::App>
+    GriddynRunner::generateLocalCommandLineParser(ReaderInfo& /*readerInformation*/)
+{
+    return nullptr;
+}
+
+}  // namespace griddyn

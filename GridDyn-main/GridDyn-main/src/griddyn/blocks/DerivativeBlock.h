@@ -1,0 +1,68 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "../Block.h"
+#include <string>
+
+namespace griddyn::blocks {
+/**
+ * @brief First-order filtered differentiator.
+ *
+ * The block realizes @f$H(s)=Ks/(1+T_1s)@f$ through a filtered input state
+ * @f$z@f$: @f$T_1\dot z=K(u+b)-z@f$ and exposed output @f$y=\dot z@f$.
+ * Thus its DC output is zero and a constant input initializes the derivative
+ * to zero.  `t1` or `t` sets @f$T_1@f$; inherited `k`/`gain`, `bias`, and
+ * output limits retain their GridBlock meanings.  The solver uses the
+ * analytic residual/Jacobian; local stepping uses the legacy integration path.
+ */
+class DerivativeBlock: public GridBlock {
+  protected:
+    model_parameter mT1 = 0.1;  //!< delay time constant for the derivative filtering operation
+  public:
+    //!< default constructor
+    explicit DerivativeBlock(const std::string& objName = "derivBlock_#");
+    /** alternate constructor to add in the time constant
+@param[in] timeConstant  the time constant
+*/
+    DerivativeBlock(double timeConstant, const std::string& objName = "derivBlock_#");
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+
+  protected:
+    virtual void dynObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+    virtual void dynObjectInitializeB(const IOdata& inputs,
+                                      const IOdata& desiredOutput,
+                                      IOdata& fieldSet) override;
+
+  public:
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+    // virtual index_t findIndex(const std::string &field, const SolverMode &sMode) const;
+
+    virtual void blockDerivative(double input,
+                                 double didt,
+                                 const StateData& stateDataRef,
+                                 double deriv[],
+                                 const SolverMode& sMode) override;
+    virtual void blockAlgebraicUpdate(double input,
+                                      const StateData& stateDataRef,
+                                      double update[],
+                                      const SolverMode& sMode) override;
+    // only called if the genModel is not present
+    virtual void blockJacobianElements(double input,
+                                       double didt,
+                                       const StateData& stateDataRef,
+                                       MatrixData<double>& jacobian,
+                                       index_t argLoc,
+                                       const SolverMode& sMode) override;
+    virtual double step(CoreTime time, double inputA) override;
+
+    virtual stringVec localStateNames() const override;
+    // virtual void setTime(CoreTime time){prevTime=time;};
+};
+}  // namespace griddyn::blocks

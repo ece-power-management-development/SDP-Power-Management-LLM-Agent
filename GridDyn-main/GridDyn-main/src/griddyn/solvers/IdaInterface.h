@@ -1,0 +1,100 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "SundialsInterface.h"
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace griddyn::solvers {
+/** @brief SolverInterface interfacing to the SUNDIALS IDA solver
+ */
+class IdaInterface: public SundialsInterface {
+  public:
+    using SundialsInterface::set;
+    count_t icCount = 0;  //!< the number of times the initical condition function was called
+
+  private:
+    MatrixDataSparse<double> a1;  //!< array structure for holding the Jacobian information
+
+    std::vector<double> tempState;  //!< temporary holding location for a state vector
+    std::vector<std::string> rootNames;  //!< diagnostic names indexed by the root offset
+    std::vector<double> integrationReferenceState;  //!< state at the start of a diagnostic solve
+    CoreTime integrationReferenceTime = CoreTime{};
+    bool integrationFailureLogged = false;
+
+  public:
+    /** @brief constructor*/
+    explicit IdaInterface(const std::string& objName = "ida");
+    /** @brief alternate constructor
+@param[in] gds  the GridDynSimulation object to connect to
+@param[in] sMode the SolverMode to solve For
+*/
+    IdaInterface(GridDynSimulation* gds, const SolverMode& sMode);
+    /** @brief destructor*/
+    ~IdaInterface();
+
+    virtual std::unique_ptr<SolverInterface> clone(bool fullCopy = false) const override;
+
+    virtual void cloneTo(SolverInterface* si, bool fullCopy = false) const override;
+
+    virtual void allocate(count_t stateCount, count_t numRoots = 0) override;
+    void setMaxNonZeros(count_t nonZeros) override;
+    virtual void initialize(CoreTime t0) override;
+    virtual void sparseReInit(SparseReinitMode sparseReInitMode) override;
+    int calcIC(CoreTime t0, CoreTime tstep0, IcModes initCondMode, bool constraints) override;
+    virtual void getCurrentData() override;
+    int solve(CoreTime tStop, CoreTime& tReturn, StepMode stepMode = StepMode::NORMAL) override;
+    virtual void getRoots() override;
+    virtual void setRootFinding(count_t numRoots) override;
+
+    void logSolverStats(PrintLevel logLevel, bool iconly = false) const override;
+    void logErrorWeights(PrintLevel logLevel) const override;
+    virtual void set(std::string_view param, double val) override;
+    virtual double get(std::string_view param) const override;
+
+    void setConstraints() override;
+
+    // declare friend some helper functions
+    friend int idaFunc(sunrealtype time,
+                       N_Vector state,
+                       N_Vector dstateDt,
+                       N_Vector resid,
+                       void* userData);
+
+    friend int idaJac(sunrealtype time,
+                      sunrealtype cj,
+                      N_Vector state,
+                      N_Vector dstateDt,
+                      N_Vector resid,
+                      SUNMatrix J,
+                      void* userData,
+                      N_Vector tmp1,
+                      N_Vector tmp2,
+                      N_Vector tmp3);
+
+    friend int idaRootFunc(sunrealtype time,
+                           N_Vector state,
+                           N_Vector dstateDt,
+                           sunrealtype* gout,
+                           void* userData);
+
+  protected:
+    void loadMaskElements();
+    void logInitialConditionDiagnostics(
+        CoreTime t0,
+        CoreTime tstep0,
+        IcModes initCondMode,
+        int retval,
+        const std::vector<double>* initialState = nullptr,
+        const std::vector<double>* initialDerivative = nullptr) const;
+    void logIntegrationFailureDiagnostics(CoreTime time, int retval) const;
+    void logIntegrationStateDrift(CoreTime time) const;
+};
+
+}  // namespace griddyn::solvers

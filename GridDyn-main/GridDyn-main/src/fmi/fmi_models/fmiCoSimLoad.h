@@ -1,0 +1,38 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "fmiCoSimWrapper.hpp"
+#include "griddyn/Load.h"
+#include <string>
+
+namespace griddyn::fmi {
+class FmiCoSimLoad: public FmiCoSimWrapper<GridLoad> {
+  public:
+    enum ThreePhaseFmiLoadFlags {
+        IGNORE_VOLTAGE_ANGLE = OBJECT_FLAG8,
+        COMPLEX_VOLTAGE = OBJECT_FLAG9,
+        CURRENT_OUTPUT = OBJECT_FLAG10,
+        COMPLEX_OUTPUT = OBJECT_FLAG11,
+    };
+
+  public:
+    FmiCoSimLoad(const std::string& objName = "fmiLoad_$");
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+    virtual void pFlowObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+    virtual void dynObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+    virtual void dynObjectInitializeB(const IOdata& inputs,
+                                      const IOdata& desiredOutput,
+                                      IOdata& fieldSet) override;
+
+    virtual void setState(CoreTime time,
+                          const double state[],
+                          const double dstateDt[],
+                          const SolverMode& sMode) override;
+};
+
+}  // namespace griddyn::fmi

@@ -1,0 +1,650 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "ZipLoad.h"
+
+#include "../GridBus.h"
+#include "ApproximatingLoad.h"
+#include "CompositeLoad.h"
+#include "ExponentialLoad.h"
+#include "FDepLoad.h"
+#include "FileLoad.h"
+#include "RampLoad.h"
+#include "ShuntTD.h"
+#include "SourceLoad.h"
+#include "ThreePhaseLoad.h"
+#include "core/CoreExceptions.h"
+#include "core/CoreObjectTemplates.hpp"
+#include "core/ObjectFactoryTemplates.hpp"
+#include "utilities/MatrixData.hpp"
+#include <array>
+#include <cmath>
+#include <complex>
+#include <iostream>
+#include <string>
+
+namespace griddyn {
+using units::convert;
+using units::puA;
+using units::puMW;
+using units::puOhm;
+using units::puV;
+using units::unit;
+
+// setup the load object factories
+static TypeFactory<GridLoad> gLoadFactory("load",
+                                          std::to_array<std::string_view>({"simple", "constant"}));
+static ChildTypeFactory<ZipLoad, GridLoad>
+    gZipLoadFactory("load",
+                    std::to_array<std::string_view>({"basic", "zip"}),
+                    "zip");  // set basic to the default
+namespace loads {
+    static TypeFactory<CompositeLoad>
+        gCompositeLoadFactory("load",
+                              std::to_array<std::string_view>({"loadcomposition", "compositemix"}));
+    static TypeFactoryArg<SourceLoad, SourceLoad::SourceType>
+        gPulseLoadFactory("load", "pulse", SourceLoad::SourceType::PULSE);
+    static TypeFactoryArg<SourceLoad, SourceLoad::SourceType>
+        gSineLoadFactory("load",
+                         std::to_array<std::string_view>({"sine", "sin", "sinusoidal"}),
+                         SourceLoad::SourceType::SINE);
+    static ChildTypeFactory<RampLoad, GridLoad> gRampLoadFactory("load", "ramp");
+    static TypeFactoryArg<SourceLoad, SourceLoad::SourceType>
+        gRandomLoadFactory("load",
+                           std::to_array<std::string_view>({"random", "rand"}),
+                           SourceLoad::SourceType::RANDOM);
+    static ChildTypeFactory<FileLoad, GridLoad> gFileLoadFactory("load", "file");
+    static ChildTypeFactory<SourceLoad, GridLoad>
+        gSourceLoadFactory("load", std::to_array<std::string_view>({"src", "source"}));
+    static ChildTypeFactory<ExponentialLoad, GridLoad>
+        gExponentialLoadFactory("load", std::to_array<std::string_view>({"exponential", "exp"}));
+    static ChildTypeFactory<FDepLoad, GridLoad>
+        gFrequencyDependentLoadFactory("load", std::to_array<std::string_view>({"fdep", "fload"}));
+    static ChildTypeFactory<ThreePhaseLoad, GridLoad>
+        gThreePhaseLoadFactory("load",
+                               std::to_array<std::string_view>({"3phase", "3p", "threephase"}));
+    static ChildTypeFactory<ShuntTD, GridLoad> gShuntTDFactory("load", "shunttd");
+
+    static ChildTypeFactory<ApproximatingLoad, GridLoad>
+        gApproximatingLoadFactory("load",
+                                  std::to_array<std::string_view>({"approx", "approximating"}));
+}  // namespace loads
+
+ZipLoad::ZipLoad(const std::string& objName): GridLoad(objName) {}
+ZipLoad::ZipLoad(double realPower, double reactivePower, const std::string& objName):
+    GridLoad(realPower, reactivePower, objName)
+{
+}
+CoreObject* ZipLoad::clone(CoreObject* obj) const
+{
+    auto* nobj = cloneBaseFactory<ZipLoad, GridLoad>(this, obj, &gZipLoadFactory);
+    if (nobj == nullptr) {
+        return obj;
+    }
+    // nobj->Psched = Psched;
+    nobj->Yp = Yp;
+    nobj->Yq = Yq;
+    nobj->Iq = Iq;
+    nobj->Ip = Ip;
+    nobj->Pout = Pout;
+    nobj->Vpqmax = Vpqmax;
+    nobj->Vpqmin = Vpqmin;
+    nobj->localBaseVoltage = localBaseVoltage;
+    nobj->trigVVlow = trigVVlow;
+    nobj->trigVVhigh = trigVVhigh;
+    return nobj;
+}
+
+void ZipLoad::pFlowObjectInitializeA(CoreTime time0, std::uint32_t flags)
+{
+    GridLoad::pFlowObjectInitializeA(time0, flags);
+    // Psched = getRealPower();
+    // dPdf = -H / 30 * Psched;
+    lastTime = time0;
+#ifdef SGS_DEBUG
+    std::cout << "SGS : " << prevTime << " : " << name
+              << " ZipLoad::pFlowInitializeA realPower = " << getRealPower()
+              << " reactive power = " << getReactivePower() << '\n';
+#endif
+}
+
+void ZipLoad::dynObjectInitializeA(CoreTime /*time0*/, std::uint32_t flags)
+{
+    if ((opFlags[CONVERT_TO_CONSTANT_IMPEDANCE]) ||
+        CHECK_CONTROLFLAG(flags, ALL_LOADS_TO_CONSTANT_IMPEDENCE)) {
+        const double voltage = bus->getVoltage();
+        const double invVsquared = 1.0 / (voltage * voltage);
+        Yp = Yp + (P * invVsquared);
+        P = 0;
+        if (opFlags[USE_POWER_FACTOR_FLAG]) {
+            Yq = Yq + (P * pfq * invVsquared);
+            Q = 0;
+        } else {
+            Yq = Yq + (Q * invVsquared);
+            Q = 0;
+        }
+    }
+
+#ifdef SGS_DEBUG
+    std::cout << "SGS : " << prevTime << " : " << name
+              << " ZipLoad::dynInitializeA realPower = " << getRealPower()
+              << " reactive power = " << getReactivePower() << '\n';
+#endif
+}
+
+void ZipLoad::timestep(CoreTime time, const IOdata& inputs, const SolverMode& /*sMode*/)
+{
+    if (!isConnected()) {
+        Pout = 0;
+        return;
+    }
+    if (time != prevTime) {
+        updateLocalCache(inputs, StateData(time), cLocalSolverMode);
+    }
+
+    const double voltage = (inputs.empty()) ? (bus->getVoltage()) : inputs[VOLTAGE_IN_LOCATION];
+    Pout = -getRealPower(voltage);
+    prevTime = time;
+    Qout = -getReactivePower(voltage);
+
+#ifdef SGS_DEBUG
+    std::cout << "SGS : " << prevTime << " : " << name
+              << " ZipLoad::timestep realPower = " << getRealPower()
+              << " reactive power = " << getReactivePower() << '\n';
+#endif
+}
+
+static constexpr auto locNumStrings =
+    std::array<std::string_view,
+               10>{"yp", "yq", "ip", "iq", "x", "r", "h", "m", "vpqmin", "vpqmax"};
+
+static constexpr std::array<std::string_view, 0> locStrStrings{};
+
+static constexpr auto flagStrings =
+    std::array<std::string_view, 2>{"converttoimpedance", "no_pqvoltage_limit"};
+
+void ZipLoad::getParameterStrings(stringVec& pstr, ParamStringType pstype) const
+{
+    getParamString<ZipLoad, GridLoad>(
+        this, pstr, locNumStrings, locStrStrings, flagStrings, pstype);
+}
+
+void ZipLoad::setFlag(std::string_view flag, bool val)
+{
+    if (flag == "usepowerfactor") {
+        if (val) {
+            if (!(opFlags[USE_POWER_FACTOR_FLAG])) {
+                opFlags.set(USE_POWER_FACTOR_FLAG);
+                updatepfq();
+            }
+        } else {
+            opFlags.reset(USE_POWER_FACTOR_FLAG);
+        }
+    } else if (flag == "converttoimpedance") {
+        opFlags.set(CONVERT_TO_CONSTANT_IMPEDANCE, val);
+    } else if (flag == "no_pqvoltage_limit") {
+        opFlags.set(NO_PQVOLTAGE_LIMIT, val);
+        if (opFlags[NO_PQVOLTAGE_LIMIT]) {
+            Vpqmax = 100;
+            Vpqmin = -1.0;
+        }
+    } else {
+        GridLoad::setFlag(flag, val);
+    }
+}
+
+// set properties
+void ZipLoad::set(std::string_view param, std::string_view val)
+{
+    if (param.empty()) {
+    } else {
+        GridLoad::set(param, val);
+    }
+}
+
+double ZipLoad::get(std::string_view param, unit unitType) const
+{
+    double val = kNullVal;
+    if (param.length() == 1) {
+        switch (param[0]) {
+            case 'p':
+                val = convert(getP(), puMW, unitType, systemBasePower);
+                break;
+            case 'q':
+                val = convert(getQ(), puMW, unitType, systemBasePower);
+                break;
+            case 'r':
+                val = getr();
+                break;
+            case 'x':
+                val = getx();
+                break;
+            case 'z':
+                val = std::abs(std::complex<double>(getr(), getx()));
+                break;
+            case 'y':
+                val = std::abs(1.0 / std::complex<double>(getr(), getx()));
+                break;
+            case 'g':
+                val = 1 / getr();
+                break;
+            case 'b':
+                val = 1.0 / getx();
+                break;
+            default:
+                break;
+        }
+        return val;
+    }
+    if (param == "yp") {
+        val = convert(Yp, puMW, unitType, systemBasePower);
+    } else if (param == "yq") {
+        val = convert(Yq, puMW, unitType, systemBasePower);
+    } else if (param == "ip") {
+        val = convert(Ip, puMW, unitType, systemBasePower);
+    } else if (param == "iq") {
+        val = convert(Iq, puMW, unitType, systemBasePower);
+    } else if (param == "pf") {
+        val = pfq;
+    } else {
+        val = GridLoad::get(param, unitType);
+    }
+    return val;
+}
+
+void ZipLoad::set(std::string_view param, double val, unit unitType)
+{
+    if (param.empty()) {
+        return;
+    }
+    if (param.length() == 1) {
+        switch (param[0]) {
+            case 'p':
+                setP(convert(val, unitType, puMW, systemBasePower, localBaseVoltage));
+                break;
+            case 'q':
+                setQ(convert(val, unitType, puMW, systemBasePower, localBaseVoltage));
+                break;
+            case 'r':
+                setr(convert(val, unitType, puOhm, systemBasePower, localBaseVoltage));
+                break;
+            case 'x':
+                setx(convert(val, unitType, puOhm, systemBasePower, localBaseVoltage));
+                break;
+            case 'g':
+                setup(convert(val, unitType, puMW, systemBasePower, localBaseVoltage));
+                break;
+            case 'b':
+                setYq(convert(val, unitType, puMW, systemBasePower, localBaseVoltage));
+                break;
+            default:
+                throw(UnrecognizedParameter(param));
+        }
+        checkFaultChange();
+        return;
+    }
+    if (param.back() == '+')  // load increments
+    {
+        // load increments  allows a delta on the load through the set functions
+        if (param == "p+") {
+            P += convert(val, unitType, puMW, systemBasePower, localBaseVoltage);
+            checkpfq();
+        } else if (param == "q+") {
+            Q += convert(val, unitType, puMW, systemBasePower, localBaseVoltage);
+            updatepfq();
+        } else if ((param == "yp+") || (param == "zr+")) {
+            Yp += convert(val, unitType, puMW, systemBasePower, localBaseVoltage);
+            checkFaultChange();
+        } else if ((param == "yq+") || (param == "zq+")) {
+            Yq += convert(val, unitType, puMW, systemBasePower, localBaseVoltage);
+            checkFaultChange();
+        } else if ((param == "ir+") || (param == "ip+")) {
+            Ip += convert(val, unitType, puA, systemBasePower, localBaseVoltage);
+            checkFaultChange();
+        } else if (param == "iq+") {
+            Iq += convert(val, unitType, puA, systemBasePower, localBaseVoltage);
+            checkFaultChange();
+        } else {
+            GridSecondary::set(param, val, unitType);  // NOLINT
+        }
+    } else if (param.back() == '*') {
+        // load increments  allows a delta on the load through the set functions
+        if (param == "p*") {
+            P *= val;
+            checkpfq();
+        } else if (param == "q*") {
+            Q *= val;
+            updatepfq();
+        } else if ((param == "yp*") || (param == "zr*")) {
+            Yp *= val;
+            checkFaultChange();
+        } else if ((param == "yq*") || (param == "zq*")) {
+            Yq *= val;
+            checkFaultChange();
+        } else if ((param == "ir*") || (param == "ip*")) {
+            Ip *= val;
+            checkFaultChange();
+        } else if (param == "iq*") {
+            Iq *= val;
+            checkFaultChange();
+        } else {
+            GridSecondary::set(param, val, unitType);  // NOLINT
+        }
+    } else if (param == "load p") {
+        setP(convert(val, unitType, puMW, systemBasePower, localBaseVoltage));
+    } else if (param == "load q") {
+        setQ(convert(val, unitType, puMW, systemBasePower, localBaseVoltage));
+    } else if ((param == "yp") || (param == "shunt g") || (param == "zr")) {
+        setup(convert(val, unitType, puMW, systemBasePower, localBaseVoltage));
+    } else if ((param == "yq") || (param == "shunt b") || (param == "zq")) {
+        setYq(convert(val, unitType, puMW, systemBasePower, localBaseVoltage));
+    } else if ((param == "ir") || (param == "ip")) {
+        setIp(convert(val, unitType, puA, systemBasePower, localBaseVoltage));
+    } else if (param == "iq") {
+        setIq(convert(val, unitType, puA, systemBasePower, localBaseVoltage));
+    } else if ((param == "pf") || (param == "powerfactor")) {
+        if (val != 0.0) {
+            if (std::abs(val) <= 1.0) {
+                pfq = std::sqrt(1.0 - (val * val)) / val;
+            } else {
+                pfq = 0.0;
+            }
+        } else {
+            pfq = kBigNum;
+        }
+        opFlags.set(USE_POWER_FACTOR_FLAG);
+    } else if (param == "scale") {
+        P *= val;
+        Q *= val;
+        Ip *= val;
+        Iq *= val;
+        Yp *= val;
+        Yq *= val;
+        updatepfq();
+        checkFaultChange();
+    } else if (param == "qratio") {
+        pfq = val;
+        opFlags.set(USE_POWER_FACTOR_FLAG);
+    } else if (param == "vpqmin") {
+        if (!opFlags[NO_PQVOLTAGE_LIMIT]) {
+            Vpqmin = convert(val, unitType, puV, systemBasePower, localBaseVoltage);
+            trigVVlow = 1.0 / (Vpqmin * Vpqmin);
+        }
+    } else if (param == "vpqmax") {
+        if (!opFlags[NO_PQVOLTAGE_LIMIT]) {
+            Vpqmax = convert(val, unitType, puV, systemBasePower, localBaseVoltage);
+            trigVVhigh = 1.0 / (Vpqmax * Vpqmax);
+        }
+    } else if (param == "pqlowvlimit") {
+        // this is mostly a convenience flag for adaptive solving
+        if (val > 0.1)  // not a flag
+        {
+            if (Vpqmin < 0.5) {
+                if (!opFlags[NO_PQVOLTAGE_LIMIT]) {
+                    Vpqmin = 0.9;
+                    trigVVlow = 1.0 / (Vpqmin * Vpqmin);
+                }
+            }
+        }
+    } else if ((param == "basevoltage") || (param == "base vol")) {
+        // SGS added to set the base voltage 2015-01-30
+        localBaseVoltage = val;
+    } else {
+        GridLoad::set(param, val, unitType);
+    }
+}
+
+void ZipLoad::setup(double newYp)
+{
+    Yp = newYp;
+    checkFaultChange();
+}
+
+void ZipLoad::setYq(double newYq)
+{
+    Yq = newYq;
+    checkFaultChange();
+}
+
+void ZipLoad::setIp(double newIp)
+{
+    Ip = newIp;
+    checkFaultChange();
+}
+
+void ZipLoad::setIq(double newIq)
+{
+    Iq = newIq;
+    checkFaultChange();
+}
+
+void ZipLoad::setr(double newr)
+{
+    if (newr == 0.0) {
+        Yp = 0.0;
+        return;
+    }
+    const std::complex<double> impedance(newr, getx());
+    const auto admittance = std::conj(1.0 / impedance);
+    Yp = admittance.real();
+    Yq = admittance.imag();
+    checkFaultChange();
+}
+void ZipLoad::setx(double newx)
+{
+    if (newx == 0.0) {
+        Yq = 0.0;
+        return;
+    }
+    const std::complex<double> impedance(getr(), -newx);
+    const auto admittance = 1.0 / impedance;
+    Yp = admittance.real();
+    Yq = admittance.imag();
+    checkFaultChange();
+}
+
+double ZipLoad::getr() const
+{
+    if (Yp == 0.0) {
+        return 0.0;
+    }
+    const std::complex<double> admittance(Yp, Yq);
+    const auto impedance = 1.0 / admittance;  // I would take a conjugate but it doesn't matter
+                                              // since we are only returning the real part
+    return impedance.real();
+}
+
+double ZipLoad::getx() const
+{
+    if (Yq == 0.0) {
+        return 0.0;
+    }
+    const std::complex<double> admittance(Yp, Yq);
+    const auto impedance = std::conj(1.0 / admittance);
+    return impedance.imag();
+}
+
+void ZipLoad::updateLocalCache(const IOdata& /*inputs*/,
+                               const StateData& stateData,
+                               const SolverMode& /*sMode*/)
+{
+    lastTime = stateData.time;
+}
+
+void ZipLoad::setState(CoreTime time,
+                       const double state[],
+                       const double dstateDt[],
+                       const SolverMode& sMode)
+{
+    const StateData stateData(time, state, dstateDt);
+    updateLocalCache(noInputs, stateData, sMode);
+    prevTime = time;
+}
+
+double ZipLoad::voltageAdjustment(double val, double voltage) const
+{
+    if (voltage < Vpqmin) {
+        val = voltage * voltage * val * trigVVlow;
+    } else if (voltage > Vpqmax) {
+        val = voltage * voltage * val * trigVVhigh;
+    }
+    return val;
+}
+
+double ZipLoad::getQval() const
+{
+    double val = Q;
+
+    if (opFlags[USE_POWER_FACTOR_FLAG]) {
+        if (pfq < 1000.0) {
+            val = P * pfq;
+        }
+    }
+    return val;
+}
+
+double ZipLoad::getRealPower() const
+{
+    return getRealPower(bus->getVoltage());
+}
+
+double ZipLoad::getReactivePower() const
+{
+    return getReactivePower(bus->getVoltage());
+}
+
+double ZipLoad::getRealPower(const IOdata& inputs,
+                             const StateData& stateData,
+                             const SolverMode& sMode) const
+{
+    const double voltage =
+        (inputs.empty()) ? (bus->getVoltage(stateData, sMode)) : inputs[VOLTAGE_IN_LOCATION];
+    return getRealPower(voltage);
+}
+
+double ZipLoad::getReactivePower(const IOdata& inputs,
+                                 const StateData& stateData,
+                                 const SolverMode& sMode) const
+{
+    const double voltage =
+        (inputs.empty()) ? (bus->getVoltage(stateData, sMode)) : inputs[VOLTAGE_IN_LOCATION];
+    return getReactivePower(voltage);
+}
+
+double ZipLoad::getRealPower(const double voltage) const
+{
+    if (!isConnected()) {
+        return 0.0;
+    }
+    double val = voltageAdjustment(P, voltage);
+    val += voltage * ((voltage * Yp) + Ip);
+
+    return val;
+}
+
+double ZipLoad::getReactivePower(double voltage) const
+{
+    if (!isConnected()) {
+        return 0.0;
+    }
+    double val = voltageAdjustment(getQval(), voltage);
+
+    val += voltage * ((voltage * Yq) + Iq);
+    return val;
+}
+
+void ZipLoad::outputPartialDerivatives(const IOdata& inputs,
+                                       const StateData& stateData,
+                                       MatrixData<double>& matrixData,
+                                       const SolverMode& sMode)
+{
+    if (inputs.empty())  // we only have output derivatives if the input arguments are not counted
+    {
+        auto argsBus = bus->getOutputs(noInputs, stateData, sMode);
+        auto inputLocs = bus->getOutputLocs(sMode);
+        ioPartialDerivatives(argsBus, stateData, matrixData, inputLocs, sMode);
+    }
+}
+
+count_t ZipLoad::outputDependencyCount(index_t /*num*/, const SolverMode& /*sMode*/) const
+{
+    return 0;
+}
+void ZipLoad::ioPartialDerivatives(const IOdata& inputs,
+                                   const StateData& stateData,
+                                   MatrixData<double>& matrixData,
+                                   const IOlocs& inputLocs,
+                                   const SolverMode& sMode)
+{
+    if (stateData.time != lastTime) {
+        updateLocalCache(inputs, stateData, sMode);
+    }
+    const double voltage = inputs[VOLTAGE_IN_LOCATION];
+    double voltageScale = 0.0;
+    if (voltage < Vpqmin) {
+        voltageScale = trigVVlow;
+    } else if (voltage > Vpqmax) {
+        voltageScale = trigVVhigh;
+    }
+
+    matrixData.assignCheckCol(POUT_LOCATION,
+                              inputLocs[VOLTAGE_IN_LOCATION],
+                              (2.0 * voltage * Yp) + Ip + (2.0 * voltage * P * voltageScale));
+
+    if (opFlags[USE_POWER_FACTOR_FLAG]) {
+        if (pfq < 1000.0) {
+            matrixData.assignCheckCol(QOUT_LOCATION,
+                                      inputLocs[VOLTAGE_IN_LOCATION],
+                                      (2.0 * voltage * Yq) + Iq +
+                                          (2.0 * voltage * P * pfq * voltageScale));
+        } else {
+            matrixData.assignCheckCol(QOUT_LOCATION,
+                                      inputLocs[VOLTAGE_IN_LOCATION],
+                                      (2.0 * voltage * Yq) + Iq +
+                                          (2.0 * voltage * Q * voltageScale));
+        }
+    } else {
+        matrixData.assignCheckCol(QOUT_LOCATION,
+                                  inputLocs[VOLTAGE_IN_LOCATION],
+                                  (2.0 * voltage * Yq) + Iq + (2.0 * voltage * Q * voltageScale));
+    }
+}
+
+bool compareLoad(ZipLoad* ld1, ZipLoad* ld2, bool /*printDiff*/)
+{
+    bool cmp = true;
+
+    if ((ld1->opFlags.to_ullong() & flagMask) != (ld2->opFlags.to_ullong() & flagMask)) {
+        cmp = false;
+    }
+    if (std::abs(ld1->P - ld2->P) > 0.00001) {
+        cmp = false;
+    }
+
+    if (std::abs(ld1->Q - ld2->Q) > 0.00001) {
+        cmp = false;
+    }
+    if (std::abs(ld1->pfq - ld2->pfq) > 0.00001) {
+        cmp = false;
+    }
+    if (std::abs(ld1->Ip - ld2->Ip) > 0.00001) {
+        cmp = false;
+    }
+
+    if (std::abs(ld1->Iq - ld2->Iq) > 0.00001) {
+        cmp = false;
+    }
+    if (std::abs(ld1->Yp - ld2->Yp) > 0.00001) {
+        cmp = false;
+    }
+
+    if (std::abs(ld1->Yq - ld2->Yq) > 0.00001) {
+        cmp = false;
+    }
+    return cmp;
+}
+
+}  // namespace griddyn

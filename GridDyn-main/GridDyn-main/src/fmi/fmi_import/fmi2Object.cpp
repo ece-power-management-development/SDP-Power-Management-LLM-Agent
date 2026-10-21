@@ -1,0 +1,515 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "fmiObjects.h"
+#include <cstdio>
+#include <memory>
+#include <print>
+#include <string>
+#include <utility>
+#include <vector>
+
+Fmi2Object::Fmi2Object(fmi2Component cmp,
+                       std::shared_ptr<const FmiInfo> keyInfo,
+                       std::shared_ptr<const FmiCommonFunctions> comFunc):
+    comp(cmp), info(std::move(keyInfo)), commonFunctions(std::move(comFunc))
+{
+}
+
+Fmi2Object::~Fmi2Object()
+{
+    commonFunctions->fmi2FreeInstance(comp);
+}
+void Fmi2Object::setupExperiment(fmi2Boolean toleranceDefined,
+                                 fmi2Real tolerance,
+                                 fmi2Real startTime,
+                                 fmi2Boolean stopTimeDefined,
+                                 fmi2Real stopTime)
+{
+    auto ret = commonFunctions->fmi2SetupExperiment(
+        comp, toleranceDefined, tolerance, startTime, stopTimeDefined, stopTime);
+    if (ret != fmi2Status::fmi2OK) {
+        handleNonOKReturnValues(ret);
+    }
+}
+
+FmuMode Fmi2Object::getCurrentMode() const
+{
+    return currentMode;
+}
+
+void Fmi2Object::setMode(FmuMode newMode)  // NOLINT(misc-no-recursion)
+{
+    if (newMode == FmuMode::ERROR) {
+        currentMode = FmuMode::ERROR;
+        throw(FmiErrorException());
+    }
+    fmi2Status ret = fmi2Error;
+    if (newMode == FmuMode::TERMINATED) {
+        currentMode = FmuMode::TERMINATED;
+        ret = commonFunctions->fmi2Terminate(comp);
+    }
+
+    switch (currentMode) {
+        case FmuMode::INSTANTIATED_MODE:
+            switch (newMode) {
+                case FmuMode::INITIALIZATION_MODE:
+                    if (inputSize() == 0) {
+                        setDefaultInputs();
+                    }
+                    if (outputSize() == 0) {
+                        setDefaultOutputs();
+                    }
+                    // printf("calling fmi enterInitMode\n");
+                    ret = commonFunctions->fmi2EnterInitializationMode(comp);
+                    // printf("return from fmiEnterInitializationMode with code %d\n", ret);
+                    break;
+                case FmuMode::EVENT_MODE:
+                case FmuMode::STEP_MODE:
+                    Fmi2Object::setMode(
+                        FmuMode::INITIALIZATION_MODE);  // go into initialization first
+                    ret = commonFunctions->fmi2ExitInitializationMode(comp);
+                    break;
+                default:
+                    break;
+            }
+            break;
+        case FmuMode::INITIALIZATION_MODE:
+            if ((newMode == FmuMode::EVENT_MODE) || (newMode == FmuMode::STEP_MODE)) {
+                // printf("calling exit initMode\n");
+                if (!commonFunctions->fmi2ExitInitializationMode) {
+                    std::println("function is not present");
+                }
+                ret = commonFunctions->fmi2ExitInitializationMode(comp);
+                // printf("finished exit initMode return %d\n", ret);
+            }
+            break;
+        default:
+            break;
+    }
+
+    if (ret == fmi2OK) {
+        currentMode = newMode;
+    } else if (currentMode == newMode) {
+        ret = fmi2OK;
+    }
+    handleNonOKReturnValues(ret);
+}
+
+void Fmi2Object::reset()
+{
+    currentMode = FmuMode::INSTANTIATED_MODE;
+    auto ret = commonFunctions->fmi2Reset(comp);
+    if (ret != fmi2Status::fmi2OK) {
+        handleNonOKReturnValues(ret);
+    }
+}
+
+template<>
+std::string Fmi2Object::get<std::string>(const std::string& param) const
+{
+    auto ref = info->getVariableInformation(param);
+    if (ref.type != FmiVariableType::STRING) {
+        handleNonOKReturnValues(fmi2Status::fmi2Discard);
+        return "";  // if we get here just return an empty string otherwise we threw an exception
+    }
+    fmi2String res;
+    auto retval = commonFunctions->fmi2GetString(comp, &(ref.valueRef), 1, &res);
+    if (retval != fmi2Status::fmi2OK) {
+        handleNonOKReturnValues(retval);
+    }
+    return {res};  // this should copy the actual the string
+}
+
+void Fmi2Object::get(const FmiVariableSet& vrset, fmi2Real value[]) const
+{
+    auto ret =
+        commonFunctions->fmi2GetReal(comp, vrset.getValueReferences(), vrset.getVrCount(), value);
+    if (ret != fmi2Status::fmi2OK) {
+        handleNonOKReturnValues(ret);
+    }
+}
+void Fmi2Object::get(const FmiVariableSet& vrset, fmi2Integer value[]) const
+{
+    auto ret = commonFunctions->fmi2GetInteger(comp,
+                                               vrset.getValueReferences(),
+                                               vrset.getVrCount(),
+                                               value);
+    if (ret != fmi2Status::fmi2OK) {
+        handleNonOKReturnValues(ret);
+    }
+}
+
+void Fmi2Object::get(const FmiVariableSet& vrset, fmi2String value[]) const
+{
+    auto ret =
+        commonFunctions->fmi2GetString(comp, vrset.getValueReferences(), vrset.getVrCount(), value);
+    if (ret != fmi2Status::fmi2OK) {
+        handleNonOKReturnValues(ret);
+    }
+}
+
+void Fmi2Object::set(const FmiVariableSet& vrset, fmi2Integer value[])
+{
+    auto ret = commonFunctions->fmi2GetInteger(comp,
+                                               vrset.getValueReferences(),
+                                               vrset.getVrCount(),
+                                               value);
+    if (ret != fmi2Status::fmi2OK) {
+        handleNonOKReturnValues(ret);
+    }
+}
+
+void Fmi2Object::set(const FmiVariableSet& vrset, fmi2Real value[])
+{
+    auto retval =
+        commonFunctions->fmi2SetReal(comp, vrset.getValueReferences(), vrset.getVrCount(), value);
+    if (retval != fmi2Status::fmi2OK) {
+        handleNonOKReturnValues(retval);
+    }
+}
+
+void Fmi2Object::set(const std::string& param, const char* val)
+{
+    auto ref = info->getVariableInformation(param);
+    if (!(ref.type == FmiVariableType::STRING)) {
+        handleNonOKReturnValues(fmi2Status::fmi2Discard);
+        return;
+    }
+    auto ret = commonFunctions->fmi2SetString(comp, &(ref.valueRef), 1, &val);
+    if (ret != fmi2Status::fmi2OK) {
+        handleNonOKReturnValues(ret);
+    }
+}
+
+void Fmi2Object::set(const std::string& param, const std::string& val)
+{
+    auto ref = info->getVariableInformation(param);
+    if (!(ref.type == FmiVariableType::STRING)) {
+        handleNonOKReturnValues(fmi2Status::fmi2Discard);
+        return;
+    }
+    fmi2String val2 = val.c_str();
+    auto ret = commonFunctions->fmi2SetString(comp, &(ref.valueRef), 1, &val2);
+    if (ret != fmi2Status::fmi2OK) {
+        handleNonOKReturnValues(ret);
+    }
+}
+
+void Fmi2Object::setFlag(const std::string& param, bool val)
+{
+    auto ref = info->getVariableInformation(param);
+    if (!(ref.type == FmiVariableType::STRING)) {
+        handleNonOKReturnValues(fmi2Status::fmi2Discard);
+        return;
+    }
+    const fmi2Boolean val2 = val ? fmi2True : fmi2False;
+    auto ret = commonFunctions->fmi2SetBoolean(comp, &(ref.valueRef), 1, &val2);
+    if (ret != fmi2Status::fmi2OK) {
+        handleNonOKReturnValues(ret);
+    }
+}
+
+void Fmi2Object::getFmuState(fmi2FMUstate* fmuState)
+{
+    auto ret = commonFunctions->fmi2GetFMUstate(comp, fmuState);
+    if (ret != fmi2Status::fmi2OK) {
+        handleNonOKReturnValues(ret);
+    }
+}
+void Fmi2Object::setFmuState(fmi2FMUstate fmuState)
+{
+    auto ret = commonFunctions->fmi2SetFMUstate(comp, fmuState);
+    if (ret != fmi2Status::fmi2OK) {
+        handleNonOKReturnValues(ret);
+    }
+}
+
+size_t Fmi2Object::serializedStateSize(fmi2FMUstate fmuState)
+{
+    size_t serializedSize;
+    auto ret = commonFunctions->fmi2SerializedFMUstateSize(comp, fmuState, &serializedSize);
+    if (ret != fmi2Status::fmi2OK) {
+        handleNonOKReturnValues(ret);
+    }
+    return serializedSize;
+}
+void Fmi2Object::serializeState(fmi2FMUstate fmuState, fmi2Byte serializedState[], size_t size)
+{
+    auto ret = commonFunctions->fmi2SerializeFMUstate(comp, fmuState, serializedState, size);
+    if (ret != fmi2Status::fmi2OK) {
+        handleNonOKReturnValues(ret);
+    }
+}
+void Fmi2Object::deserializeState(const fmi2Byte serializedState[],
+                                  size_t size,
+                                  fmi2FMUstate* fmuState)
+{
+    auto ret = commonFunctions->fmi2DeSerializeFMUstate(comp, serializedState, size, fmuState);
+    if (ret != fmi2Status::fmi2OK) {
+        handleNonOKReturnValues(ret);
+    }
+}
+void Fmi2Object::getDirectionalDerivative(const fmi2ValueReference vUnknownRef[],
+                                          size_t nUnknown,
+                                          const fmi2ValueReference vKnownRef[],
+                                          size_t unknown,
+                                          const fmi2Real dvKnown[],
+                                          fmi2Real dvUnknown[])
+{
+    auto ret = commonFunctions->fmi2GetDirectionalDerivative(
+        comp, vUnknownRef, nUnknown, vKnownRef, unknown, dvKnown, dvUnknown);
+    if (ret != fmi2Status::fmi2OK) {
+        handleNonOKReturnValues(ret);
+    }
+}
+
+fmi2Real Fmi2Object::getPartialDerivative(int indexX, int indexY, double deltaX)
+{
+    double deltaY;
+    commonFunctions->fmi2GetDirectionalDerivative(comp,
+                                                  &(info->getVariableInformation(indexX).valueRef),
+                                                  1,
+                                                  &(info->getVariableInformation(indexY).valueRef),
+                                                  1,
+                                                  &deltaX,
+                                                  &deltaY);
+    return deltaY;
+}
+
+/** check if an output is real and actually is an output*/
+static bool isRealOutput(const VariableInformation& variableInfo)
+{
+    return ((variableInfo.index >= 0) && (variableInfo.type == FmiVariableType::REAL) &&
+            (variableInfo.causality == FmiCausalityType::OUTPUT));
+}
+
+/** check if an input is real and actually is an input*/
+static bool isRealInput(const VariableInformation& variableInfo)
+{
+    return ((variableInfo.index >= 0) && (variableInfo.type == FmiVariableType::REAL) &&
+            (variableInfo.causality == FmiCausalityType::INPUT));
+}
+
+// NOLINTBEGIN(misc-no-recursion)
+void Fmi2Object::setOutputVariables(const std::vector<std::string>& outNames)
+{
+    if (outNames.size() == 1) {
+        if (outNames[0] == "all") {
+            setDefaultOutputs();
+            return;
+        }
+    }
+    activeOutputs.clear();
+    activeOutputIndices.clear();
+    for (const auto& outName : outNames) {
+        const auto& variableInfo = info->getVariableInformation(outName);
+        if (isRealOutput(variableInfo)) {
+            activeOutputs.push(variableInfo.valueRef);
+            activeOutputIndices.push_back(variableInfo.index);
+        }
+        // TODO(phlpt): Decide what to do if this condition is not valid.
+    }
+}
+
+void Fmi2Object::setOutputVariables(const std::vector<int>& outIndices)
+{
+    activeOutputIndices.clear();
+    activeOutputs.clear();
+    for (const auto& outIndex : outIndices) {
+        const auto& variableInfo = info->getVariableInformation(outIndex);
+        if (isRealOutput(variableInfo)) {
+            activeOutputs.push(variableInfo.valueRef);
+            activeOutputIndices.push_back(variableInfo.index);
+        }
+    }
+}
+
+void Fmi2Object::setInputVariables(const std::vector<std::string>& inNames)
+{
+    if (inNames.size() == 1) {
+        if (inNames[0] == "all") {
+            setDefaultInputs();
+            return;
+        }
+    }
+    activeInputs.clear();
+    activeInputIndices.clear();
+    for (const auto& inName : inNames) {
+        const auto& variableInfo = info->getVariableInformation(inName);
+        if (isRealInput(variableInfo)) {
+            activeInputs.push(variableInfo.valueRef);
+            activeInputIndices.push_back(variableInfo.index);
+        }
+    }
+}
+
+void Fmi2Object::setInputVariables(const std::vector<int>& inIndices)
+{
+    activeInputs.clear();
+    activeInputIndices.clear();
+    for (const auto& inIndex : inIndices) {
+        const auto& variableInfo = info->getVariableInformation(inIndex);
+        if (isRealInput(variableInfo)) {
+            activeInputs.push(variableInfo.valueRef);
+            activeInputIndices.push_back(variableInfo.index);
+        }
+    }
+}
+
+void Fmi2Object::setDefaultInputs()
+{
+    setInputVariables(info->getVariableNames("input"));
+}
+
+void Fmi2Object::setDefaultOutputs()
+{
+    setOutputVariables(info->getVariableNames("output"));
+}
+// NOLINTEND(misc-no-recursion)
+
+void Fmi2Object::setInputs(const fmi2Real inputs[])
+{
+    auto ret = commonFunctions->fmi2SetReal(comp,
+                                            activeInputs.getValueReferences(),
+                                            activeInputs.getVrCount(),
+                                            inputs);
+    if (ret != fmi2Status::fmi2OK) {
+        handleNonOKReturnValues(ret);
+    }
+}
+
+void Fmi2Object::getCurrentInputs(fmi2Real inputs[])
+{
+    auto ret = commonFunctions->fmi2GetReal(comp,
+                                            activeInputs.getValueReferences(),
+                                            activeInputs.getVrCount(),
+                                            inputs);
+    if (ret != fmi2Status::fmi2OK) {
+        handleNonOKReturnValues(ret);
+    }
+}
+
+void Fmi2Object::getOutputs(fmi2Real outputs[]) const
+{
+    auto ret = commonFunctions->fmi2GetReal(comp,
+                                            activeOutputs.getValueReferences(),
+                                            activeOutputs.getVrCount(),
+                                            outputs);
+    if (ret != fmi2Status::fmi2OK) {
+        handleNonOKReturnValues(ret);
+    }
+}
+
+fmi2Real Fmi2Object::getOutput(size_t outNum) const
+{
+    fmi2Real out = -1e48;
+    if (outNum < activeOutputs.getVrCount()) {
+        commonFunctions->fmi2GetReal(comp, activeOutputs.getValueReferences() + outNum, 1, &out);
+    }
+    return out;
+}
+
+FmiVariableSet Fmi2Object::getVariableSet(const std::string& variable) const
+{
+    return info->getVariableSet(variable);
+}
+
+FmiVariableSet Fmi2Object::getVariableSet(int index) const
+{
+    return info->getVariableSet(index);
+}
+
+std::vector<std::string> Fmi2Object::getOutputNames() const
+{
+    std::vector<std::string> oVec;
+    if (activeOutputs.getVrCount() == 0) {
+        oVec = info->getVariableNames("outputs");
+    } else {
+        oVec.reserve(activeOutputs.getVrCount());
+        for (const auto& outputIndex : activeOutputIndices) {
+            oVec.push_back(info->getVariableInformation(outputIndex).name);
+        }
+    }
+
+    return oVec;
+}
+
+std::vector<std::string> Fmi2Object::getInputNames() const
+{
+    std::vector<std::string> oVec;
+    if (activeInputs.getVrCount() == 0) {
+        oVec = info->getVariableNames("inputs");
+    } else {
+        oVec.reserve(activeInputs.getVrCount());
+        for (const auto& inputIndex : activeInputIndices) {
+            oVec.push_back(info->getVariableInformation(inputIndex).name);
+        }
+    }
+    return oVec;
+}
+
+bool Fmi2Object::isParameter(const std::string& param, FmiVariableType type)
+{
+    const auto& variableInfo = info->getVariableInformation(param);
+    if (variableInfo.index >= 0) {
+        if ((variableInfo.causality == FmiCausalityType::PARAMETER) ||
+            (variableInfo.causality == FmiCausalityType::INPUT)) {
+            if (variableInfo.type == type) {
+                return true;
+            }
+            if (type == FmiVariableType::NUMERIC) {
+                if (variableInfo.type != FmiVariableType::STRING) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+bool Fmi2Object::isVariable(const std::string& var, FmiVariableType type)
+{
+    const auto& variableInfo = info->getVariableInformation(var);
+    if (variableInfo.index >= 0) {
+        if (variableInfo.type == type) {
+            return true;
+        }
+        if (type == FmiVariableType::NUMERIC) {
+            if (variableInfo.type != FmiVariableType::STRING) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+void Fmi2Object::handleNonOKReturnValues(fmi2Status retval) const
+{
+    switch (retval) {
+        case fmi2Status::fmi2OK:
+        case fmi2Status::fmi2Pending:
+            return;
+        case fmi2Status::fmi2Discard:
+            if (exceptionOnDiscard) {
+                throw(FmiDiscardException());
+            }
+            break;
+        case fmi2Status::fmi2Warning:
+            if (exceptionOnWarning) {
+                throw(FmiWarningException());
+            }
+            break;
+        case fmi2Status::fmi2Error:
+            throw(FmiErrorException());
+        case fmi2Status::fmi2Fatal:
+            throw(FmiFatalException());
+        default:
+            throw(FmiException());
+    }
+}

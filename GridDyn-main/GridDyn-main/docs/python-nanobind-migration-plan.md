@@ -1,0 +1,382 @@
+# Python Nanobind Migration Plan
+
+> **Status (2026-09):** The initial nanobind migration is complete and the
+> package is built through `pyproject.toml` and cross-platform wheel CI. This
+> document began as a design plan; sections below describing the first
+> milestone and future phases are historical planning context. The maintained
+> Python API is documented in [Python interface](python-interface.md).
+
+This document records the design and completion of replacing GridDyn's
+SWIG-generated Python interface with a first-class nanobind interface built
+directly on the C++ simulation API.
+
+## Summary
+
+GridDyn previously exposed Python through SWIG wrappers over the C API in
+`interfaces/python`. The replacement is a Pythonic interface built with
+nanobind that calls GridDyn C++ directly. The C API and SWIG-generated wrappers
+are no longer part of the maintained Python implementation.
+
+The first milestone was deliberately narrow. The implementation has since
+grown to include model inspection and editing, result collections, dynamic
+simulation, and PYPOWER/MATPOWER power-flow case export.
+
+## Goals
+
+1. Provide a modern Python package for GridDyn using nanobind.
+2. Bind directly to C++ classes and functions, not to the C API.
+3. Make `Simulation` the first supported public concept.
+4. Replace return codes and output parameters with Python exceptions and return
+   values.
+5. Use modern Python conventions such as `pathlib.Path`, properties,
+   type-friendly APIs, and eventually NumPy arrays.
+6. Deprecate SWIG entirely and remove it as soon as replacement workflows are
+   available.
+7. Treat Matlab support, if needed later, as a separate interface problem rather
+   than a SWIG requirement.
+
+## Non-goals For The First Milestone
+
+1. Bind the entire GridDyn C++ class hierarchy.
+2. Reproduce the SWIG function-name API.
+3. Wrap the C API with nanobind.
+4. Support Matlab, Octave, or Java through the new Python work.
+5. Provide complete object construction and model-editing support.
+6. Expose advanced solver internals, Jacobians, or state-vector APIs.
+
+## Current State
+
+The retired Python interface was generated from `interfaces/griddyn.i` and
+`interfaces/python/griddynPython.i`. It exposed the C API from
+`src/griddyn_shared/griddyn_export.h` and
+`src/griddyn_shared/griddyn_export_advanced.h`.
+
+That API is intentionally C-shaped:
+
+- Opaque `void*` handles represent objects, simulations, queries, events, and
+  solver keys.
+- Users call functions such as `gridDynSimulationLoadfile`,
+  `gridDynSimulationRunTo`, and `gridDynObjectGetValue`.
+- Error reporting is based on `GridDynError` output structures and return
+  values.
+- Arrays are exposed as raw pointer buffers.
+- The generated Python files include SWIG pointer helpers and explicit object
+  free functions.
+
+This is useful for broad language binding generation, but it is not the surface
+we want to preserve for Python.
+
+## Target Package Shape
+
+The preferred package shape is:
+
+```text
+python/
+  griddyn/
+    __init__.py
+    py.typed
+  griddyn_python.cpp
+pyproject.toml
+```
+
+The compiled extension should live under the package, for example:
+
+```text
+griddyn/_core.pyd
+```
+
+Python users should import from `griddyn`, not from an implementation module:
+
+```python
+import griddyn as gd
+
+sim = gd.Simulation(name="case14")
+sim.load("case14.xml")
+sim.power_flow.run()
+sim.time_domain.initialize()
+sim.time_domain.run_until(10.0)
+```
+
+## First Public API
+
+The first public API should focus on loading and operating a simulation:
+
+```python
+class Simulation:
+    def __init__(self, *, name: str = "", type: str = "default") -> None:
+        ...
+
+    def load(self, path: str | Path, *, format: str | None = None) -> None:
+        ...
+
+    def load_from_string(self, arguments: str) -> None:
+        ...
+
+    def load_from_args(self, arguments: list[str]) -> None:
+        ...
+
+    def reset(self) -> None:
+        ...
+
+    def execute(self, action: str) -> int:
+        ...
+
+    @property
+    def time(self) -> float:
+        ...
+
+    @property
+    def name(self) -> str:
+        ...
+
+    @name.setter
+    def name(self, value: str) -> None:
+        ...
+
+    @property
+    def power_flow(self) -> "PowerFlowRoutine":
+        ...
+
+    @property
+    def time_domain(self) -> "TimeDomainRoutine":
+        ...
+
+
+class PowerFlowRoutine:
+    def run(self) -> None:
+        ...
+
+
+class TimeDomainRoutine:
+    def initialize(self) -> None:
+        ...
+
+    def run(self) -> float:
+        ...
+
+    def run_until(self, time: float) -> float:
+        ...
+
+    def step(self, time: float) -> float:
+        ...
+```
+
+`Simulation` owns loading, system properties, object access, file output, and
+general GridDyn action execution.
+Power-flow, OPF, and time-domain operations live on their respective domain
+objects. The simulation clock is exposed once as `Simulation.time`.
+
+## C++ Binding Design
+
+The nanobind module should use small adapter classes owned by the binding layer.
+Those adapters should make Python ownership and error behavior explicit while
+calling GridDyn C++ directly.
+
+A likely first adapter is:
+
+```cpp
+class PySimulation {
+  public:
+    explicit PySimulation(std::string name = "", std::string type = "default");
+
+    void load(const std::filesystem::path& path,
+              std::optional<std::string> format = std::nullopt);
+    void loadFromString(std::string_view arguments);
+    void loadFromArgs(const std::vector<std::string>& arguments);
+    void reset();
+    int execute(std::string_view action);
+
+    double time() const;
+    std::string name() const;
+    void setName(std::string_view name);
+
+  private:
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+};
+
+class PyPowerFlowRoutine {
+  public:
+    void run();
+};
+
+class PyTimeDomainRoutine {
+  public:
+    void initialize();
+    double run();
+    double runUntil(double time);
+    double step(double time);
+};
+```
+
+The adapter should call C++ APIs such as:
+
+- `griddyn::GriddynRunner`
+- `griddyn::GridDynSimulation`
+- `griddyn::loadFile`
+- `GridDynSimulation::powerflow`
+- `GridDynSimulation::run`
+- `GridSimulation::getSimulationTime`
+
+The nanobind module should not include or call:
+
+- `griddyn_export.h`
+- `griddyn_export_advanced.h`
+- `GridDynSimulationCreate`
+- `gridDynObjectCreate`
+- any other C API entry points
+
+## Error Handling
+
+The Python layer should translate GridDyn C++ exceptions into Python
+exceptions. Python code should not inspect integer return codes for normal error
+handling.
+
+Initial exception hierarchy:
+
+```python
+GridDynError
+InvalidObjectError
+InvalidParameterError
+FileLoadError
+SolveError
+ExecutionError
+```
+
+The implementation maps common GridDyn failures to Python exceptions, with
+`GridDynError` as the public base class. The mapping lives in the nanobind
+source so it is shared by wrapped methods.
+
+## GIL Policy
+
+Long-running simulation operations should release the GIL once they no longer
+need Python objects:
+
+- `load`
+- `load_from_string`
+- `load_from_args`
+- `power_flow.run`
+- `time_domain.initialize`
+- `time_domain.run`
+- `time_domain.run_until`
+- `time_domain.step`
+- `execute`
+- `reset` if it can perform significant work
+
+The wrapper should reacquire the GIL before throwing Python exceptions or
+interacting with Python-owned objects.
+
+## Build And Packaging
+
+Use the `rtunits` Python package as the local model:
+
+- `pyproject.toml`
+- `scikit-build-core`
+- `nanobind`
+- CMake-driven extension build
+- package-local compiled extension
+
+Python library CMake option:
+
+```cmake
+GRIDDYN_BUILD_PYTHON_LIBRARY=ON
+```
+
+The nanobind target should link to internal C++ targets needed by
+`GriddynRunner` and `GridDynSimulation`, not to `griddyn_shared_lib`.
+
+## SWIG Removal
+
+The SWIG-generated language interfaces have been removed. Do not add new SWIG
+typemaps, generated files, or SWIG-based language interfaces. If Matlab or
+another language needs support later, prefer a command-line, file-based, or
+purpose-built interface rather than reviving SWIG.
+
+## C API Removal
+
+The nanobind migration does not depend on the C API. The old C shared-library
+target and its export headers have been removed from the maintained build.
+
+## Future API Phases
+
+### Phase 2: Minimal Object Access
+
+Expose enough object access to inspect and lightly edit loaded simulations:
+
+```python
+obj = sim.find("bus1")
+obj.get("voltage", units="pu")
+obj.set("angle", 0.0, units="rad")
+obj.flag("enabled")
+```
+
+This will require a `GridObject` adapter with explicit non-owning references
+that keep the parent `Simulation` alive.
+
+### Phase 3: Results
+
+Expose common simulation results in a Pythonic way:
+
+- scalar results as return values
+- table-like results as Python objects
+- vector data as NumPy arrays where useful
+- file save/load helpers only where they are part of normal workflows
+
+### Phase 4: Events And Queries
+
+Expose event scheduling and query objects after the simulation and object
+surfaces are stable.
+
+### Phase 5: Solver And Advanced Math APIs
+
+Expose advanced state, residual, derivative, and Jacobian APIs only after
+deciding the Python scientific stack expectations:
+
+- NumPy arrays
+- SciPy sparse matrices
+- typed result objects
+- ownership and mutability rules for state buffers
+
+## Testing Plan
+
+The first tests should be small and workflow-oriented:
+
+1. Import `griddyn`.
+2. Construct `Simulation`.
+3. Load a tiny existing test model.
+4. Initialize.
+5. Run `powerflow`.
+6. Read `time`.
+7. Run to a short target time if the model supports dynamics.
+8. Confirm invalid file loads raise `FileLoadError`.
+
+The first tests should not depend on SWIG or the C API.
+
+The CI workflow builds and smoke-tests wheels. The release workflow publishes
+versioned releases to PyPI and checks that a release tag matches the package
+version.
+
+## Decisions In Use
+
+- Package sources live in top-level `python/` and users import `griddyn`.
+- The compiled extension is `griddyn._core` and uses nanobind's stable ABI.
+- The package requires Python 3.13 or newer and CI builds platform wheels.
+- The extension links the required GridDyn components statically into the
+  package wheel.
+- Initialization accepts either a command-line string or a sequence of
+  arguments through distinct methods.
+
+## Working Checklist
+
+- [x] Choose final package location.
+- [x] Add `pyproject.toml` for scikit-build-core.
+- [x] Add nanobind CMake discovery and extension target.
+- [x] Add `griddyn` Python package directory.
+- [x] Implement `PySimulation` adapter.
+- [x] Bind `Simulation` in nanobind.
+- [x] Add GridDyn exception translation.
+- [x] Add basic Python import and construction smoke test.
+- [x] Add CI wheel build and smoke test.
+- [x] Add load and powerflow smoke test.
+- [x] Add documentation for the Python API and case export.
+- [x] Remove SWIG interface sources and CMake build paths.
+- [x] Remove the C shared-library target.

@@ -1,0 +1,129 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+// headers
+#include "../GridBus.h"
+#include "DcBusControls.h"
+#include "utilities/MatrixDataTranslate.hpp"
+#include <string>
+
+namespace griddyn {
+// forward classes
+
+/** @brief class implements a DC powered bus
+ the DC has only one state (voltage) and can only attach to links that are DC capable
+*/
+class DcBus: public GridBus {
+    friend class DcBusControls;
+
+  public:
+    enum BusFlags {
+        USE_AUTOGEN = OBJECT_FLAG2,  //!< indicator if the bus is using an autogen
+        SLAVE_BUS = OBJECT_FLAG3,  //!< indicator that the bus is a slave Bus
+        MASTER_BUS = OBJECT_FLAG4,  //!< indicator that a bus is a master bus
+        DIRECTCONNECT = OBJECT_FLAG5,  //!< indicator that a bus is direct connected to another bus
+    };
+
+  protected:
+    double vTarget = 1.0;  //!< a target voltage
+    double participation = 1.0;
+    DcBusControls busController;  //!< pointer to the busController object
+    BusType prevType = BusType::PQ;  //!< previous type container if the type automatically changes
+    DynBusType prevDynType =
+        DynBusType::NORMAL;  //!< previous type container if the type automatically changes
+    double dVdP = 0.0;  //!< storage for the dVdP terms from all the secondary objects
+    MatrixDataTranslate<1> of;
+
+  public:
+    explicit DcBus(const std::string& objName = "dcBus_$");
+
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+    // add components
+    using GridBus::add;
+    virtual void add(Link* lnk) override;  // this add function checks for DC capable links
+
+    // dynInitializeB
+
+    virtual StateSizes localStateSizes(const SolverMode& sMode) const override;
+
+    virtual count_t localJacobianCount(const SolverMode& sMode) const override;
+
+  protected:
+    virtual void pFlowObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+    virtual void pFlowObjectInitializeB() override;
+
+  public:
+    virtual ChangeCode powerFlowAdjust(const IOdata& inputs,
+                                       std::uint32_t flags,
+                                       CheckLevel level) override;  // only applicable in pFlow
+    // virtual  void generationAdjust(double adjustment);
+    virtual void pFlowCheck(std::vector<Violation>& violationVector) override;
+    // dynInitializeB dynamics
+  protected:
+    virtual void dynObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+    virtual void dynObjectInitializeB(const IOdata& inputs,
+                                      const IOdata& desiredOutput,
+                                      IOdata& fieldSet) override;
+
+  public:
+    // parameter set functions
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+
+    virtual void guessState(CoreTime time,
+                            double state[],
+                            double dstateDt[],
+                            const SolverMode& sMode) override;
+    virtual void setState(CoreTime time,
+                          const double state[],
+                          const double dstateDt[],
+                          const SolverMode& sMode) override;
+    virtual void jacobianElements(const IOdata& inputs,
+                                  const StateData& stateDataValue,
+                                  MatrixData<double>& matrixDataValue,
+                                  const IOlocs& inputLocs,
+                                  const SolverMode& sMode) override;
+
+    void computeDerivatives(const StateData& stateDataValue, const SolverMode& sMode);
+
+    virtual void residual(const IOdata& inputs,
+                          const StateData& stateDataValue,
+                          double resid[],
+                          const SolverMode& sMode) override;
+    virtual void converge(CoreTime time,
+                          double state[],
+                          double dstateDt[],
+                          const SolverMode& sMode,
+                          ConvergeMode mode = ConvergeMode::LOCAL_ITERATION,
+                          double tol = 0.01) override;
+
+    virtual void timestep(CoreTime time, const IOdata& inputs, const SolverMode& sMode) override;
+
+    virtual double getVoltage(const double state[], const SolverMode& sMode) const override;
+
+    virtual double getVoltage(const StateData& stateDataValue,
+                              const SolverMode& sMode) const override;
+
+    virtual IOlocs getOutputLocs(const SolverMode& sMode) const override;
+
+    virtual index_t getOutputLoc(const SolverMode& sMode, index_t num = 0) const override;
+
+    virtual bool useVoltage(const SolverMode& sMode) const;
+    virtual int getMode(const SolverMode& sMode) const;
+    virtual int propogatePower(bool makeSlack = false) override;
+
+    virtual void getStateName(stringVec& stNames,
+                              const SolverMode& sMode,
+                              const std::string& prefix) const override;
+
+  protected:
+    void computePowerAdjustments();
+};
+
+}  // namespace griddyn

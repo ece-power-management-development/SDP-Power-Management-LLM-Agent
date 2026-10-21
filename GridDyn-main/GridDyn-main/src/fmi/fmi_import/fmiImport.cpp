@@ -1,0 +1,456 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "fmiImport.h"
+
+#include "fmiObjects.h"
+#include "gmlc/utilities/stringOps.h"
+#include "utilities/zipUtilities.h"
+#include <array>
+#include <cstdarg>
+#include <cstdio>
+#include <map>
+#include <memory>
+#include <print>
+
+#include <boost/dll/import.hpp>
+#include <boost/dll/shared_library.hpp>
+
+using std::filesystem::create_directories;
+using std::filesystem::exists;
+using std::filesystem::is_directory;
+using std::filesystem::path;
+
+FmiLibrary::FmiLibrary()
+{
+    information = std::make_shared<FmiInfo>();
+}
+
+FmiLibrary::FmiLibrary(const std::string& fmupath): FmiLibrary()
+{
+    loadFmu(fmupath);
+}
+
+FmiLibrary::FmiLibrary(const std::string& fmupath, const std::string& extractPath):
+    extractDirectory(extractPath), fmuName(fmupath)
+{
+    information = std::make_shared<FmiInfo>();
+    if (!exists(extractDirectory)) {
+        create_directories(extractDirectory);
+    }
+    loadInformation();
+}
+
+FmiLibrary::~FmiLibrary() = default;
+
+void FmiLibrary::close()
+{
+    soMeLoaded = false;
+    soCoSimLoaded = false;
+    lib = nullptr;
+}
+
+bool FmiLibrary::checkFlag(FmuCapabilityFlags flag) const
+{
+    return information->checkFlag(flag);
+}
+
+bool FmiLibrary::isSoLoaded(FmuType type) const
+{
+    switch (type) {
+        case FmuType::MODEL_EXCHANGE:
+            return soMeLoaded;
+        case FmuType::COSIMULATION:
+            return soCoSimLoaded;
+        default:
+            return (soMeLoaded || soCoSimLoaded);
+    }
+}
+
+void FmiLibrary::loadFmu(const std::string& fmupath)
+{
+    path ipath(fmupath);
+    if (is_directory(ipath)) {
+        extractDirectory = ipath;
+    } else {
+        fmuName = ipath;
+        extractDirectory = fmuName.parent_path() / fmuName.stem();
+    }
+    loadInformation();
+}
+
+void FmiLibrary::loadFmu(const std::string& fmupath, const std::string& extractPath)
+{
+    extractDirectory = extractPath;
+    fmuName = fmupath;
+    loadInformation();
+}
+
+int FmiLibrary::getCounts(const std::string& countType) const
+{
+    int cnt{-1};
+    if (countType == "meobjects") {
+        cnt = mecount;
+    } else if (countType == "cosimobjects") {
+        cnt = cosimcount;
+    } else {
+        cnt = information->getCounts(countType);
+    }
+
+    if (cnt == -1) {
+        return -1;
+    }
+    return cnt;
+}
+
+void FmiLibrary::loadInformation()
+{
+    auto xmlfile = extractDirectory / "modelDescription.xml";
+    if (!exists(xmlfile)) {
+        auto res = extract();
+        if (res != 0) {
+            return;
+        }
+    }
+    const int res = information->loadFile(xmlfile.string());
+    if (res != 0) {
+        error = true;
+        return;
+    }
+    xmlLoaded = true;
+
+    // load the resources directory location if it exists
+    if (exists(extractDirectory / "resources")) {
+        resourceDir = extractDirectory / "resources";
+    } else {
+        resourceDir = "";
+    }
+}
+
+std::string FmiLibrary::getTypes() const
+{
+    if (isSoLoaded()) {
+        return {baseFunctions.fmi2GetTypesPlatform()};
+    }
+    return {};
+}
+
+std::string FmiLibrary::getVersion() const
+{
+    if (isSoLoaded()) {
+        return {baseFunctions.fmi2GetVersion()};
+    }
+    return {};
+}
+
+int FmiLibrary::extract()
+{
+    const int ret = utilities::unzip(fmuName.string(), extractDirectory.string());
+    if (ret != 0) {
+        error = true;
+    }
+    return ret;
+}
+
+std::unique_ptr<Fmi2ModelExchangeObject>
+    FmiLibrary::createModelExchangeInstance(const std::string& name)
+{
+    if (!isSoLoaded()) {
+        loadSharedLibrary(FmuType::MODEL_EXCHANGE);
+    }
+    if (soMeLoaded) {
+        if (!callbacks) {
+            makeCallbackFunctions();
+        }
+        auto* comp =
+            baseFunctions.fmi2Instantiate(name.c_str(),
+                                          fmi2ModelExchange,
+                                          information->getString("guid").c_str(),
+                                          (R"raw(file:///)raw" + resourceDir.string()).c_str(),
+                                          callbacks.get(),
+                                          fmi2False,
+                                          fmi2False);
+        auto meobj = std::make_unique<Fmi2ModelExchangeObject>(comp,
+                                                               information,
+                                                               commonFunctions,
+                                                               ModelExchangeFunctions);
+        ++mecount;
+        return meobj;
+    }
+
+    return nullptr;
+}
+
+std::unique_ptr<Fmi2CoSimObject> FmiLibrary::createCoSimulationInstance(const std::string& name)
+{
+    if (!isSoLoaded()) {
+        loadSharedLibrary(FmuType::COSIMULATION);
+    }
+    if (soCoSimLoaded) {
+        if (!callbacks) {
+            makeCallbackFunctions();
+        }
+        auto* comp =
+            baseFunctions.fmi2Instantiate(name.c_str(),
+                                          fmi2CoSimulation,
+                                          information->getString("guid").c_str(),
+                                          (R"raw(file:///)raw" + resourceDir.string()).c_str(),
+                                          callbacks.get(),
+                                          fmi2False,
+                                          fmi2False);
+        auto csobj =
+            std::make_unique<Fmi2CoSimObject>(comp, information, commonFunctions, CoSimFunctions);
+        ++cosimcount;
+        return csobj;
+    }
+    return nullptr;
+}
+
+void FmiLibrary::loadSharedLibrary(FmuType type)
+{
+    if (isSoLoaded()) {
+        return;
+    }
+    auto sopath = findSoPath(type);
+    bool loaded = false;
+    if (!sopath.empty()) {
+        lib = std::make_shared<boost::dll::shared_library>(sopath.string());
+        if (lib->is_loaded()) {
+            loaded = true;
+        } else {
+            std::println("unable to load shared file {}", sopath.string().c_str());  // NOLINT
+        }
+    } else {
+        std::println("unable to locate shared file ");  // NOLINT
+    }
+    if (loaded) {
+        loadBaseFunctions();
+        loadCommonFunctions();
+        // Only load one or the other
+        if (checkFlag(MODEL_EXCHANGE_CAPABLE) && type != FmuType::COSIMULATION) {
+            loadModelExchangeFunctions();
+            soMeLoaded = true;
+            soCoSimLoaded = false;
+        } else if (checkFlag(CO_SIMULATION_CAPABLE)) {
+            loadCoSimFunctions();
+            soCoSimLoaded = true;
+            soMeLoaded = false;
+        }
+    }
+}
+
+path FmiLibrary::findSoPath(FmuType type)
+{
+    path sopath = extractDirectory / "binaries";
+
+    std::string identifier;
+    switch (type) {
+        case FmuType::UNKNOWN:
+        default:
+            if (checkFlag(MODEL_EXCHANGE_CAPABLE))  // give priority to model Exchange
+            {
+                identifier = information->getString("meidentifier");
+            } else if (checkFlag(CO_SIMULATION_CAPABLE)) {
+                identifier = information->getString("cosimidentifier");
+            } else {
+                return "";
+            }
+            break;
+        case FmuType::COSIMULATION:
+            if (checkFlag(CO_SIMULATION_CAPABLE)) {
+                identifier = information->getString("cosimidentifier");
+            } else {
+                return "";
+            }
+            break;
+        case FmuType::MODEL_EXCHANGE:
+            if (checkFlag(MODEL_EXCHANGE_CAPABLE)) {
+                identifier = information->getString("meidentifier");
+            } else {
+                return "";
+            }
+            break;
+    }
+    if constexpr (sizeof(void*) == 8) {
+#ifdef _WIN32
+        sopath /= "win64";
+        sopath /= identifier + ".dll";
+#else
+#    ifdef MACOS
+        sopath /= "darwin64";
+        sopath /= identifier + ".dylib";
+#    else
+        sopath /= "linux64";
+        sopath /= identifier + ".so";
+#    endif
+#endif
+
+        if (exists(sopath)) {
+            return sopath;
+        }
+        std::println("checking {} but doesn't exist", sopath.string().c_str());  // NOLINT
+#ifdef MACOS
+        sopath /= "darwin64";
+        sopath /= identifier + ".so";
+#endif
+    } else {  // NOLINT
+#ifdef _WIN32
+        sopath /= "win32";
+        sopath /= identifier + ".dll";
+#else
+#    ifdef MACOS
+        sopath /= "darwin32";
+        sopath /= identifier + ".dylib";
+#    else
+        sopath /= "linux32";
+        sopath /= identifier + ".so";
+#    endif
+#endif
+    }
+
+    if (exists(sopath)) {
+        return sopath;
+    }
+
+    return {};
+}
+
+void FmiLibrary::loadBaseFunctions()
+{
+    baseFunctions.fmi2GetVersion = lib->get<fmi2GetVersionTYPE>("fmi2GetVersion");
+    baseFunctions.fmi2GetTypesPlatform = lib->get<fmi2GetTypesPlatformTYPE>("fmi2GetTypesPlatform");
+    baseFunctions.fmi2Instantiate = lib->get<fmi2InstantiateTYPE>("fmi2Instantiate");
+}
+
+// TODO(PT): move these to the constructors of the function libraries
+void FmiLibrary::loadCommonFunctions()
+{
+    commonFunctions = std::make_shared<FmiCommonFunctions>();
+
+    commonFunctions->lib = lib;
+    commonFunctions->fmi2SetDebugLogging = lib->get<fmi2SetDebugLoggingTYPE>("fmi2SetDebugLogging");
+
+    /* Creation and destruction of FMU instances and setting debug status */
+
+    commonFunctions->fmi2FreeInstance = lib->get<fmi2FreeInstanceTYPE>("fmi2FreeInstance");
+
+    /* Enter and exit initialization mode, terminate and reset */
+    commonFunctions->fmi2SetupExperiment = lib->get<fmi2SetupExperimentTYPE>("fmi2SetupExperiment");
+    commonFunctions->fmi2EnterInitializationMode =
+        lib->get<fmi2EnterInitializationModeTYPE>("fmi2EnterInitializationMode");
+    commonFunctions->fmi2ExitInitializationMode =
+        lib->get<fmi2ExitInitializationModeTYPE>("fmi2ExitInitializationMode");
+    commonFunctions->fmi2Terminate = lib->get<fmi2TerminateTYPE>("fmi2Terminate");
+    commonFunctions->fmi2Reset = lib->get<fmi2ResetTYPE>("fmi2Reset");
+
+    /* Getting and setting variable values */
+    commonFunctions->fmi2GetReal = lib->get<fmi2GetRealTYPE>("fmi2GetReal");
+    commonFunctions->fmi2GetInteger = lib->get<fmi2GetIntegerTYPE>("fmi2GetInteger");
+    commonFunctions->fmi2GetBoolean = lib->get<fmi2GetBooleanTYPE>("fmi2GetBoolean");
+    commonFunctions->fmi2GetString = lib->get<fmi2GetStringTYPE>("fmi2GetString");
+
+    commonFunctions->fmi2SetReal = lib->get<fmi2SetRealTYPE>("fmi2SetReal");
+    commonFunctions->fmi2SetInteger = lib->get<fmi2SetIntegerTYPE>("fmi2SetInteger");
+    commonFunctions->fmi2SetBoolean = lib->get<fmi2SetBooleanTYPE>("fmi2SetBoolean");
+    commonFunctions->fmi2SetString = lib->get<fmi2SetStringTYPE>("fmi2SetString");
+
+    /* Getting and setting the internal FMU state */
+    commonFunctions->fmi2GetFMUstate = lib->get<fmi2GetFMUstateTYPE>("fmi2GetFMUstate");
+    commonFunctions->fmi2SetFMUstate = lib->get<fmi2SetFMUstateTYPE>("fmi2SetFMUstate");
+    commonFunctions->fmi2FreeFMUstate = lib->get<fmi2FreeFMUstateTYPE>("fmi2FreeFMUstate");
+    commonFunctions->fmi2SerializedFMUstateSize =
+        lib->get<fmi2SerializedFMUstateSizeTYPE>("fmi2SerializedFMUstateSize");
+    commonFunctions->fmi2SerializeFMUstate =
+        lib->get<fmi2SerializeFMUstateTYPE>("fmi2SerializeFMUstate");
+    commonFunctions->fmi2DeSerializeFMUstate =
+        lib->get<fmi2DeSerializeFMUstateTYPE>("fmi2DeSerializeFMUstate");
+
+    /* Getting partial derivatives */
+    commonFunctions->fmi2GetDirectionalDerivative =
+        lib->get<fmi2GetDirectionalDerivativeTYPE>("fmi2GetDirectionalDerivative");
+}
+void FmiLibrary::loadModelExchangeFunctions()
+{
+    ModelExchangeFunctions = std::make_shared<FmiModelExchangeFunctions>();
+
+    ModelExchangeFunctions->lib = lib;
+    ModelExchangeFunctions->fmi2EnterEventMode =
+        lib->get<fmi2EnterEventModeTYPE>("fmi2EnterEventMode");
+    ModelExchangeFunctions->fmi2NewDiscreteStates =
+        lib->get<fmi2NewDiscreteStatesTYPE>("fmi2NewDiscreteStates");
+    ModelExchangeFunctions->fmi2EnterContinuousTimeMode =
+        lib->get<fmi2EnterContinuousTimeModeTYPE>("fmi2EnterContinuousTimeMode");
+    ModelExchangeFunctions->fmi2CompletedIntegratorStep =
+        lib->get<fmi2CompletedIntegratorStepTYPE>("fmi2CompletedIntegratorStep");
+
+    /* Providing independent variables and re-initialization of caching */
+    ModelExchangeFunctions->fmi2SetTime = lib->get<fmi2SetTimeTYPE>("fmi2SetTime");
+    ModelExchangeFunctions->fmi2SetContinuousStates =
+        lib->get<fmi2SetContinuousStatesTYPE>("fmi2SetContinuousStates");
+
+    /* Evaluation of the model equations */
+    ModelExchangeFunctions->fmi2GetDerivatives =
+        lib->get<fmi2GetDerivativesTYPE>("fmi2GetDerivatives");
+    ModelExchangeFunctions->fmi2GetEventIndicators =
+        lib->get<fmi2GetEventIndicatorsTYPE>("fmi2GetEventIndicators");
+    ModelExchangeFunctions->fmi2GetContinuousStates =
+        lib->get<fmi2GetContinuousStatesTYPE>("fmi2GetContinuousStates");
+    ModelExchangeFunctions->fmi2GetNominalsOfContinuousStates =
+        lib->get<fmi2GetNominalsOfContinuousStatesTYPE>("fmi2GetNominalsOfContinuousStates");
+}
+void FmiLibrary::loadCoSimFunctions()
+{
+    CoSimFunctions = std::make_shared<FmiCoSimFunctions>();
+    CoSimFunctions->lib = lib;
+    CoSimFunctions->fmi2SetRealInputDerivatives =
+        lib->get<fmi2SetRealInputDerivativesTYPE>("fmi2SetRealInputDerivatives");
+    CoSimFunctions->fmi2GetRealOutputDerivatives =
+        lib->get<fmi2GetRealOutputDerivativesTYPE>("fmi2GetRealOutputDerivatives");
+
+    CoSimFunctions->fmi2DoStep = lib->get<fmi2DoStepTYPE>("fmi2DoStep");
+    CoSimFunctions->fmi2CancelStep = lib->get<fmi2CancelStepTYPE>("fmi2CancelStep");
+
+    /* Inquire slave status */
+    CoSimFunctions->fmi2GetStatus = lib->get<fmi2GetStatusTYPE>("fmi2GetStatus");
+    CoSimFunctions->fmi2GetRealStatus = lib->get<fmi2GetRealStatusTYPE>("fmi2GetRealStatus");
+    CoSimFunctions->fmi2GetIntegerStatus =
+        lib->get<fmi2GetIntegerStatusTYPE>("fmi2GetIntegerStatus");
+    CoSimFunctions->fmi2GetBooleanStatus =
+        lib->get<fmi2GetBooleanStatusTYPE>("fmi2GetBooleanStatus");
+    CoSimFunctions->fmi2GetStringStatus = lib->get<fmi2GetStringStatusTYPE>("fmi2GetStringStatus");
+}
+
+void FmiLibrary::makeCallbackFunctions()
+{
+    callbacks = std::make_shared<fmi2CallbackFunctions>(
+        fmi2CallbackFunctions{.logger = &loggerFunc,
+                              .allocateMemory = &calloc,
+                              .freeMemory = &free,
+                              .stepFinished = nullptr,
+                              .componentEnvironment = static_cast<void*>(this)});
+}
+
+namespace {
+constexpr std::size_t stringBufferSize = 1000;
+}
+
+// NOLINTNEXTLINE(hicpp-vararg,cert-dcl50-cpp,modernize-avoid-variadic-functions)
+void loggerFunc(fmi2ComponentEnvironment /* compEnv */,
+                fmi2String /* instanceName */,
+                fmi2Status /* status */,
+                fmi2String /* category */,
+                fmi2String message,
+                ...)
+{
+    std::array<char, stringBufferSize> temp{};
+    // FMI defines this callback as a variadic C API, so we must bridge it with va_list here.
+    // NOLINTNEXTLINE(hicpp-vararg)
+    va_list arglist;
+    va_start(arglist, message);  // NOLINT
+    static_cast<void>(std::vsnprintf(temp.data(), stringBufferSize, message, arglist));
+    va_end(arglist);
+    std::println("{}", temp.data());  // NOLINT
+}

@@ -1,0 +1,1590 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+#include "../GridBus.h"
+#include "../GridDynSimulation.h"
+#include "../events/Event.h"
+#include "../events/EventQueue.h"
+#include "../solvers/SolverInterface.h"
+#include "Diagnostics.h"
+#include "DynamicInitialConditionRecovery.h"
+#include "FaultResetRecovery.h"
+#include "GridDynSimulationFileOps.h"
+#include "core/CoreExceptions.h"
+#include "gmlc/utilities/vectorOps.hpp"
+#include "utilities/MatrixData.hpp"
+// system libraries
+#include <algorithm>
+#include <cassert>
+#include <chrono>
+#include <compare>
+#include <cstdio>
+#include <format>
+#include <memory>
+#include <numeric>
+#include <print>
+#include <vector>
+// #include <fstream>
+// #include <iostream>
+namespace griddyn {
+static IOdata gNullOutputVec;  //!<  this is a purposely created empty vector which gets used for
+                               //!<  functions that take as
+//! an input a vector but don't use it.
+
+namespace {
+    void reportPartitionedDiagnosticFailure() noexcept
+    {
+        static_cast<void>(std::fputs("GridDyn: partitioned diagnostic output failed\n", stderr));
+    }
+}  // namespace
+
+// --------------- dynamic program ---------------
+// dynamic solver and initial conditions
+int GridDynSimulation::dynInitialize(CoreTime tStart)
+{
+    using Clock = std::chrono::steady_clock;
+    auto lastPhaseEnd = Clock::now();
+    const auto logCompletedPhase = [this, &lastPhaseEnd](std::string_view phase) {
+        const auto now = Clock::now();
+        logging::normal(this,
+                        "Dynamic initialization phase '{}' completed in {} s",
+                        phase,
+                        std::chrono::duration<double>(now - lastPhaseEnd).count());
+        lastPhaseEnd = now;
+    };
+    logging::normal(this, "Dynamic initialization: preparing the static operating point");
+    if (opFlags[DYN_INITIALIZED]) {
+        offsets.unload(true);
+    }
+    const SolverMode& tempSm = (defaultDynamicSolverMethod == DynamicSolverMethods::PARTITIONED) ?
+        *defDynDiffMode :
+        *defDAEMode;
+
+    const int retval = makeReady(GridState::POWERFLOW_COMPLETE, tempSm);
+    if (retval != FUNCTION_EXECUTION_SUCCESS || controlFlags[POWER_FLOW_ONLY]) {
+        return retval;
+    }
+    logCompletedPhase("static power-flow preparation");
+    configureResidualParallelism();
+
+    auto dynData = getSolverInterface(tempSm);
+    const SolverMode& solverModeRef = dynData->getSolverMode();
+    if (defaultDynamicSolverMethod == DynamicSolverMethods::PARTITIONED) {
+        defDynDiffMode = &solverModeRef;
+    } else {
+        defDAEMode = &solverModeRef;
+    }
+
+    if (tStart < startTime) {
+        tStart = startTime;
+    }
+    logging::normal(this, "Initializing Dynamics to time {}", static_cast<double>(tStart));
+    // run any events before the simulation
+    // In most cases this should be none but users can manipulate the times if they choose
+    EvQ->executeEvents(tStart - 0.001);
+
+    dynInitializeA(tStart, lower_flags(controlFlags));
+    logCompletedPhase("model initialization A");
+
+    const count_t stateCount = stateSize(solverModeRef);
+    if (stateCount == 0) {
+        logging::warning(this, "State size==0 stopping computation\n");
+        return 0;  // TODO(phlpt): Add a positive return code when state size is 0.
+    }
+    updateOffsets(solverModeRef);
+    // check for objects with roots
+    count_t totalRoots = 0;
+    // CSW: Need to send in the number of roots to find so that memory
+    // can be allocated to for the array indicating indices of roots.
+    // do the final Ida initialization
+    if (controlFlags[ROOTS_DISABLED]) {
+        offsets.local().local.algRoots = 0;
+        offsets.local().local.diffRoots = 0;
+        opFlags[HAS_ROOTS] = false;
+        opFlags[HAS_ALG_ROOTS] = false;
+    } else {
+        totalRoots = rootSize(solverModeRef);
+        if (totalRoots > 0) {
+            setRootOffset(0, solverModeRef);
+            opFlags[HAS_ROOTS] = true;
+            opFlags[HAS_ALG_ROOTS] = (offsets.getOffsets(solverModeRef).total.algRoots > 0);
+        } else {
+            opFlags[HAS_ROOTS] = false;
+            opFlags[HAS_ALG_ROOTS] = false;
+        }
+    }
+
+    dynData->allocate(stateCount, totalRoots);
+
+    // dynInitializeB
+    dynData->set("tolerance", tols.rtol);
+    // run the dynamic initialization part B there is no actual output from an area currently
+    dynInitializeB(noInputs, noInputs, gNullOutputVec);
+    logCompletedPhase("model initialization B");
+
+    // Execute pre-existing events at the start time before initializing the
+    // solver, but do not record the state here: its vector is still zeroed
+    // until the solver's initialize() call copies the component initial values.
+    EvQ->executeEvents(tStart);
+
+    //    assert(nextStopTime == EvQ->getNextTime());
+    nextStopTime = EvQ->getNextTime();
+
+    // initialize the solver
+    dynData->initialize(tStart);
+    logCompletedPhase("differential solver initialization");
+
+    if (state_record_period > timeZero && !stateFile.empty()) {
+        currentTime = tStart;
+        // Save the initialized solver vector once at tStart, then schedule
+        // subsequent snapshots at each recording interval.
+        saveStateBinary(this, stateFile, solverModeRef, false);
+        stateRecorder = std::make_shared<FunctionEventAdapter>(
+            [=, this]() {
+                saveStateBinary(this, stateFile, solverModeRef);
+                return ChangeCode::NO_CHANGE;
+            },
+            tStart + state_record_period,
+            state_record_period);
+        stateRecorder->partB_only = true;
+        add(stateRecorder);
+    }
+
+    opFlags &= RESET_CHANGE_FLAG_MASK;
+    pState = GridState::DYNAMIC_INITIALIZED;
+    currentTime = tStart;
+    logging::normal(this,
+                    "Dynamic initialization completed at t={} s",
+                    static_cast<double>(tStart));
+    return FUNCTION_EXECUTION_SUCCESS;
+}
+
+int GridDynSimulation::runDynamicSolverStep(std::shared_ptr<SolverInterface>& dynData,
+                                            CoreTime nextStop,
+                                            CoreTime& timeActual)
+{
+    int retval = FUNCTION_EXECUTION_SUCCESS;
+    if (controlFlags[SINGLE_STEP_MODE]) {
+        while ((timeActual + tols.timeTol < nextStop) && (retval == FUNCTION_EXECUTION_SUCCESS)) {
+            retval = dynData->solve(nextStop, timeActual, SolverInterface::StepMode::SINGLE_STEP);
+            if (retval == FUNCTION_EXECUTION_SUCCESS) {
+                for (auto& sso : singleStepObjects) {
+                    sso->setState(timeActual,
+                                  dynData->stateData(),
+                                  dynData->derivData(),
+                                  dynData->getSolverMode());
+                }
+            }
+        }
+    } else {
+        retval = dynData->solve(nextStop, timeActual);
+    }
+    if (controlFlags[PARTITIONED_DIAGNOSTICS_FLAG] && (retval == SOLVER_ROOT_FOUND)) {
+        // CVODE/ARKode only populate rootsfound when queried after a root return.
+        // Read the current mask before logging it; handleEarlySolverReturn() also
+        // queries it later before dispatching the root to model objects.
+        dynData->getRoots();
+        stringVec rootNames;
+        const auto& mode = dynData->getSolverMode();
+        getRootObjectNames(rootNames, mode);
+        for (std::size_t root = 0; root < dynData->rootsfound.size(); ++root) {
+            if (dynData->rootsfound[root] != 0) {
+                const auto owner = (root < rootNames.size()) ? rootNames[root] : "<unmapped>";
+                const auto message = std::format("Partitioned solver root at t={} root={} owner={}",
+                                                 static_cast<double>(timeActual),
+                                                 root,
+                                                 owner);
+                std::println("{}", message);
+                partitionedDiagnostic(message);
+            }
+        }
+    }
+    if (retval != FUNCTION_EXECUTION_SUCCESS) {
+        //   dynData->printStates(true);
+        handleEarlySolverReturn(retval, timeActual, dynData);
+    }
+    return retval;
+}
+
+void GridDynSimulation::setupDynamicDAE()
+{
+    if (defDAEMode == nullptr) {
+        setDefaultMode(SolutionModes::DAE_MODE, getSolverMode("dae"));
+        updateSolver(*defDAEMode);
+    }
+    const SolverMode& sMode = *defDAEMode;
+    const int retval = makeReady(GridState::DYNAMIC_INITIALIZED, sMode);
+    if (retval != FUNCTION_EXECUTION_SUCCESS) {
+        logging::error(this, "Unable to prepare simulation for dynamic solution");
+        setErrorCode(retval);
+        return;
+    }
+
+    auto dynData = getSolverInterface(sMode);
+    if (!dynData->isInitialized()) {
+        updateSolver(sMode);
+    }
+}
+
+#define JAC_CHECK_ENABLED 0
+
+int GridDynSimulation::dynamicDAEStartupConditions(std::shared_ptr<SolverInterface>& dynData,
+                                                   const SolverMode& sMode)
+{
+    int retval = FUNCTION_EXECUTION_SUCCESS;
+    if (pState == GridState::DYNAMIC_INITIALIZED) {
+        // do mode 0 IC calculation
+        guessState(currentTime, dynData->stateData(), dynData->derivData(), sMode);
+
+        if (controlFlags[IDA_INTEGRATION_DIAGNOSTICS_FLAG] && !controlFlags[ROOTS_DISABLED]) {
+            const auto rootTotal = rootSize(sMode);
+            std::vector<double> rootValues(rootTotal, 0.0);
+            stringVec rootNames;
+            getRootObjectNames(rootNames, sMode);
+            rootFindingFunction(
+                currentTime, dynData->stateData(), dynData->derivData(), rootValues.data(), sMode);
+
+            std::vector<index_t> closestRoots(rootTotal);
+            std::iota(closestRoots.begin(), closestRoots.end(), 0);
+            const auto rootAbs = [&rootValues](index_t left, index_t right) {
+                return std::abs(rootValues[left]) < std::abs(rootValues[right]);
+            };
+            const auto reportCount = (std::min)(closestRoots.size(), size_t{16});
+            std::partial_sort(closestRoots.begin(),
+                              closestRoots.begin() + static_cast<std::ptrdiff_t>(reportCount),
+                              closestRoots.end(),
+                              rootAbs);
+            logging::logTo(this,
+                           this,
+                           PrintLevel::SUMMARY,
+                           "IDA pre-IC root probe: roots={}, reporting {} closest-to-zero roots",
+                           rootTotal,
+                           reportCount);
+            for (size_t rootIndex = 0; rootIndex < reportCount; ++rootIndex) {
+                const auto root = closestRoots[rootIndex];
+                logging::logTo(this,
+                               this,
+                               PrintLevel::SUMMARY,
+                               "IDA pre-IC root[{}]={} owner={}",
+                               root,
+                               rootValues[root],
+                               ((root >= 0) && (static_cast<size_t>(root) < rootNames.size())) ?
+                                   rootNames[root] :
+                                   "<unmapped>");
+            }
+        } else if (controlFlags[IDA_INTEGRATION_DIAGNOSTICS_FLAG]) {
+            logging::logTo(this,
+                           this,
+                           PrintLevel::SUMMARY,
+                           "IDA pre-IC root probe skipped because root finding is disabled");
+        }
+
+        // Solve the actual algebraic equations while holding initialized
+        // differential states.  The masked IDA_Y_INIT system can be singular
+        // for a valid stationary model: an inactive integral controller has
+        // residual -yp and no state derivative when yp is held fixed.
+        retval =
+            dynData->calcIC(currentTime, probeStepTime, SolverInterface::IcModes::FIXED_DIFF, true);
+        if (retval == FUNCTION_EXECUTION_SUCCESS) {
+            retval = checkAlgebraicRoots(dynData);
+        }
+        if (retval != FUNCTION_EXECUTION_SUCCESS) {
+            // Retain the masked strategy for cases whose differential states
+            // must also move before the normal recovery sequence can succeed.
+            guessState(currentTime, dynData->stateData(), dynData->derivData(), sMode);
+            retval = dynData->calcIC(currentTime,
+                                     probeStepTime,
+                                     SolverInterface::IcModes::FIXED_MASKED_AND_DERIV,
+                                     false);
+            if (retval != FUNCTION_EXECUTION_SUCCESS) {
+                retval = generateDaeDynamicInitialConditions(sMode);
+            }
+            if (retval != FUNCTION_EXECUTION_SUCCESS) {
+#if JAC_CHECK_ENABLED > 0
+                int errc = jacobianCheck(this, sMode);
+                if (errc > 0) {
+                    printStateNames(this, sMode);
+                }
+#endif
+                logging::error(this, dynData->getLastErrorString());
+                logging::error(this, "Unable to generate initial dynamic solution modeA");
+                return retval;
+            }
+        }
+    } else {
+        retval = generateDaeDynamicInitialConditions(sMode);
+        if (retval != FUNCTION_EXECUTION_SUCCESS) {
+            logging::error(this, dynData->getLastErrorString());
+            logging::error(this, "Unable to generate dynamic solution conditions modeB");
+            return retval;
+        }
+    }
+    return retval;
+}
+
+// IDA DAE Solver
+int GridDynSimulation::dynamicDAE(CoreTime tStop)
+{
+    const int out = FUNCTION_EXECUTION_SUCCESS;
+
+    int tstep = 0;
+    const SolverMode& sMode = *defDAEMode;
+
+    setupDynamicDAE();
+    auto dynData = getSolverInterface(sMode);
+
+    int retval = dynamicDAEStartupConditions(dynData, sMode);
+    if (retval != FUNCTION_EXECUTION_SUCCESS) {
+        return retval;
+    }
+    logging::normal(this,
+                    "DAE initial-condition setup completed at t={} s",
+                    static_cast<double>(currentTime));
+
+    nextStopTime = (std::min)(tStop, EvQ->getNextTime());
+
+    // If running in block mode, integrate over entire simulation interval
+    if (dynData->getFlag("block_mode_only")) {  // this is primarily for braid
+        nextStopTime = tStop;
+    }
+
+    // go into the main loop
+    int smStep = 0;
+    while (timeReturn < tStop) {
+        CoreTime nextStop = (std::min)(tStop, nextStopTime);
+
+        nextStopTime = tStop;
+        if (nextStop - currentTime <
+            tols.timeTol)  // if the interval is too small just advance the clock a little
+        {  // the most likely cause of this is numerical instability in recorders and events
+            timeReturn = nextStop;
+        } else {
+            retval = runDynamicSolverStep(dynData, nextStop, timeReturn);
+            currentTime = timeReturn;
+            if ((retval < FUNCTION_EXECUTION_SUCCESS) && (retval != SOLVER_STEP_LIMIT_REACHED)) {
+                pState = GridState::DYNAMIC_PARTIAL;
+                logging::error(this, "simulation halted after dynamic solver failure");
+                logging::error(this, dynData->getLastErrorString());
+                return FUNCTION_EXECUTION_FAILURE;
+            }
+        }
+
+        while (timeReturn + tols.timeTol <
+               nextStop)  // the timeTol is for stopping just prior to the expected stop time
+        {
+            const CoreTime lastTimeStop = currentTime;
+            dynamicCheckAndReset(sMode);
+            retval = generateDaeDynamicInitialConditions(sMode);
+            if (retval != FUNCTION_EXECUTION_SUCCESS) {
+                pState = GridState::DYNAMIC_PARTIAL;
+                logging::error(this, "simulation halted unable to converge");
+                logging::error(this, dynData->getLastErrorString());
+                return FUNCTION_EXECUTION_FAILURE;
+            }
+            // update the stopping time just in case the events have changed
+            nextStop = (std::min)(tStop, EvQ->getNextTime());
+            retval = runDynamicSolverStep(dynData, nextStop, timeReturn);
+
+            currentTime = timeReturn;
+
+            if (retval != SOLVER_ROOT_FOUND) {
+                if (timeReturn < lastTimeStop + tols.timeTol) {
+                    ++tstep;
+                    if (tstep == 1)  // there are some circumstances where internal models halt
+                                     // advancement until
+                    // the clock moves forward
+                    {
+                        currentTime += tols.timeTol;
+                    } else if (tstep > 1) {
+                        pState = GridState::DYNAMIC_PARTIAL;
+                        logging::error(this, "simulation halted unable to converge");
+                        logging::error(this, dynData->getLastErrorString());
+                        return FUNCTION_EXECUTION_FAILURE;
+                    }
+                } else if (timeReturn < lastTimeStop + 1e-4) {
+                    ++smStep;
+                    if (smStep > 10) {
+                        logging::error(this, "simulation halted too many small time steps");
+                        return FUNCTION_EXECUTION_FAILURE;
+                    }
+                    tstep = 0;
+                } else {
+                    smStep = 0;
+                    tstep = 0;
+                }
+            }
+        }
+        currentTime = nextStop;
+        // transmit the current state to the various objects for updates and recorders
+        setState(currentTime, dynData->stateData(), dynData->derivData(), sMode);
+        updateLocalCache();
+        const auto eventResult = EvQ->executeEvents(currentTime);
+        if (eventResult > ChangeCode::NON_STATE_CHANGE) {
+            dynamicCheckAndReset(sMode, eventResult);
+            retval = generateDaeDynamicInitialConditions(sMode);
+            if (retval != FUNCTION_EXECUTION_SUCCESS) {
+                pState = GridState::DYNAMIC_PARTIAL;
+                logging::error(this, "simulation halted unable to converge");
+                logging::error(this, dynData->getLastErrorString());
+                return FUNCTION_EXECUTION_FAILURE;
+            }
+        }
+        nextStopTime = EvQ->getNextTime();
+    }
+    if ((consolePrintLevel >= PrintLevel::TRACE) || (logPrintLevel >= PrintLevel::TRACE)) {
+        dynData->logSolverStats(PrintLevel::TRACE);
+        dynData->logErrorWeights(PrintLevel::TRACE);
+    }
+
+    // store the results to the buses
+    pState = GridState::DYNAMIC_COMPLETE;
+    return out;
+}
+
+void GridDynSimulation::setupDynamicPartitioned()
+{
+    const SolverMode& sModeAlg = *defDynAlgMode;
+    const SolverMode& sModeDiff = *defDynDiffMode;
+    const int retval = makeReady(GridState::DYNAMIC_INITIALIZED, sModeDiff);
+    if (retval != FUNCTION_EXECUTION_SUCCESS) {
+        logging::error(this, "Unable to prepare simulation for dynamic solution");
+        setErrorCode(retval);
+        throw(ExecutionFailure(this, "Unable to prepare simulation for dynamic solution"));
+    }
+    auto dynDataAlg = getSolverInterface(sModeAlg);
+    auto dynDataDiff = getSolverInterface(sModeDiff);
+    if (!dynDataAlg->isInitialized()) {
+        updateSolver(sModeAlg);
+    }
+
+    if (!dynDataDiff->isInitialized()) {
+        updateSolver(sModeDiff);
+    }
+    dynDataAlg->set("pair", static_cast<double>(sModeDiff.offsetIndex));
+    dynDataDiff->set("pair", static_cast<double>(sModeAlg.offsetIndex));
+}
+
+int GridDynSimulation::dynamicPartitionedStartupConditions(
+    std::shared_ptr<SolverInterface>& dynDataDiff,
+    std::shared_ptr<SolverInterface>& dynDataAlg,
+    const SolverMode& sModeDiff,
+    const SolverMode& sModeAlg)
+{
+    int retval = FUNCTION_EXECUTION_SUCCESS;
+    if (pState == GridState::DYNAMIC_INITIALIZED) {
+        if (controlFlags[DAE_INITIALIZATION_FOR_PARTITIONED]) {
+            auto daeData = getSolverInterface(*defDAEMode);
+            if (!daeData->isInitialized()) {
+                updateSolver(*defDAEMode);
+            }
+            retval = dynamicDAEStartupConditions(daeData, *defDAEMode);
+            if (retval != FUNCTION_EXECUTION_SUCCESS) {
+                return retval;
+            }
+
+            // IDA stores the corrected consistent initial condition in its own
+            // state vectors.  The partitioned solvers have separate state
+            // vectors, so simply calculating the DAE IC is not sufficient: the
+            // corrected dynamic model states must be committed to the objects
+            // and then copied into the differential/algebraic solver vectors.
+            // Without this transfer, the optional DAE initialization path has
+            // no effect on the first partitioned RHS evaluation.
+            setState(currentTime, daeData->stateData(), daeData->derivData(), *defDAEMode);
+            updateLocalCache();
+            guessState(currentTime, dynDataDiff->stateData(), dynDataDiff->derivData(), sModeDiff);
+            guessState(currentTime, dynDataAlg->stateData(), nullptr, sModeAlg);
+        } else {
+            guessState(currentTime, dynDataDiff->stateData(), dynDataDiff->derivData(), sModeDiff);
+            guessState(currentTime, dynDataAlg->stateData(), nullptr, sModeAlg);
+        }
+    } else {
+        guessState(currentTime, dynDataDiff->stateData(), dynDataDiff->derivData(), sModeDiff);
+        guessState(currentTime, dynDataAlg->stateData(), nullptr, sModeAlg);
+    }
+    return retval;
+}
+
+int GridDynSimulation::dynamicPartitioned(CoreTime tStop, CoreTime tStep)
+{
+    const int out = FUNCTION_EXECUTION_SUCCESS;
+
+    auto nextEventTime = EvQ->getNextTime();
+    setupDynamicPartitioned();
+    CoreTime lastTimeStop = currentTime;
+
+    auto dynDataAlg = getSolverInterface(*defDynAlgMode);
+    auto dynDataDiff = getSolverInterface(*defDynDiffMode);
+
+    dynDataDiff->set("step", tStep);
+    // The partitioned differential RHS invokes an algebraic Newton solve at
+    // every trial state.  Start CVODE/ARKode with the same conservative probe
+    // step used by dynamic initialization, then permit it to grow to the
+    // requested partitioned maximum step.  A large initial predictor can
+    // otherwise present KINSOL with an unnecessarily remote algebraic state.
+    if (((dynDataDiff->getName() == "cvode") || (dynDataDiff->getName() == "arkode")) &&
+        (tStep > 0.0)) {
+        dynDataDiff->set("initialstep", (std::min)(tStep, probeStepTime));
+    }
+    const auto& sModeAlg = dynDataAlg->getSolverMode();
+    const auto& sModeDiff = dynDataDiff->getSolverMode();
+    if (controlFlags[PARTITIONED_DIAGNOSTICS_FLAG]) {
+        std::println("Partitioned startup: differential mode={} index={} states={} roots={} "
+                     "algebraic mode={} index={} states={} roots={} step={}",
+                     dynDataDiff->getName(),
+                     sModeDiff.offsetIndex,
+                     dynDataDiff->size(),
+                     rootSize(sModeDiff),
+                     dynDataAlg->getName(),
+                     sModeAlg.offsetIndex,
+                     dynDataAlg->size(),
+                     rootSize(sModeAlg),
+                     static_cast<double>(tStep));
+        partitionedDiagnostic(std::format(
+            "Partitioned startup: differential mode={} index={} states={} roots={} algebraic mode={} index={} states={} roots={} step={}",
+            dynDataDiff->getName(),
+            sModeDiff.offsetIndex,
+            dynDataDiff->size(),
+            rootSize(sModeDiff),
+            dynDataAlg->getName(),
+            sModeAlg.offsetIndex,
+            dynDataAlg->size(),
+            rootSize(sModeAlg),
+            static_cast<double>(tStep)));
+    }
+
+    int tstep = 0;
+    partitionedAlgebraicCallCount = 0;
+    int retval = dynamicPartitionedStartupConditions(dynDataDiff, dynDataAlg, sModeDiff, sModeAlg);
+    if (retval != FUNCTION_EXECUTION_SUCCESS) {
+        return retval;
+    }
+    logging::normal(this,
+                    "Partitioned initial-condition setup completed at t={} s",
+                    static_cast<double>(currentTime));
+    // go into the main loop
+    int smStep = 0;
+    while (getSimulationTime() < tStop) {
+        nextStopTime = std::min(tStop, nextEventTime);
+
+        if (nextStopTime - currentTime <
+            tols.timeTol)  // if the interval is too small just advance the clock a little
+        {  // the most likely cause of this is a tiny numerical instability in recorders and events
+            timeReturn = nextStopTime;
+        } else {
+            retval = runDynamicSolverStep(dynDataDiff, nextStopTime, timeReturn);
+            if (retval == FUNCTION_EXECUTION_SUCCESS) {
+                dynAlgebraicSolve(timeReturn,
+                                  dynDataDiff->stateData(),
+                                  dynDataDiff->derivData(),
+                                  sModeDiff);
+            }
+        }
+
+        while (timeReturn + tols.timeTol <
+               nextStopTime)  // the timeTol is for stopping just prior to the expected stop time
+        {
+            lastTimeStop = timeReturn;
+            dynamicCheckAndReset(sModeDiff);
+            // After a limiter root, both the differential state and the
+            // algebraic network must be consistent at the same event time.
+            // Advancing only the algebraic solve by probeStepTime leaves
+            // CVODE's internal clock at the root and can rediscover it.
+            retval = generatePartitionedDynamicInitialConditions(sModeAlg, sModeDiff, false);
+            if (retval != FUNCTION_EXECUTION_SUCCESS) {
+                pState = GridState::DYNAMIC_PARTIAL;
+                logging::error(this, "simulation halted unable to converge");
+                logging::error(this, dynDataDiff->getLastErrorString());
+                return FUNCTION_EXECUTION_FAILURE;
+            }
+            retval = runDynamicSolverStep(dynDataDiff, nextStopTime, timeReturn);
+            dynAlgebraicSolve(timeReturn,
+                              dynDataDiff->stateData(),
+                              dynDataDiff->derivData(),
+                              sModeDiff);
+            currentTime = timeReturn;
+
+            // CSW Changed this from 2e-3 to 1e-7: need to rethink this in light of rootfinding
+            if (retval != SOLVER_ROOT_FOUND) {
+                if (timeReturn < lastTimeStop + tols.timeTol) {
+                    ++tstep;
+                    if (tstep == 1)  // there are some circumstances where internal models halt
+                                     // advancement until
+                    // the clock moves forward
+                    {
+                        currentTime = currentTime + tols.timeTol;
+                    } else if (tstep > 1) {
+                        pState = GridState::DYNAMIC_PARTIAL;
+                        logging::error(this, "simulation halted unable to converge");
+                        logging::error(this, dynDataDiff->getLastErrorString());
+                        return FUNCTION_EXECUTION_FAILURE;
+                    }
+                } else if (timeReturn < lastTimeStop + 1e-4) {
+                    ++smStep;
+                    if (smStep > 10) {
+                        logging::error(this, "simulation halted too many small time steps");
+                        return FUNCTION_EXECUTION_FAILURE;
+                    }
+                    tstep = 0;
+                } else {
+                    smStep = 0;
+                    tstep = 0;
+                }
+            }
+        }
+        currentTime = nextStopTime;
+        if (nextEventTime - tols.timeTol < currentTime) {
+            // transmit the current state to the various objects for updates and recorders
+            setState(currentTime, dynDataDiff->stateData(), dynDataDiff->derivData(), sModeDiff);
+            setState(currentTime, dynDataAlg->stateData(), nullptr, sModeAlg);
+            updateLocalCache();
+            const auto eventResult = EvQ->executeEvents(currentTime);
+            if (eventResult > ChangeCode::NON_STATE_CHANGE) {
+                retval = generatePartitionedDynamicInitialConditions(sModeAlg, sModeDiff, false);
+                if (retval != FUNCTION_EXECUTION_SUCCESS) {
+                    pState = GridState::DYNAMIC_PARTIAL;
+                    logging::error(this, "simulation halted unable to converge");
+                    logging::error(this, dynDataDiff->getLastErrorString());
+                    return FUNCTION_EXECUTION_FAILURE;
+                }
+                // Refresh the object caches with the algebraic solution before
+                // reinitializing the differential integrator.  This makes the
+                // first post-event derivative evaluation consistent with the
+                // new algebraic operating point.
+                setState(currentTime, dynDataAlg->stateData(), nullptr, sModeAlg);
+                updateLocalCache();
+                dynamicCheckAndReset(sModeDiff, eventResult);
+                retval = derivativeFunction(currentTime,
+                                            dynDataDiff->stateData(),
+                                            dynDataDiff->derivData(),
+                                            sModeDiff);
+                if (retval != FUNCTION_EXECUTION_SUCCESS) {
+                    pState = GridState::DYNAMIC_PARTIAL;
+                    logging::error(this,
+                                   "simulation halted unable to evaluate post-event derivative");
+                    return FUNCTION_EXECUTION_FAILURE;
+                }
+                // Preserve the refreshed derivative in the component caches so a later run()
+                // call does not restore the pre-event derivative through guessState().
+                setState(currentTime,
+                         dynDataDiff->stateData(),
+                         dynDataDiff->derivData(),
+                         sModeDiff);
+                updateLocalCache();
+            }
+            nextEventTime = EvQ->getNextTime();
+        }
+    }
+    if (controlFlags[PARTITIONED_DIAGNOSTICS_FLAG]) {
+        const auto printPerformance = [&](const std::shared_ptr<SolverInterface>& solver,
+                                          bool differential) {
+            const double total = solver->get("perftotal");
+            const double jacobian = solver->get("perfjacobiantime");
+            const double modelJacobian = solver->get("perfmodeljacobiantime");
+            if (differential) {
+                std::println(
+                    "Partitioned performance {}: solve_calls={} solve_s={:.3f} rhs_calls={} "
+                    "rhs_s={:.3f} algebraic_calls={} algebraic_s={:.3f} derivative_calls={} "
+                    "derivative_s={:.3f} jacobian_calls={} jacobian_s={:.3f} model_jacobian_s={:.3f}",
+                    solver->getName(),
+                    solver->get("solvercount"),
+                    total,
+                    solver->get("perfrhs"),
+                    solver->get("perfrhstime"),
+                    solver->get("perfalgebraic"),
+                    solver->get("perfalgebraictime"),
+                    solver->get("perfderivative"),
+                    solver->get("perfderivativetime"),
+                    solver->get("perfjacobians"),
+                    jacobian,
+                    modelJacobian);
+            } else {
+                const double residual = solver->get("perfresidualtime");
+                const double other = (std::max)(0.0, total - residual - jacobian);
+                std::println(
+                    "Partitioned performance {}: solve_calls={} solve_s={:.3f} residual_calls={} "
+                    "residual_s={:.3f} jacobian_calls={} jacobian_s={:.3f} model_jacobian_s={:.3f} "
+                    "other_linear_solver_s={:.3f}",
+                    solver->getName(),
+                    solver->get("solvercount"),
+                    total,
+                    solver->get("perfresiduals"),
+                    residual,
+                    solver->get("perfjacobians"),
+                    jacobian,
+                    modelJacobian,
+                    other);
+            }
+        };
+        printPerformance(dynDataDiff, true);
+        printPerformance(dynDataAlg, false);
+    }
+
+    if ((consolePrintLevel >= PrintLevel::TRACE) || (logPrintLevel >= PrintLevel::TRACE)) {
+        dynDataDiff->logSolverStats(PrintLevel::TRACE);
+        dynDataDiff->logErrorWeights(PrintLevel::TRACE);
+    }
+
+    // store the results to the buses
+    setState(currentTime, dynDataDiff->stateData(), dynDataDiff->derivData(), sModeDiff);
+    setState(currentTime, dynDataAlg->stateData(), nullptr, sModeAlg);
+    updateLocalCache();
+    pState = GridState::DYNAMIC_COMPLETE;
+    return out;
+}
+
+int GridDynSimulation::dynamicDecoupled(CoreTime /*tStop*/, CoreTime /*tStep*/)
+{
+    return FUNCTION_EXECUTION_FAILURE;
+}
+
+int GridDynSimulation::step()
+{
+    CoreTime tact;
+    const CoreTime nextT = currentTime + stepTime;
+    const int ret = step(nextT, tact);
+    return (tact == nextT) ? FUNCTION_EXECUTION_SUCCESS : ret;
+}
+
+int GridDynSimulation::step(CoreTime nextStep, CoreTime& timeActual)
+{
+    if (currentTime >= nextStep) {
+        if (EvQ->getNextTime() <= currentTime) {
+            EvQ->executeEvents(currentTime);
+        } else {
+            timeActual = nextStep;
+            return FUNCTION_EXECUTION_SUCCESS;
+        }
+    }
+    timeActual = currentTime;
+    const SolverMode& solverModeRef = *defDAEMode;
+    int retval = FUNCTION_EXECUTION_SUCCESS;
+
+    auto dynData = getSolverInterface(solverModeRef);
+    if (pState == GridState::DYNAMIC_COMPLETE) {
+        if (dynamicCheckAndReset(solverModeRef)) {
+            retval = generateDaeDynamicInitialConditions(solverModeRef);
+            if (retval != FUNCTION_EXECUTION_SUCCESS) {
+                return 1;
+            }
+        }  // this step does a reset of IDA if necessary
+    } else if (pState == GridState::DYNAMIC_INITIALIZED) {
+        retval = dynamicDAEStartupConditions(dynData, solverModeRef);
+        if (retval != FUNCTION_EXECUTION_SUCCESS) {
+            return retval;
+        }
+        pState = GridState::DYNAMIC_PARTIAL;
+    } else {
+        // check to make sure nothing has changed
+        dynamicCheckAndReset(solverModeRef);
+        retval = generateDaeDynamicInitialConditions(solverModeRef);
+        if (retval != FUNCTION_EXECUTION_SUCCESS) {
+            logging::error(this, "Unable to generate dynamic solution conditions modeB");
+            return retval;
+        }
+    }
+    nextStopTime = std::min(nextStep, EvQ->getNextTime());
+
+    while (timeReturn < nextStep) {
+        CoreTime tStop = std::min(nextStep, nextStopTime);
+
+        nextStopTime = nextStep;
+        if (tStop - currentTime <
+            tols.timeTol)  // if the interval is too small just advance the clock a little
+        {  // the most likely cause of this is numerical instability in recorders and events
+            timeReturn = tStop;
+        } else {
+            retval = runDynamicSolverStep(dynData, nextStopTime, timeReturn);
+            currentTime = timeReturn;
+        }
+
+        while (timeReturn + tols.timeTol < tStop) {
+            const CoreTime lastTimeStop = currentTime;
+            if (dynamicCheckAndReset(solverModeRef)) {
+                retval = generateDaeDynamicInitialConditions(solverModeRef);
+                if (retval != FUNCTION_EXECUTION_SUCCESS) {
+                    timeActual = currentTime;
+                    return 1;
+                }
+            }  // this step does a reset of IDA if necessary
+            tStop = std::min(stopTime,
+                             EvQ->getNextTime());  // update the stopping time just in case the
+                                                   // events have changed
+            retval = runDynamicSolverStep(dynData, nextStopTime, timeReturn);
+            currentTime = timeReturn;
+            // CSW Changed this from 2e-3 to 1e-7: need to rethink this in light of rootfinding
+            if (timeReturn < lastTimeStop + tols.timeTol) {
+                timeActual = currentTime;
+                return retval;  // TODO(phlpt): Replace this with a constant.
+            }
+        }
+        currentTime = tStop;
+        // transmit the current state to the various objects for updates and recorders
+        setState(currentTime, dynData->stateData(), dynData->derivData(), solverModeRef);
+
+        const auto eventResult = EvQ->executeEvents(currentTime);
+        if (eventResult > ChangeCode::NO_CHANGE) {
+            dynamicCheckAndReset(solverModeRef);
+            break;
+        }
+        nextStopTime = EvQ->getNextTime();
+        // recorders last to capture any state change
+    }
+    timeActual = currentTime;
+    pState = GridState::DYNAMIC_COMPLETE;
+    return retval;
+}
+
+void GridDynSimulation::handleEarlySolverReturn(int retval,
+                                                CoreTime timeActual,
+                                                std::shared_ptr<SolverInterface>& dynData)
+{
+    ++haltCount;
+
+    if (opFlags[HAS_ROOTS]) {
+        if (retval == SOLVER_ROOT_FOUND)  // a root was found in IDASolve
+        {  // Note that if a root is found, integration halts at the root time which is
+            // returned in timeReturn.
+            dynData->getRoots();
+            currentTime = timeActual;
+            setState(timeActual,
+                     dynData->stateData(),
+                     dynData->derivData(),
+                     dynData->getSolverMode());
+            // rootTrigger() does not receive a StateData object and several
+            // controllers classify entry versus release from cached inputs.
+            // Refresh those inputs from the solver's event state first; the
+            // last RHS cache can correspond to a different CVODE trial point.
+            StateData rootStateData(timeActual,
+                                    dynData->stateData(),
+                                    dynData->derivData(),
+                                    ++residCount);
+            fillExtraStateData(rootStateData, dynData->getSolverMode());
+            updateLocalCache(noInputs, rootStateData, dynData->getSolverMode());
+            logging::debug(this, "Root detected");
+            rootTrigger(timeActual, noInputs, dynData->rootsfound, dynData->getSolverMode());
+            if (controlFlags[IDA_INTEGRATION_DIAGNOSTICS_FLAG]) {
+                const auto rootTotal = rootSize(dynData->getSolverMode());
+                std::vector<double> rootValues(rootTotal, 0.0);
+                stringVec rootNames;
+                getRootObjectNames(rootNames, dynData->getSolverMode());
+                rootFindingFunction(timeActual,
+                                    dynData->stateData(),
+                                    dynData->derivData(),
+                                    rootValues.data(),
+                                    dynData->getSolverMode());
+                for (index_t root = 0; root < rootTotal; ++root) {
+                    if (std::abs(rootValues[root]) <= 1e-9) {
+                        logging::logTo(this,
+                                       this,
+                                       PrintLevel::SUMMARY,
+                                       "IDA post-root zero probe: root[{}]={} owner={}",
+                                       root,
+                                       rootValues[root],
+                                       ((root >= 0) &&
+                                        (static_cast<size_t>(root) < rootNames.size())) ?
+                                           rootNames[root] :
+                                           "<unmapped>");
+                    }
+                }
+            }
+        } else if (retval == SOLVER_INVALID_STATE_ERROR) {
+            // if we get into here the most likely cause is a very low voltage bus
+            const StateData stateDataValue(timeActual, dynData->stateData(), dynData->derivData());
+
+            rootCheck(noInputs,
+                      stateDataValue,
+                      dynData->getSolverMode(),
+                      CheckLevel::LOW_VOLTAGE_CHECK);
+            // return dynData->calcIC(getSimulationTime(), probeStepTime,
+            // SolverInterface::IcModes::FIXED_DIFF, true);
+            opFlags.reset(LOW_BUS_VOLTAGE);
+#if JAC_CHECK_ENABLED > 0
+            int mmatch = jacobianCheck(this, dynData->getSolverMode());
+            if (mmatch > 0) {
+                printStateNames(this, dynData->getSolverMode());
+            }
+#endif
+        }
+    }
+}
+
+bool GridDynSimulation::dynamicCheckAndReset(const SolverMode& sMode, ChangeCode change)
+{
+    auto dynData = getSolverInterface(sMode);
+    if (opFlags[CONNECTIVITY_CHANGE_FLAG]) {
+        checkNetwork(NetworkCheckType::SIMPLIFIED);
+    }
+    if ((opFlags[STATE_CHANGE_FLAG]) || (change == ChangeCode::STATE_SIZE_CHANGE)) {
+        // we changed object states so we have to do a full reset
+        if (checkEventsForDynamicReset(currentTime + probeStepTime, sMode)) {
+            return true;
+        }
+        reInitDyn(sMode);
+    } else if ((opFlags[OBJECT_CHANGE_FLAG]) || (change == ChangeCode::OBJECT_CHANGE)) {
+        // the object count changed
+        if (checkEventsForDynamicReset(currentTime + probeStepTime, sMode)) {
+            return true;
+        }
+
+        if (dynData->size() != stateSize(sMode)) {
+            reInitDyn(sMode);
+        } else {
+            updateOffsets(sMode);
+        }
+    } else if ((opFlags[JACOBIAN_COUNT_CHANGE_FLAG]) || (change == ChangeCode::JACOBIAN_CHANGE)) {
+        if (checkEventsForDynamicReset(currentTime + probeStepTime, sMode)) {
+            return true;
+        }
+        handleRootChange(sMode, dynData);
+        dynData->setMaxNonZeros(jacSize(sMode));
+        if (isDifferentialOnly(sMode)) {
+            // A limiter root can change the differential RHS/Jacobian branch.
+            // Reinitialize CVODE at the event time from the post-trigger model
+            // state so its multistep history and root history do not reuse the
+            // pre-transition branch.
+            reInitDyn(sMode);
+        } else {
+            // Allow for the fact that the new size of Jacobian now also has a
+            // different number of non-zeros.
+            dynData->sparseReInit(SolverInterface::SparseReinitMode::RESIZE);
+        }
+    } else if (change == ChangeCode::PARAMETER_CHANGE) {
+        // A parameter event changes the residual/derivative functions without
+        // changing the state layout.  Reinitialize the time integrator so its
+        // multistep history does not straddle the discontinuity.
+        reInitDyn(sMode);
+    } else if (opFlags[ROOT_CHANGE_FLAG]) {
+        handleRootChange(sMode, dynData);
+    } else {
+        // mode ==0
+        opFlags &= RESET_CHANGE_FLAG_MASK;
+        return false;
+    }
+
+    opFlags &= RESET_CHANGE_FLAG_MASK;
+    return true;
+}
+
+int GridDynSimulation::generateDaeDynamicInitialConditions(const SolverMode& sMode)
+{
+    auto dynData = getSolverInterface(sMode);
+    int retval = FUNCTION_EXECUTION_FAILURE;
+    // check and deal with voltage Reset
+    if (opFlags[RESET_VOLTAGE_FLAG]) {
+        opFlags.reset(RESET_VOLTAGE_FLAG);
+        faultResetRecovery frr(this, dynData);
+        while (frr.hasMoreFixes()) {
+            retval = frr.attemptFix();
+            if (retval == FUNCTION_EXECUTION_SUCCESS) {
+                retval = checkAlgebraicRoots(dynData);
+                if (retval == FUNCTION_EXECUTION_SUCCESS) {
+                    return retval;
+                }
+            }
+        }
+    }
+    if (opFlags[LOW_BUS_VOLTAGE]) {
+        const StateData stateDataValue(getSimulationTime(),
+                                       dynData->stateData(),
+                                       dynData->derivData());
+
+        rootCheck(noInputs,
+                  stateDataValue,
+                  dynData->getSolverMode(),
+                  CheckLevel::LOW_VOLTAGE_CHECK);
+        // return dynData->calcIC(getSimulationTime(), probeStepTime,
+        // SolverInterface::IcModes::FIXED_DIFF, true);
+        opFlags.reset(LOW_BUS_VOLTAGE);
+    }
+    // Do the first cut guessState at the solution
+    guessState(currentTime, dynData->stateData(), dynData->derivData(), sMode);
+    auto maxResid = checkResid(this, dynData);
+    // double cr2;
+    if (std::abs(maxResid.first) > 0.5) {
+        if ((logPrintLevel >= PrintLevel::DEBUG) || (consolePrintLevel >= PrintLevel::DEBUG)) {
+            stringVec snames;
+            getStateName(snames, sMode);
+            logging::debug(this,
+                           "state {}:{} error= {}",
+                           maxResid.second,
+                           snames[maxResid.second],
+                           maxResid.first);
+        }
+        // converge (currentTime, dynData->stateData (), dynData->derivData (), sMode,
+        // ConvergeMode::high_error_only, 0.05);
+        // jacobianCheck(sMode);
+        //  printStateNames(this,sMode);
+    }
+
+    retval =
+        dynData->calcIC(currentTime, probeStepTime, SolverInterface::IcModes::FIXED_DIFF, true);
+
+    if (retval == -22) {
+        // this is bad initial conditions TODO:: map this to Solver ERROR codes not
+        // Sundials ERROR codes
+        converge(currentTime,
+                 dynData->stateData(),
+                 dynData->derivData(),
+                 sMode,
+                 ConvergeMode::SINGLE_ITERATION,
+                 0.05);
+        retval =
+            dynData->calcIC(currentTime, probeStepTime, SolverInterface::IcModes::FIXED_DIFF, true);
+    }
+    if ((retval < FUNCTION_EXECUTION_SUCCESS) && dynData->getFlag("ida_ic_stop_on_failure")) {
+        return retval;
+    }
+    if (retval == FUNCTION_EXECUTION_SUCCESS) {
+        retval = checkAlgebraicRoots(dynData);
+    }
+    // if we still haven't fixed it call the recovery object and let it try to deal with it
+    if (retval < FUNCTION_EXECUTION_SUCCESS) {
+        dynamicInitialConditionRecovery dicr(this, dynData);
+        while (dicr.hasMoreFixes()) {
+            retval = dicr.attemptFix();
+            if (retval == FUNCTION_EXECUTION_SUCCESS) {
+                retval = checkAlgebraicRoots(dynData);
+                if (retval == FUNCTION_EXECUTION_SUCCESS) {
+                    return retval;
+                }
+            }
+        }
+    }
+
+    if ((consolePrintLevel >= PrintLevel::TRACE) || (logPrintLevel >= PrintLevel::TRACE)) {
+        dynData->logSolverStats(PrintLevel::TRACE, true);
+    }
+    return retval;
+}
+
+int GridDynSimulation::generatePartitionedDynamicInitialConditions(const SolverMode& sModeAlg,
+                                                                   const SolverMode& sModeDiff,
+                                                                   bool advanceTime)
+{
+    auto dynDataAlg = getSolverInterface(sModeAlg);
+    auto dynDataDiff = getSolverInterface(sModeDiff);
+    int retval = FUNCTION_EXECUTION_FAILURE;
+    // check and deal with voltage Reset
+    if (opFlags[RESET_VOLTAGE_FLAG]) {
+        opFlags.reset(RESET_VOLTAGE_FLAG);
+        /*faultResetRecovery frr(this, dynData);
+        while (frr.hasMoreFixes())
+        {
+                retval = frr.attemptFix();
+                if (retval == FUNCTION_EXECUTION_SUCCESS)
+                {
+                        retval = checkAlgebraicRoots(dynData);
+                        if (retval == FUNCTION_EXECUTION_SUCCESS)
+                        {
+                                return retval;
+                        }
+                }
+        }
+        */
+    }
+    if (opFlags[LOW_BUS_VOLTAGE]) {
+        /*StateData sD(getSimulationTime(), dynData->stateData(), dynData->derivData());
+
+        rootCheck(&sD, dynData->getSolverMode(), CheckLevel::LOW_VOLTAGE_CHECK);
+        //return dynData->calcIC(getSimulationTime(), probeStepTime,
+        SolverInterface::IcModes::FIXED_DIFF, true); opFlags.reset(LOW_BUS_VOLTAGE);
+        */
+    }
+    CoreTime tRet;
+    const auto algebraicTime = advanceTime ? currentTime + probeStepTime : currentTime;
+    if (controlFlags[PARTITIONED_DIAGNOSTICS_FLAG]) {
+        const auto message = std::format(
+            "Partitioned algebraic reinitialization start: current_time={} solve_time={} advance_time={}",
+            static_cast<double>(currentTime),
+            static_cast<double>(algebraicTime),
+            advanceTime);
+        std::println("{}", message);
+        partitionedDiagnostic(message);
+    }
+    retval = dynDataAlg->solve(algebraicTime, tRet);
+    if (retval == FUNCTION_EXECUTION_SUCCESS && advanceTime) {
+        currentTime = algebraicTime;
+    }
+    if (controlFlags[PARTITIONED_DIAGNOSTICS_FLAG]) {
+        const auto message = std::format(
+            "Partitioned algebraic reinitialization result: return={} solver_time={} current_time={}",
+            retval,
+            static_cast<double>(tRet),
+            static_cast<double>(currentTime));
+        std::println("{}", message);
+        partitionedDiagnostic(message);
+    }
+    return retval;
+}
+
+int GridDynSimulation::checkAlgebraicRoots(std::shared_ptr<SolverInterface>& dynData)
+{
+    if (opFlags[HAS_ALG_ROOTS]) {
+        const SolverMode& sMode = dynData->getSolverMode();
+        dynData->getCurrentData();
+        setState(currentTime + probeStepTime, dynData->stateData(), dynData->derivData(), sMode);
+        updateLocalCache();
+        const ChangeCode ret =
+            rootCheck(noInputs, emptyStateData, cLocalSolverMode, CheckLevel::FULL_CHECK);
+        handleRootChange(sMode, dynData);
+        if (ret > ChangeCode::NON_STATE_CHANGE) {
+            dynamicCheckAndReset(sMode, ret);
+            int retval = dynData->calcIC(currentTime,
+                                         probeStepTime,
+                                         SolverInterface::IcModes::FIXED_DIFF,
+                                         true);
+
+            if (retval < 0)  // this is bad initial conditions
+            {
+                converge(currentTime,
+                         dynData->stateData(),
+                         dynData->derivData(),
+                         sMode,
+                         ConvergeMode::SINGLE_ITERATION,
+                         0.05);
+                retval = dynData->calcIC(currentTime,
+                                         probeStepTime,
+                                         SolverInterface::IcModes::FIXED_DIFF,
+                                         true);
+            }
+            return retval;
+        }
+    }
+    return FUNCTION_EXECUTION_SUCCESS;
+}
+
+int GridDynSimulation::handleStateChange(const SolverMode& sMode)
+{
+    if (opFlags[STATE_CHANGE_FLAG]) {
+        if (checkEventsForDynamicReset(currentTime + probeStepTime, sMode)) {
+            return generateDaeDynamicInitialConditions(sMode);
+        }
+
+        reInitDyn(sMode);
+        return generateDaeDynamicInitialConditions(sMode);
+    }
+    return HANDLER_NO_RETURN;
+}
+
+void GridDynSimulation::handleRootChange(const SolverMode& sMode,
+                                         std::shared_ptr<SolverInterface>& dynData)
+{
+    if (opFlags[ROOT_CHANGE_FLAG])  // something with the roots changed
+    {
+        const auto modeRootCount = rootSize(sMode);
+        if (std::cmp_not_equal(modeRootCount, dynData->rootsfound.size())) {
+            dynData->setRootFinding(modeRootCount);
+            if (modeRootCount > 0) {
+                setRootOffset(0, sMode);
+            }
+        }
+        opFlags.reset(ROOT_CHANGE_FLAG);
+    } else if (rootSize(sMode) > 0) {
+        if (offsets.getRootOffset(sMode) == kNullLocation) {
+            setRootOffset(0, sMode);
+        }
+    }
+}
+
+void GridDynSimulation::getConstraints(double consData[], const SolverMode& sMode)
+{
+    // if ((controlFlags[VOLTAGE_CONSTRAINTS_FLAG]) || (opFlags[HAS_CONSTRAINTS]))
+    if (controlFlags[VOLTAGE_CONSTRAINTS_FLAG]) {
+        getVoltageStates(consData, sMode);
+    }
+    if (opFlags[HAS_CONSTRAINTS]) {
+        GridArea::getConstraints(consData, sMode);
+    }
+}
+
+void GridDynSimulation::updateOffsets(const SolverMode& sMode)
+{
+    setupOffsets(sMode, default_ordering);
+    setMaxNonZeros(sMode, jacSize(sMode));
+}
+
+int GridDynSimulation::reInitDyn(const SolverMode& sMode)
+{
+    auto dynData = getSolverInterface(sMode);
+    updateOffsets(sMode);
+
+    // check for objects with roots
+    count_t nRoots = 0;
+    if (controlFlags[ROOTS_DISABLED]) {
+        offsets.local().local.algRoots = 0;
+        offsets.local().local.diffRoots = 0;
+        opFlags[HAS_ROOTS] = false;
+        opFlags[HAS_ALG_ROOTS] = false;
+    } else {
+        nRoots = rootSize(sMode);
+        if (rootSize(sMode) > 0) {
+            opFlags[HAS_ROOTS] = true;
+            setRootOffset(0, sMode);
+            opFlags[HAS_ALG_ROOTS] = (offsets.getOffsets(sMode).total.algRoots > 0);
+        } else {
+            opFlags[HAS_ROOTS] = false;
+            opFlags[HAS_ALG_ROOTS] = false;
+        }
+    }
+    if (controlFlags[CONSTRAINTS_DISABLED]) {
+        opFlags[HAS_CONSTRAINTS] = false;
+    }
+
+    // CSW: Need to send in the number of roots to find so that memory
+    // can be allocated to for the array indicating indices of roots.
+    const auto stateCount = stateSize(sMode);
+    dynData->allocate(stateCount, nRoots);
+
+    // guessState an initial condition
+    guessState(currentTime, dynData->stateData(), dynData->derivData(), sMode);
+    // dynInitializeB ida memory
+    if (stateCount > 0) {
+        dynData->initialize(currentTime);
+    }
+
+    opFlags &= RESET_CHANGE_FLAG_MASK;
+    pState = GridState::DYNAMIC_INITIALIZED;
+    return FUNCTION_EXECUTION_SUCCESS;
+}
+
+#define DEBUG_RESID 0
+#ifdef NDEBUG
+#    define CHECK_RESID 0
+#    define CHECK_STATE 0
+#else
+#    define CHECK_RESID 1
+#    define CHECK_STATE 1
+#endif
+
+#if DEBUG_RESID > 0
+static constexpr double resid_print_tol = 1e-6;
+#endif
+// IDA nonlinear function evaluation
+int GridDynSimulation::residualFunction(CoreTime time,
+                                        const double state[],
+                                        const double dstateDt[],
+                                        double resid[],
+                                        const SolverMode& sMode) noexcept
+{
+    ++residCount;
+    StateData stateDataValue(time, state, dstateDt, residCount);
+    // Use the allocated vector length for model bounds checks.  A stateSize
+    // query can reload invalidated counts and clear offsets mid-callback.
+    if (isValidIndex(sMode.offsetIndex, solverInterfaces)) {
+        const auto& solver = solverInterfaces[sMode.offsetIndex];
+        if (solver != nullptr) {
+            stateDataValue.stateSize = static_cast<index_t>(solver->size());
+        }
+    }
+
+#if (CHECK_STATE > 0)
+    auto dynDataa = getSolverInterface(sMode);
+    for (index_t kk = 0; kk < dynDataa->size(); ++kk) {
+        if (!std::isfinite(state[kk])) {
+            logging::error(this, "state[{}] is not finite", kk);
+            printStateNames(this, sMode);
+            return FUNCTION_EXECUTION_FAILURE;
+        }
+    }
+#endif
+
+    fillExtraStateData(stateDataValue, sMode);
+    // call the area based function to handle the looping
+    preEx(noInputs, stateDataValue, sMode);
+    residual(noInputs, stateDataValue, resid, sMode);
+    delayedResidual(noInputs, stateDataValue, resid, sMode);
+
+#if (CHECK_RESID > 0)
+    auto dynDatab = getSolverInterface(sMode);
+    for (index_t kk = 0; kk < dynDatab->size(); ++kk) {
+        if (!std::isfinite(resid[kk])) {
+            logging::error(this, "resid[{}] is not finite", kk);
+            printStateNames(this, sMode);
+            assert(std::isfinite(resid[kk]));
+        }
+    }
+#endif
+
+#if (DEBUG_RESID >= 1)
+    static std::vector<double> rvals;
+    static std::vector<double> lstate;
+    static std::vector<int> dbigger;
+    static CoreTime ptime = negTime;
+    auto dynData = getSolverInterface(sMode);
+    const auto stateCount = dynData->size();
+    if (rvals.size() != stateCount) {
+        rvals.resize(stateCount);
+        dbigger.resize(stateCount);
+        lstate.resize(stateCount);
+        std::copy(resid, resid + stateCount, rvals.data());
+        std::copy(state, state + stateCount, lstate.data());
+        std::fill(dbigger.begin(), dbigger.end(), 0);
+        ptime = time;
+#    if DEBUG_RESID > 1
+        for (index_t kk = 0; kk < stateCount; kk++) {
+#        if (DEBUG_RESID == 3)
+            std::println("{}[{}] {} r={} state={}",
+                         static_cast<int>(residCount),
+                         static_cast<double>(time),
+                         static_cast<int>(kk),
+                         resid[kk],
+                         state[kk]);
+#        else
+            if (std::abs(resid[kk]) > resid_print_tol) {
+                std::println("{}[{}] {} r={} state={}",
+                             static_cast<int>(residCount),
+                             static_cast<double>(time),
+                             static_cast<int>(kk),
+                             resid[kk],
+                             state[kk]);
+            }
+#        endif
+        }
+#    endif
+        dynData->printStates(true);
+    } else if (ptime != time) {
+        std::copy(resid, resid + stateCount, rvals.data());
+        std::copy(state, state + stateCount, lstate.data());
+        std::fill(dbigger.begin(), dbigger.end(), 0);
+
+#    if DEBUG_RESID > 1
+        std::println("time change {}", static_cast<double>(time - ptime));
+        for (index_t kk = 0; kk < stateCount; kk++) {
+#        if (DEBUG_RESID == 3)
+            std::println("{}[{}] {} r={} state={}",
+                         static_cast<int>(residCount),
+                         static_cast<double>(time),
+                         static_cast<int>(kk),
+                         resid[kk],
+                         state[kk]);
+#        else
+            if (std::abs(resid[kk]) > resid_print_tol) {
+                std::println("{}[{}] {} r={} state={}",
+                             static_cast<int>(residCount),
+                             static_cast<double>(time),
+                             static_cast<int>(kk),
+                             resid[kk],
+                             state[kk]);
+            }
+#        endif
+        }
+#    endif
+        ptime = time;
+    } else {
+        for (index_t kk = 0; kk < stateCount; kk++) {
+#    if DEBUG_RESID > 1
+#        if (DEBUG_RESID == 3)
+            std::println("{}[{}] {} r={} state={} dr={} ds={}",
+                         static_cast<int>(residCount),
+                         static_cast<double>(time),
+                         static_cast<int>(kk),
+                         resid[kk],
+                         state[kk],
+                         resid[kk] - rvals[kk],
+                         state[kk] - lstate[kk]);
+#        else
+            if ((std::abs(resid[kk]) > resid_print_tol) ||
+                (std::abs(state[kk] - lstate[kk]) > 1e-5)) {
+                std::println("{}[{}] {} r={} state={} dr={} ds={}",
+                             static_cast<int>(residCount),
+                             static_cast<double>(time),
+                             static_cast<int>(kk),
+                             resid[kk],
+                             state[kk],
+                             resid[kk] - rvals[kk],
+                             state[kk] - lstate[kk]);
+            }
+#        endif
+#    endif
+            if (std::abs(resid[kk]) - 1e-7 > std::abs(rvals[kk])) {
+                dbigger[kk] += 1;
+                if (dbigger[kk] > 2) {
+                    std::println("residual[{}] getting bigger from {} to {} at time={}",
+                                 static_cast<int>(kk),
+                                 rvals[kk],
+                                 resid[kk],
+                                 static_cast<double>(time));
+                }
+            } else {
+                dbigger[kk] = 0;
+            }
+        }
+        std::copy(resid, resid + stateCount, rvals.data());
+        std::copy(state, state + stateCount, lstate.data());
+    }
+    // compute the maximum resid and location
+    auto me = std::max_element(resid, resid + stateCount);
+    std::println(" max residual at {} = {}", static_cast<int>(me - resid), *me);
+#endif
+    if (opFlags[INVALID_STATE_FLAG]) {
+        opFlags.reset(INVALID_STATE_FLAG);
+        return 1;
+    }
+    return 0;
+}
+
+int GridDynSimulation::derivativeFunction(CoreTime time,
+                                          const double state[],
+                                          double dstateDt[],
+                                          const SolverMode& sMode) noexcept
+{
+    ++residCount;
+    StateData stateDataValue(time, state, dstateDt, residCount);
+    fillExtraStateData(stateDataValue, sMode);
+#if (CHECK_STATE > 0)
+    auto dynDataa = getSolverInterface(sMode);
+    for (index_t kk = 0; kk < dynDataa->size(); ++kk) {
+        if (!std::isfinite(state[kk])) {
+            logging::error(this, "state[{}] is not finite", kk);
+            return FUNCTION_EXECUTION_FAILURE;
+        }
+    }
+#endif
+
+    // call the area based function to handle the looping
+    preEx(noInputs, stateDataValue, sMode);
+    derivative(noInputs, stateDataValue, dstateDt, sMode);
+    delayedDerivative(noInputs, stateDataValue, dstateDt, sMode);
+    return FUNCTION_EXECUTION_SUCCESS;
+}
+
+// Jacobian computation
+int GridDynSimulation::jacobianFunction(CoreTime time,
+                                        const double state[],
+                                        const double dstateDt[],
+                                        MatrixData<double>& matrixDataRef,
+                                        double cjValue,
+                                        const SolverMode& sMode) noexcept
+{
+    ++JacobianCallCount;
+    // assuming it is the same data as the preceding residual call  (it is for IDA but not sure if
+    // this assumption will be generally valid)
+    StateData stateDataValue(time, state, dstateDt, residCount);
+    stateDataValue.cj = cjValue;
+    fillExtraStateData(stateDataValue, sMode);
+    // the area function to evaluate the Jacobian elements
+    preEx(noInputs, stateDataValue, sMode);
+    matrixDataRef.clear();
+    jacobianElements(noInputs, stateDataValue, matrixDataRef, noInputLocs, sMode);
+    delayedJacobian(noInputs, stateDataValue, matrixDataRef, noInputLocs, sMode);
+
+    return FUNCTION_EXECUTION_SUCCESS;
+}
+
+int GridDynSimulation::rootFindingFunction(CoreTime time,
+                                           const double state[],
+                                           const double dstateDt[],
+                                           double roots[],
+                                           const SolverMode& sMode) noexcept
+{
+    if (sMode.pairedOffsetIndex != kNullLocation) {
+        // Partitioned CVODE supplies an interpolated differential state to its
+        // root callback. The paired KINSOL vector still belongs to the last RHS
+        // evaluation, so algebraic-dependent roots (for example terminal-voltage
+        // limits) must solve the network at this callback state before reading
+        // model inputs.
+        const int algStatus = dynAlgebraicSolve(time, state, dstateDt, sMode);
+        if (algStatus != FUNCTION_EXECUTION_SUCCESS) {
+            return algStatus;
+        }
+    }
+    StateData stateDataValue(time, state, dstateDt, residCount);
+    fillExtraStateData(stateDataValue, sMode);
+    rootTest(noInputs, stateDataValue, roots, sMode);
+    return FUNCTION_EXECUTION_SUCCESS;
+}
+
+int GridDynSimulation::dynAlgebraicSolve(CoreTime time,
+                                         const double diffState[],
+                                         const double deriv[],
+                                         const SolverMode& sMode) noexcept
+{
+    if ((!isValidIndex(sMode.offsetIndex, extraStateInformation)) ||
+        (!isValidIndex(sMode.offsetIndex, extraDerivInformation)) ||
+        (sMode.pairedOffsetIndex == kNullLocation) || (diffState == nullptr) ||
+        (deriv == nullptr)) {
+        // This callback is noexcept because it is entered from SUNDIALS. The
+        // diagnostic must not turn invalid callback input into an exception
+        // escaping through the solver library.
+        try {
+            logging::error(
+                this,
+                "Partitioned algebraic callback has invalid state pairing: mode={} pair={} "
+                "state_index_valid={} derivative_index_valid={} state_present={} derivative_present={}",
+                sMode.offsetIndex,
+                sMode.pairedOffsetIndex,
+                isValidIndex(sMode.offsetIndex, extraStateInformation),
+                isValidIndex(sMode.offsetIndex, extraDerivInformation),
+                diffState != nullptr,
+                deriv != nullptr);
+        }
+        catch (...) {
+            reportPartitionedDiagnosticFailure();
+        }
+        return FUNCTION_EXECUTION_FAILURE;
+    }
+    extraStateInformation[sMode.offsetIndex] = diffState;
+    extraDerivInformation[sMode.offsetIndex] = deriv;
+
+    auto solverData = getSolverInterface(sMode.pairedOffsetIndex);
+    int ret = FUNCTION_EXECUTION_FAILURE;
+    if (solverData) {
+        const auto callbackCount = ++partitionedAlgebraicCallCount;
+        if (controlFlags[PARTITIONED_DIAGNOSTICS_FLAG] && callbackCount <= 8) {
+            try {
+                std::println(
+                    "Partitioned algebraic callback: time={} differential index={} states={} "
+                    "paired algebraic index={} states={} initialized={}",
+                    static_cast<double>(time),
+                    sMode.offsetIndex,
+                    stateSize(sMode),
+                    solverData->getSolverMode().offsetIndex,
+                    solverData->size(),
+                    solverData->isInitialized());
+                partitionedDiagnostic(std::format(
+                    "Partitioned algebraic callback: time={} differential index={} states={} paired algebraic index={} states={} initialized={}",
+                    static_cast<double>(time),
+                    sMode.offsetIndex,
+                    stateSize(sMode),
+                    solverData->getSolverMode().offsetIndex,
+                    solverData->size(),
+                    solverData->isInitialized()));
+            }
+            catch (...) {
+                reportPartitionedDiagnosticFailure();
+            }
+        }
+        CoreTime tret;
+        ret = solverData->solve(time, tret);
+        if (controlFlags[PARTITIONED_DIAGNOSTICS_FLAG] && callbackCount <= 8) {
+            try {
+                std::println(
+                    "Partitioned algebraic callback returned: time={} return={} solver_time={}",
+                    static_cast<double>(time),
+                    ret,
+                    static_cast<double>(tret));
+                partitionedDiagnostic(std::format(
+                    "Partitioned algebraic callback returned: time={} return={} solver_time={}",
+                    static_cast<double>(time),
+                    ret,
+                    static_cast<double>(tret)));
+            }
+            catch (...) {
+                reportPartitionedDiagnosticFailure();
+            }
+        }
+        if (ret < 0) {
+            if (jacobianCheck(this, solverData->getSolverMode()) > 0) {
+                printStateNames(this, solverData->getSolverMode());
+            }
+            solverData->setFlag("print_resid");
+        }
+    }
+    extraStateInformation[sMode.offsetIndex] = nullptr;
+    extraDerivInformation[sMode.offsetIndex] = nullptr;
+    return ret;
+}
+
+}  // namespace griddyn

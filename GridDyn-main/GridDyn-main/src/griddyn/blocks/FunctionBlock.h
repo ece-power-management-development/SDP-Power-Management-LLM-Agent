@@ -1,0 +1,80 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "../Block.h"
+#include "utilities/functionInterpreter.h"
+#include <string>
+
+namespace griddyn::blocks {
+/**
+ * @brief Algebraic wrapper around a supported unary or binary math function.
+ *
+ * Unary functions evaluate @f$y=K f(G(u+b))@f$.  Binary functions evaluate
+ * @f$y=K f(G(u+b),a)@f$, where `arg` supplies the constant second argument.
+ * `function` and `func` select the function; an unknown name throws
+ * InvalidParameterValue rather than leaving a null callable.  The analytic
+ * Jacobian is available for supported unary functions.  Binary functions use
+ * the function interpreter's two-argument behavior and should be selected
+ * only when its derivative contract is suitable for the containing model.
+ */
+class FunctionBlock: public GridBlock {
+  public:
+    //!< flags for function block
+    enum FunctionBlockFlags {
+        USES_CONSTANT_ARG =
+            OBJECT_FLAG10,  //!< flag indicating that the function should use a constant
+                            //!< argument for the second argument of functions
+    };
+
+  protected:
+    function1_t mFunctionPtr = nullptr;  //!< function object for single argument functions
+    function1_t mDerivativeFunctionPtr =
+        nullptr;  //!< derivative function object for single argument functions
+    function2_t mBinaryFunctionPtr = nullptr;  //!< function object for multiple argument functions
+    model_parameter mGain = 1.0;  //!< extra gain factor
+    model_parameter mArg2 = 0.0;  //!< second argument for 2 argument functions
+  public:
+    /** @brief default constructor*/
+    FunctionBlock();
+    /** @brief alternate constructor
+@param[in] functionName the name of the function as a string
+*/
+    explicit FunctionBlock(const std::string& functionName);
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+
+    virtual void dynObjectInitializeB(const IOdata& inputs,
+                                      const IOdata& desiredOutput,
+                                      IOdata& fieldSet) override;
+
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+    // virtual index_t findIndex(const std::string &field, const SolverMode &sMode) const;
+
+    // virtual void blockDerivative(double input, double didt, const StateData&sD, double
+    // deriv[], const SolverMode &sMode) override;
+    virtual void blockAlgebraicUpdate(double input,
+                                      const StateData& stateDataValue,
+                                      double update[],
+                                      const SolverMode& sMode) override;
+
+    // only called if the genModel is not present
+    virtual void blockJacobianElements(double input,
+                                       double didt,
+                                       const StateData& stateDataValue,
+                                       MatrixData<double>& matrixDataValue,
+                                       index_t argLoc,
+                                       const SolverMode& sMode) override;
+    virtual double step(CoreTime time, double input) override;
+    // virtual void setTime(CoreTime time){prevTime=time;};
+  protected:
+    /** @brief load the function objects from a string input
+@param[in] functionName the name of the function as a string*/
+    void setFunction(const std::string& functionName);
+};
+}  // namespace griddyn::blocks

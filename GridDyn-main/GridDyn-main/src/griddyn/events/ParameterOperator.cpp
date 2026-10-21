@@ -1,0 +1,113 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "ParameterOperator.h"
+
+#include "../GridComponent.h"
+#include "core/ObjectInterpreter.h"
+#include "gmlc/utilities/string_viewOps.h"
+#include <memory>
+#include <string>
+#include <string_view>
+
+namespace griddyn {
+ParameterOperator::ParameterOperator() = default;
+ParameterOperator::ParameterOperator(GridComponent* target, const std::string& field):
+    m_field(field), comp(target)
+{
+    checkField();
+}
+
+void ParameterOperator::setTarget(GridComponent* target, const std::string& field)
+{
+    if (!field.empty()) {
+        m_field = field;
+    }
+    if (target != nullptr) {
+        comp = target;
+    }
+    checkField();
+}
+
+void ParameterOperator::updateObject(CoreObject* target, ObjectUpdateMode mode)
+{
+    if (mode == ObjectUpdateMode::DIRECT) {
+        auto* nobj = dynamic_cast<GridComponent*>(target);
+        if (nobj != nullptr) {
+            comp = nobj;
+        }
+    } else {
+        auto* newTarget = dynamic_cast<GridComponent*>(findMatchingObject(comp, target));
+        if (newTarget != nullptr) {
+            setTarget(newTarget);
+        } else {
+            throw(ObjectUpdateFailException());
+        }
+    }
+}
+
+void ParameterOperator::setParameter(double val)
+{
+    if (parameterIndex == kNullLocation) {
+        comp->set(m_field, val);
+        return;
+    }
+    comp->setParameter(parameterIndex, val);
+}
+
+double ParameterOperator::getParameter() const
+{
+    if (parameterIndex == kNullLocation) {
+        return comp->get(m_field);
+    }
+    return comp->getParameter(parameterIndex);
+}
+CoreObject* ParameterOperator::getObject() const
+{
+    return comp;
+}
+
+void ParameterOperator::getObjects(std::vector<CoreObject*>& objects) const
+{
+    objects.push_back(comp);
+}
+
+void ParameterOperator::checkField() {}
+
+std::unique_ptr<ParameterOperator> make_parameterOperator(std::string_view param,
+                                                          GridComponent* rootObject)
+{
+    using gmlc::utilities::string_viewOps::trim;
+
+    std::string_view paramS(param);
+    auto renameloc = paramS.find(" as ");  // spaces are important
+                                           // extract out a rename
+    std::string_view rname;
+    if (renameloc != std::string::npos) {
+        rname = trim(paramS.substr(renameloc + 4));
+        paramS = paramS.substr(0, renameloc);
+    }
+    const ObjectInfo objectInfo(std::string{paramS}, rootObject);
+
+    auto pop = std::make_unique<ParameterOperator>(dynamic_cast<GridComponent*>(objectInfo.mObject),
+                                                   objectInfo.mField);
+    if (!rname.empty()) {
+        pop->setName(rname);
+    }
+    return pop;
+}
+
+index_t ParameterSet::add(const std::string& paramString, GridComponent* rootObject)
+{
+    params.push_back(make_parameterOperator(paramString, rootObject));
+    return static_cast<index_t>(params.size()) - 1;
+}
+ParameterOperator* ParameterSet::operator[](index_t index)
+{
+    return params[index].get();
+}
+
+}  // namespace griddyn

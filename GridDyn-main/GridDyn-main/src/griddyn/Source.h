@@ -1,0 +1,71 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "GridSubModel.h"
+#include <string>
+
+namespace griddyn {
+/** Source is a signal generator in GridDyn.
+The component Definition class defines the interface for a Source
+*/
+class Source: public GridSubModel {
+  public:
+    std::string purpose_;  //!< string for use by applications to indicate usage
+  protected:
+    double m_tempOut = 0;  //!< temporary output corresponding to desired time
+    CoreTime lastTime = timeZero;  //!< storage for the previously queried time
+    units::unit outputUnits_ = units::defunit;  //!< specify the units of the output
+  public:
+    /** constructor
+    @param[in] objName the name of the object
+    @param[in] startVal the starting Value of the object
+    */
+    Source(const std::string& objName = "source_#", double startVal = 0.0);
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+
+    virtual void timestep(CoreTime time, const IOdata& inputs, const SolverMode& sMode) override;
+
+    virtual IOdata getOutputs(const IOdata& inputs,
+                              const StateData& sD,
+                              const SolverMode& sMode) const override;
+    virtual double getOutput(const IOdata& inputs,
+                             const StateData& sD,
+                             const SolverMode& sMode,
+                             index_t num = 0) const override;
+
+    virtual double getOutput(index_t outputNum = 0) const override;
+    virtual index_t getOutputLoc(const SolverMode& sMode, index_t num = 0) const override;
+
+    virtual units::unit outputUnits(index_t outputNum) const override;
+
+    virtual count_t outputDependencyCount(index_t num, const SolverMode& sMode) const override;
+    virtual void setState(CoreTime time,
+                          const double state[],
+                          const double dstate_dt[],
+                          const SolverMode& sMode) override;
+    /** update the output to correspond to a new time value*/
+    virtual void updateOutput(CoreTime time);
+    virtual void updateLocalCache(const IOdata& inputs,
+                                  const StateData& sD,
+                                  const SolverMode& sMode) override;
+
+    /** update the source output and advance the model time
+    @param[in] time  the time to update to
+    */
+    virtual double computeOutput(CoreTime time) const;
+    /** set the output level
+    @param[in] newLevel the level to set the output at
+    */
+    virtual void setLevel(double newLevel);
+};
+
+}  // namespace griddyn

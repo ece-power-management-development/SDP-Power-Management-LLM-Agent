@@ -1,0 +1,93 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "../Block.h"
+#include <string>
+#include <vector>
+
+namespace griddyn::blocks {
+/**
+ * @brief Identity/pass-through block with no solver states or roots.
+ *
+ * The block implements @f$y=u@f$ and, when configured with a differential
+ * input, passes its input derivative through as well.  It deliberately has no
+ * GridBlock gain, bias, limiter, power-flow, or dynamic operations.  It is a
+ * programmatic composition helper and is intentionally not factory-registered.
+ */
+class NullBlock final: public GridBlock {
+  public:
+    /** @brief default constructor*/
+    explicit NullBlock(const std::string& objName = "nullblock_#");
+
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+
+  protected:
+    virtual void dynObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+
+    virtual void dynObjectInitializeB(const IOdata& inputs,
+                                      const IOdata& desiredOutput,
+                                      IOdata& fieldSet) override;
+
+  public:
+    virtual void setFlag(std::string_view flag, bool val) override;
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+    virtual double get(std::string_view param,
+                       units::unit unitType = units::defunit) const override;
+
+    virtual void blockResidual(double input,
+                               double didt,
+                               const StateData& stateDataValue,
+                               double resid[],
+                               const SolverMode& solverModeValue) override;
+
+    virtual void blockDerivative(double input,
+                                 double didt,
+                                 const StateData& stateDataValue,
+                                 double deriv[],
+                                 const SolverMode& solverModeValue) override;
+
+    virtual void blockAlgebraicUpdate(double input,
+                                      const StateData& stateDataValue,
+                                      double update[],
+                                      const SolverMode& solverModeValue) override;
+
+    virtual void blockJacobianElements(double input,
+                                       double didt,
+                                       const StateData& stateDataValue,
+                                       MatrixData<double>& matrixDataValue,
+                                       index_t argLoc,
+                                       const SolverMode& solverModeValue) override;
+
+    virtual void timestep(CoreTime time, const IOdata& inputs, const SolverMode& sMode) override;
+
+    virtual double step(CoreTime time, double input) override;
+    virtual void rootTest(const IOdata& inputs,
+                          const StateData& stateDataValue,
+                          double roots[],
+                          const SolverMode& solverModeValue) override;
+    virtual void rootTrigger(CoreTime time,
+                             const IOdata& inputs,
+                             const std::vector<int>& rootMask,
+                             const SolverMode& solverModeValue) override;
+    virtual ChangeCode rootCheck(const IOdata& inputs,
+                                 const StateData& stateDataValue,
+                                 const SolverMode& solverModeValue,
+                                 CheckLevel level) override;
+    // virtual void setTime(CoreTime time){prevTime=time;};
+
+    virtual double getBlockOutput(const StateData& stateDataValue,
+                                  const SolverMode& solverModeValue) const override;
+    virtual double getBlockOutput() const override;
+    virtual double getBlockDoutDt(const StateData& stateDataValue,
+                                  const SolverMode& solverModeValue) const override;
+    virtual double getBlockDoutDt() const override;
+};
+
+}  // namespace griddyn::blocks

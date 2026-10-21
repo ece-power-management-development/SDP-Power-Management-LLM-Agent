@@ -1,0 +1,45 @@
+/* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil;  eval: (c-set-offset 'innamespace 0); -*-
+ */
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+// libraries
+
+// headers
+#include "gridDyn.h"
+#include "gridDynRunner.h"
+#include "gridDynServer.h"
+#include "libraryLoader.h"
+#include <chrono>
+#include <cstdio>
+#include <filesystem>
+#include <memory>
+
+// main
+int main(int argc, char* argv[])
+{
+    loadLibraries();
+    std::shared_ptr<GridDynSimulation> simulation = std::make_shared<GridDynSimulation>();
+
+    // Store the simulation pointer somewhere so that it can be accessed in other modules.
+    GridDynSimulation::setInstance(simulation.get());  // peer to GridDynSimulation::GetInstance ();
+
+    if (!simulation) {
+        return (-5);
+    }
+
+    bool isMpiCountMode = false;
+    // check for an MPI run setup
+    for (int ii = 0; ii < argc; ++ii) {
+        if (!strcmp("--mpicount", argv[ii])) {
+            isMpiCountMode = true;
+        }
+    }
+
+    // create the simulation
+
+    return 0;
+}

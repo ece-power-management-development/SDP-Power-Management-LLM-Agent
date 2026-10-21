@@ -1,0 +1,128 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+// headers
+#include "../gridOptObjects.h"
+#include "griddyn/MatPowerCostCurve.h"
+#include <string>
+#include <vector>
+// forward classes
+
+namespace griddyn {
+class GridLinkOpt;
+class GridLoadOpt;
+class GridGenOpt;
+class GridBusOpt;
+class Generator;
+
+class GridGenOpt: public GridOptObject {
+  public:
+    enum OptGenFlags {
+        PIECEWISE_LINEAR_COST = 1,
+    };
+
+  protected:
+    Generator* gen = nullptr;
+    GridBusOpt* bus;
+    double m_heatRate = -kBigNum;
+    std::vector<double> Pcoeff;
+    std::vector<double> Qcoeff;
+    MatPowerCostCurve activeCostCurve;
+    MatPowerCostCurve reactiveCostCurve;
+    double m_penaltyCost = 0;
+    double m_fuelCost = -1;
+    double m_forecast = -kBigNum;
+
+  public:
+    GridGenOpt(const std::string& objName = "");
+    GridGenOpt(CoreObject* obj, const std::string& objName = "");
+
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+    CoreObject* sourceObject() const override;
+    // add components
+
+    virtual void add(CoreObject* obj) override;
+    virtual void dynObjectInitializeA(std::uint32_t flags) override;
+    virtual void loadSizes(const OptimizationMode& oMode) override;
+
+    virtual void setValues(const OptimizationData& optimizationData,
+                           const OptimizationMode& oMode) override;
+    // for saving the state
+    virtual void guessState(double time, double val[], const OptimizationMode& oMode) override;
+    virtual void getTols(double tols[], const OptimizationMode& oMode) override;
+    virtual void getVariableType(double sdata[], const OptimizationMode& oMode) override;
+
+    virtual void valueBounds(double time,
+                             double upperLimit[],
+                             double lowerLimit[],
+                             const OptimizationMode& oMode) override;
+
+    virtual void linearObj(const OptimizationData& optimizationData,
+                           vectData<double>& linObj,
+                           const OptimizationMode& oMode) override;
+    virtual void quadraticObj(const OptimizationData& optimizationData,
+                              vectData<double>& linObj,
+                              vectData<double>& quadObj,
+                              const OptimizationMode& oMode) override;
+
+    virtual double objValue(const OptimizationData& optimizationData,
+                            const OptimizationMode& oMode) override;
+    virtual void gradient(const OptimizationData& optimizationData,
+                          double deriv[],
+                          const OptimizationMode& oMode) override;
+    virtual void jacobianElements(const OptimizationData& optimizationData,
+                                  MatrixData<double>& matrixDataRef,
+                                  const OptimizationMode& oMode) override;
+    virtual void getConstraints(const OptimizationData& optimizationData,
+                                MatrixData<double>& cons,
+                                double upperLimit[],
+                                double lowerLimit[],
+                                const OptimizationMode& oMode) override;
+    virtual void constraintValue(const OptimizationData& optimizationData,
+                                 double cVals[],
+                                 const OptimizationMode& oMode) override;
+    virtual void constraintJacobianElements(const OptimizationData& optimizationData,
+                                            MatrixData<double>& matrixDataRef,
+                                            const OptimizationMode& oMode) override;
+    virtual void getObjectiveNames(stringVec& objectiveNames,
+                                   const OptimizationMode& oMode,
+                                   const std::string& prefix = "") override;
+
+    // parameter set functions
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+    // parameter get functions
+    virtual double get(std::string_view param,
+                       units::unit unitType = units::defunit) const override;
+
+    /** Store a MATPOWER/PYPOWER cost curve in the optimizer's per-unit variables.
+        The source format expresses power in MW/MVAr; the adapter obtains the
+        current system base from its attached Generator when converting it. */
+    virtual void loadMatPowerCostCoeff(std::vector<double> coeff, int powerMode, int costModel);
+    void loadMatPowerCostCurve(const MatPowerCostCurve& curve, bool reactive = false);
+    /** Whether this generator's active piecewise curve covers its current Pg bounds. */
+    bool piecewiseCoversGenerationBounds(double time) const;
+    const MatPowerCostCurve& matPowerCostCurve(bool reactive = false) const
+    {
+        return reactive ? reactiveCostCurve : activeCostCurve;
+    }
+    // find components
+
+    /** Attached physical generator; optimization data remains external to it. */
+    Generator* sourceGenerator() const { return gen; }
+
+    virtual GridOptObject* getBus(index_t index) const override;
+    virtual GridOptObject* getArea(index_t index) const override;
+
+  protected:
+    bool usesActivePiecewiseCost(const OptimizationMode& oMode) const;
+    bool hasNonconvexActiveCost() const;
+};
+
+}  // namespace griddyn

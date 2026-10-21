@@ -1,0 +1,63 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+// headers
+// #include "GridDynSimulation.h"
+
+#include "CompoundEvent.h"
+#include "gmlc/utilities/TimeSeriesMulti.hpp"
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace griddyn::events {
+/** event type allowing multiple changes on multiple object at a set of given time points*/
+class CompoundEventPlayer: public CompoundEvent {
+  protected:
+    CoreTime period = maxTime;  //!< period of the player
+    gmlc::utilities::TimeSeriesMulti<double, CoreTime>
+        ts;  //!< the time series containing the data for the player
+    index_t currIndex = kNullLocation;  //!< the current index of the player
+    std::string eFile;  //!< the file name
+    std::vector<index_t>
+        columns;  //!< the columns of the time series to use for the different fields
+  public:
+    /** constructor from an event Name*/
+    explicit CompoundEventPlayer(const std::string& eventName);
+    /** default constructor*/
+    CompoundEventPlayer();
+    /** construct from an eventInfo structure and root object*/
+    CompoundEventPlayer(EventInfo& gdEI, CoreObject* rootObject);
+    virtual std::unique_ptr<Event> clone() const override;
+
+    virtual void cloneTo(Event* gE) const override;
+
+    // virtual void updateEvent(EventInfo &gdEI, CoreObject *rootObject) override;
+
+    virtual ChangeCode trigger() override;
+    virtual ChangeCode trigger(CoreTime time) override;
+
+    virtual void set(std::string_view param, double val) override;
+    virtual void set(std::string_view param, std::string_view val) override;
+    void setTime(CoreTime time) override;
+    void setTimeValue(CoreTime time, double val);
+    void setTimeValue(const std::vector<CoreTime>& time, const std::vector<double>& val);
+    /** load the player data from a file
+@param[in] fileName the name of the file to load
+*/
+    void loadEventFile(const std::string& fileName);
+    virtual std::string to_string() const override;
+
+    virtual bool setTarget(CoreObject* gdo, std::string_view var = {}) override;
+    virtual void initialize() override;
+
+  protected:
+    /** helper function to update the trigger time*/
+    virtual void updateTrigger(CoreTime time);
+};
+}  // namespace griddyn::events

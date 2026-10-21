@@ -1,0 +1,81 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "ZipLoad.h"
+#include <array>
+#include <string>
+#include <string_view>
+#include <vector>
+namespace griddyn {
+class Source;
+namespace loads {
+    /** @brief a load that uses sources to calculate the values for the each of the load parameters
+eventually will replace most of the shaped loads*/
+    class SourceLoad: public ZipLoad {
+      public:
+        enum SourceLoc {
+            P_SOURCE = 0,
+            Q_SOURCE = 1,
+            YP_SOURCE = 2,
+            YQ_SOURCE = 3,
+            IP_SOURCE = 4,
+            IQ_SOURCE = 5,
+            R_SOURCE = 6,
+            X_SOURCE = 7,
+        };
+        enum class SourceType {
+            OTHER,
+            PULSE,
+            SINE,
+            RANDOM,
+        };
+
+      private:
+        std::vector<Source*> sources;
+        std::array<int, 8> sourceLink;  // source lookups for the values
+        SourceType sType = SourceType::OTHER;
+
+      public:
+        explicit SourceLoad(const std::string& objName = "sourceLoad_$");
+        SourceLoad(SourceType type, const std::string& objName = "sourceLoad_$");
+        virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+
+        virtual void add(CoreObject* obj) override;
+        virtual void add(Source* src);
+        virtual void remove(CoreObject* obj) override;
+        virtual void remove(Source* src);
+
+        virtual void set(std::string_view param, std::string_view val) override;
+        virtual void
+            set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+        virtual void setFlag(std::string_view flag, bool val = true) override;
+
+        virtual void pFlowObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+        virtual void dynObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+
+        virtual void updateLocalCache(const IOdata& inputs,
+                                      const StateData& stateDataValue,
+                                      const SolverMode& sMode) override;
+
+        virtual void setState(CoreTime time,
+                              const double state[],
+                              const double dstateDt[],
+                              const SolverMode& sMode) override;
+        virtual void
+            timestep(CoreTime time, const IOdata& inputs, const SolverMode& sMode) override;
+
+        CoreObject* find(std::string_view obj) const override;
+
+      private:
+        void getSourceLoads();
+        Source* makeSource(SourceLoc loc);
+        Source* findSource(std::string_view srcname);
+        Source* findSource(std::string_view srcname) const;
+    };
+}  // namespace loads
+}  // namespace griddyn

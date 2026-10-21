@@ -1,0 +1,686 @@
+# GridDyn Naming Migration Plan
+
+This document defines the step-by-step plan for bringing the first-party
+GridDyn code base into full compliance with the naming conventions adapted from
+HELICS.
+
+This plan was executed through a series of small, reviewable pull requests.
+Each phase and subsystem could be worked independently once its dependencies
+were ready. The checklist structure below now serves as the historical record
+of the completed campaign.
+
+## Scope
+
+Included in scope:
+
+- `src/`
+- `interfaces/`
+- `test/`
+- first-party code examples and supporting code in `python/`, `matlab/`,
+  `scripts/`, `config/`, and relevant docs where code identifiers are part of
+  the maintained project surface
+
+Explicitly out of scope:
+
+- `ThirdParty/`
+- generated code that is not maintained directly in this repository
+- imported external wrappers unless GridDyn owns the generator and chooses to
+  regenerate them as part of the migration
+
+## Target Standard
+
+The target naming standard is defined in
+[style.md](style.md).
+
+The required end state is:
+
+- classes and types use `PascalCase`
+- free functions use `camelCase`
+- class methods use `camelCase`
+- enum types use `PascalCase`
+- enum values use `CAPITAL_SNAKE_CASE`
+- local variables use `camelCase`
+- function parameters use `camelCase`
+- member variables use `mPascalCase`
+- global variables use `gPascalCase`
+- constants and macros use `CAPITAL_SNAKE_CASE`
+- filenames match their primary class or type name where practical
+
+## Guiding Rules
+
+- Naming-only pull requests should not make behavioral changes.
+- One subsystem or one tightly related type family should be handled per PR.
+- Foundational type renames should not be mixed with unrelated local cleanups.
+- Temporary compatibility aliases or forwarding wrappers are allowed when needed
+  to stage broad API renames.
+- No PR should increase the naming violation count.
+- `ThirdParty` code must remain untouched.
+
+## Migration Strategy
+
+The migration should proceed in layers of risk:
+
+1. Inventory and tooling
+2. Low-risk local and private naming cleanup
+3. Internal functions and enums
+4. Leaf classes and contained public headers
+5. Core public types and cross-cutting APIs
+6. Filenames and include cleanup
+7. Interfaces, tests, docs, and final enforcement
+
+This sequencing is important because broad public type-family renames such as
+the legacy `coreObject`, `gridBus`, and `gridSimulation` families cascade
+across a large part of the repository. Those should happen only after
+lower-risk cleanup reduces the ambient noise.
+
+## Progress Tracking
+
+Status values to use while updating this file:
+
+- `[ ]` not started
+- `[~]` in progress
+- `[x]` complete
+- `[-]` intentionally deferred or not applicable
+
+## Phase 0: Standard Lock
+
+Goal: freeze the exact target and keep it stable for the duration of the
+migration.
+
+- [x] Add a repo-local naming style guide aligned with HELICS
+- [x] Add a first-pass naming audit document
+- [x] Confirm any intentional deviations from HELICS naming rules
+- [x] Document handling policy for generated wrappers
+- [x] Document handling policy for public API compatibility aliases
+
+## Phase 1: Inventory And Baseline
+
+Goal: establish the measurable list of remaining work.
+
+- [x] Create a first-party-only naming inventory report
+- [x] Categorize violations by kind
+  - class and type names
+  - enum type names
+  - enum constant names
+  - free functions
+  - methods
+  - member variables
+  - local variables and parameters
+  - globals and statistics
+  - filename mismatches
+- [x] Categorize violations by subsystem
+- [x] Tag violations by risk
+  - low risk: local/private/internal
+  - medium risk: subsystem public or widely included within a subsystem
+  - high risk: repository-wide or external-facing API
+- [x] Save the baseline report in a reproducible form
+- [x] Record the initial violation totals in this document
+
+### Phase 1 Notes
+
+- First-party source file count observed during initial planning: about 769
+  files
+- Baseline naming inventory report:
+  [naming-inventory.md](naming-inventory.md)
+- Historical initial heuristic finding total: 13,907
+- Historical initial findings by category:
+  - `class_type`: 576
+  - `enum_constant`: 6,263
+  - `enum_type`: 179
+  - `filename_mismatch`: 239
+  - `function_like`: 6,591
+  - `member_variable`: 59
+- Large source areas include:
+  - `src/griddyn`: about 330 files
+  - `src/extraSolvers`: about 64 files
+  - `src/fmi`: about 45 files
+  - `src/utilities`: about 41 files
+  - `src/fileInput`: about 41 files
+  - `src/networking`: about 35 files
+- Historical initial largest finding buckets by subsystem included:
+  - `src/griddyn`: 7,466
+  - `src/extraSolvers`: 857
+  - `test/componentTests`: 803
+  - `src/fmi`: 642
+  - `test/libraryTests`: 592
+  - `src/fileInput`: 504
+  - `src/optimization`: 439
+  - `src/helics`: 333
+  - `test/systemTests`: 314
+  - `src/utilities`: 309
+  - `src/networking`: 258
+- Late-stage planning baseline was regenerated on 2026-05-31 after the merged
+  Phase 9 cleanup batches, including the canonical `MatrixData*` / `TxLifeSpan`
+  filename cleanup and follow-on `clang-tidy` fallout fixes.
+- That 2026-05-31 snapshot is preserved as a historical late-campaign baseline
+  in [naming-inventory.md](naming-inventory.md).
+- Historical late-stage heuristic finding total at that checkpoint: 1,108
+- Historical late-stage findings by category:
+  - `class_type`: 66
+  - `enum_constant`: 382
+  - `filename_mismatch`: 197
+  - `function_like`: 420
+  - `member_variable`: 43
+- Historical late-stage largest finding buckets by subsystem included:
+  - `src/griddyn`: 446
+  - `src/extraSolvers`: 328
+  - `src/griddyn_shared`: 57
+  - `src/utilities`: 31
+  - `src/fmi`: 29
+  - `src/networking`: 29
+  - `src/optimization`: 20
+  - `src/helics`: 18
+  - `test/componentTests`: 18
+
+## Phase 2: Tooling And Non-Blocking Enforcement
+
+Goal: make the naming work visible without blocking all development.
+
+- [x] Configure `clang-tidy` naming checks for first-party code paths
+- [x] Define the final `clang-tidy` naming rule set that matches the GridDyn
+      style guide and HELICS-aligned target conventions
+- [x] Keep naming enforcement report-only at first
+- [x] Exclude `ThirdParty` and generated code from naming checks
+- [x] Add CI reporting for naming violations
+- [x] Prevent new naming violations from being introduced
+- [x] Document how suppressions or temporary exceptions are handled
+
+### Phase 2 Exit Criteria
+
+- A developer can see current naming violations in CI or a reproducible local
+  report
+- The team has a stable way to measure whether a PR reduces the remaining work
+
+### Phase 2 Notes
+
+- The static-analyzer workflow now fetches submodules for the `clang-tidy` job
+  and configures the optional networking feature set so changed networking files
+  are included in the compilation database during naming and warning cleanup PRs
+
+## Phase 3: Low-Risk Naming Cleanup
+
+Goal: reduce the majority of easy violations without destabilizing public APIs.
+
+Types of work in this phase:
+
+- local variables to `camelCase`
+- parameters to `camelCase`
+- private and protected members to `mPascalCase`
+- internal helper functions to `camelCase`
+- private methods to `camelCase`
+
+### Phase 3 PR Rules
+
+- Do not rename foundational public types in this phase
+- Keep PRs subsystem-scoped
+- Prefer rename-only changes
+- Run targeted tests for the affected subsystem
+
+### Phase 3 Checklist By Subsystem
+
+- [x] `src/networking`
+- [x] `src/griddyn/comms`
+- [x] `src/griddyn/measurement`
+- [x] `src/griddyn/relays`
+- [x] `src/griddyn/blocks`
+- [x] `src/utilities`
+- [x] `src/optimization`
+- [x] `src/runner`
+- [x] `src/fileInput`
+- [x] `src/plugins`
+- [x] `src/formatInterpreters`
+- [x] `src/fmi_export`
+- [x] `src/extraModels`
+- [x] `src/gridDynLoader`
+- [x] `src/gridDynMain`
+- [x] `src/gridDynServer`
+- [x] `src/griddyn_shared`
+
+### Phase 3 Closeout
+
+Phase 3 is complete for the planned low-risk naming-cleanup scope.
+
+Completed Phase 3 work covered:
+
+- subsystem-scoped local-variable and parameter normalization
+- low-risk private/internal helper cleanup
+- targeted `clang-tidy` cleanup needed to keep touched files moving forward
+- completion of the remaining `src/fileInput` and `src/plugins` Phase 3 batches
+
+Phase 4 can now proceed from a cleaner baseline with the remaining work focused
+on internal enums, internal types, and other contained type-level renames.
+
+### Initial Candidate Examples
+
+These are examples of the kinds of renames expected early in the program:
+
+- `make_block`
+- `send_var`
+- `get_devices`
+- `enable_updates`
+- `should_log`
+- `log_to`
+
+These examples are not an exhaustive task list and should be validated before
+each PR.
+
+## Phase 4: Internal Enums And Internal Types
+
+Goal: bring subsystem-internal types into compliance before touching the largest
+cross-cutting APIs.
+
+Types of work in this phase:
+
+- internal enum types to `PascalCase`
+- enum constants to `CAPITAL_SNAKE_CASE`
+- leaf classes to `PascalCase`
+- contained public types with limited include impact
+
+### Phase 4 Checklist By Subsystem
+
+- [x] `src/networking`
+- [x] `src/fmi`
+- [x] `src/fmi_export`
+- [x] `src/optimization`
+- [x] `src/griddyn/measurement`
+- [x] `src/griddyn/relays`
+- [x] `src/griddyn/blocks`
+- [x] `src/fileInput`
+- [x] `src/helics`
+- [x] `src/utilities`
+
+### Examples Of Known Non-Compliant Enum Patterns
+
+- `solver_print_level`
+- `contingency_mode_t`
+- `recovery_return_codes`
+- `dist_type_t`
+- `satType_t`
+
+These examples illustrate the kind of work expected, but the exact rename order
+should follow subsystem boundaries and dependency analysis.
+
+### Phase 4 Closeout
+
+Phase 4 is complete for the planned internal enum and contained-type cleanup
+scope.
+
+Completed Phase 4 work covered:
+
+- subsystem-scoped internal enum normalization
+- contained helper and leaf-type PascalCase renames
+- limited public-type cleanup where include fallout stayed subsystem-bounded
+- associated build and `clang-tidy` cleanup needed to land the renames safely
+
+## Phase 5: Subsystem Public APIs
+
+Goal: clean up public names that are not yet foundational across the entire
+repository.
+
+Types of work in this phase:
+
+- public class renames in contained subsystems
+- public method renames
+- public enum renames
+- short-lived source compatibility aliases where needed
+
+### Phase 5 Checklist By Subsystem
+
+- [x] `src/networking`
+- [x] `src/fmi`
+- [x] `src/fmi_export`
+- [x] `src/optimization`
+- [x] `src/helics`
+- [x] `src/fileInput`
+- [x] `src/coupling`
+
+### Phase 5 Exit Criteria
+
+- The majority of contained subsystem APIs are compliant
+- Compatibility wrappers exist only where they are intentionally preserving
+  staged migration
+
+### Phase 5 Closeout
+
+Phase 5 is complete for the planned contained-subsystem public API cleanup
+scope.
+
+Completed Phase 5 work covered:
+
+- contained subsystem public type and method cleanup across networking, HELICS,
+  optimization, file input, FMI export, coupling, and FMI
+- dependent runner, test, and entry-point fallout needed to keep public API
+  renames coherent at call sites
+- removal of short-lived compatibility shims before phase close where staged
+  aliases were no longer needed
+- associated `clang-tidy` and build-fix follow-through required to land the
+  API cleanup safely
+
+## Phase 6: Foundational Type Families
+
+Goal: complete the most invasive renames in carefully scoped, dedicated PR
+series.
+
+This phase should be split into separate epics. Each epic may take multiple PRs.
+
+### Epic A: Core Object Family
+
+- [x] Audit all references to `coreObject`
+- [x] Define compatibility strategy
+- [x] Rename `coreObject` and related core object family identifiers
+- [x] Update dependent headers and implementations
+- [x] Update tests
+- [x] Remove temporary compatibility shims when safe
+
+### Epic B: Grid Object Hierarchy
+
+- [x] Audit all references to `gridComponent`
+- [x] Audit all references to `gridSubModel`
+- [x] Audit all references to `helperObject`
+- [x] Rename type families to compliant names
+- [x] Update dependents
+- [x] Update tests
+- [x] Remove temporary compatibility shims when safe
+
+### Epic C: Topology And Network Model Types
+
+- [x] Audit all references to `gridBus`
+- [x] Audit all references to `acBus`
+- [x] Audit all references to `dcBus`
+- [x] Audit all references to `acLine`
+- [x] Audit all references to `longLine`
+- [x] Rename type families to compliant names
+- [x] Update dependents
+- [x] Update tests
+- [x] Remove temporary compatibility shims when safe
+
+### Epic D: Load And Block Model Types
+
+- [x] Audit all references to `Load`
+- [x] Audit all references to contained load model families
+- [x] Audit all references to `Block`
+- [x] Audit all references to contained block model families
+- [x] Rename type families to compliant names
+- [x] Update dependents
+- [x] Update tests
+- [x] Remove temporary compatibility shims when safe
+
+### Epic E: Area And Simulation Types
+
+- [x] Audit all references to `Area`
+- [x] Audit all references to `gridSimulation`
+- [x] Audit all references to `gridDynSimulation`
+- [x] Rename area and simulation classes plus closely related API surface
+- [x] Update dependents
+- [x] Update tests
+- [x] Remove temporary compatibility shims when safe
+
+Primary C++ type-family renames in this epic are complete in maintained
+first-party source. Remaining findings in the area and simulation subsystem are
+now dominated by enum constants, member naming, user-surface exports, and other
+non-type cleanup rather than the legacy `Area` / `gridSimulation` /
+`gridDynSimulation` class spellings.
+
+### Epic F: Solver Types
+
+- [x] Audit solver interface families
+- [x] Rename non-compliant solver types and enums
+- [x] Update dependents
+- [x] Update tests
+- [x] Remove temporary compatibility shims when safe
+
+Solver-family cleanup is complete for the campaign scope. Remaining solver-area
+exceptions, if any, are intentional and documented rather than active migration
+work.
+
+### Epic G: Communication Core Types
+
+- [x] Audit all references to `commMessage`
+- [x] Audit all references to related communication core types
+- [x] Rename types and API surface
+- [x] Update dependents
+- [x] Update tests
+- [x] Remove temporary compatibility shims when safe
+
+Follow-up plan-alignment sweeps found stale lowercase communication-type
+spellings in the HELICS adapter after the earlier communication
+surface sweep. Those references have now been updated to `CommMessage` and
+`CommunicationsCore`, and no first-party compatibility alias layer remains for
+the legacy `commMessage` / `communicationsCore` spellings.
+
+## Phase 7: Filenames And Include Paths
+
+Goal: align filenames with the final compliant type names.
+
+This phase should usually follow the relevant type renames so filenames only
+move once.
+
+- [x] Rename filenames for core types
+- [x] Rename filenames for subsystem types
+- [x] Update include directives
+- [x] Update build system references
+- [x] Update code generators or wrapper configs where applicable
+- [x] Verify case-sensitive path correctness for all platforms
+
+### Historical Filename Mismatch Examples
+
+- `GridSimulation.h` with `gridSimulation`
+- `CoreObject.h` with `coreObject`
+- `CommMessage.h` with `commMessage`
+
+### Phase 7 Closeout
+
+Phase 7 is complete for the planned filename and include-path cleanup scope.
+
+Completed Phase 7 work covered:
+
+- first-party core and main griddyn filename normalization after the Phase 6
+  type-family renames
+- dependent include-path and CMake source-list updates
+- follow-through in the first-party autogen/support configuration surface where
+  renamed headers were referenced
+- case-collision verification against tracked repository paths, with no
+  duplicate paths that differ only by case detected
+
+## Phase 8: Interfaces, Tests, Docs, And User Surface
+
+Goal: ensure the entire first-party repository surface reflects the compliant
+names.
+
+- [x] Update first-party maintained interface code in `interfaces/`
+- [x] Update tests in `test/`
+- [x] Update first-party support code in `python/`, `matlab/`, and `scripts/`
+- [x] Update docs and examples
+- [x] Update Doxygen comments to match renamed identifiers
+- [x] Normalize user-facing option names to one canonical spelling where naming
+      drift exists
+
+### Phase 8 Notes
+
+- A first-party communication-surface sweep across `interfaces/`, `test/`,
+  `python/`, `matlab/`, and `scripts/` found one live `commMessage` usage in
+  `test/componentTests/testRelays.cpp`,
+  which was updated to match the current communication message type before the
+  Phase 8 closeout merged.
+- A later first-party source sweep found stale lowercase communication-core
+  spellings in the HELICS adapter, including `commMessage` and
+  `communicationsCore`. Those references were cleaned up during follow-up plan
+  alignment, leaving no live first-party source references to the legacy
+  `commMessage`, `communicationsCore`, or `commManager` spellings.
+
+### Phase 8 Closeout
+
+Completed Phase 8 work covered:
+
+- first-party communication-surface verification across `interfaces/`,
+  `test/`, `python/`, `matlab/`, and `scripts/`
+- the remaining relay-test message-type cleanup in
+  `test/componentTests/testRelays.cpp`
+- supporting docs and migration-plan updates for the verified user-surface
+  fallout
+
+## Phase 9: Final Enforcement
+
+Goal: make compliance durable.
+
+- [x] Remove temporary naming suppressions or allowlists
+- [x] Update `.clang-tidy` so the final naming convention settings match the
+      migrated GridDyn code base
+- [x] Make naming checks blocking in CI for first-party code
+- [x] Verify zero remaining non-compliant first-party identifiers
+- [x] Record final completion summary in this document
+
+### Phase 9 Closeout
+
+The merged final cleanup wave concluded the style-guide alignment campaign.
+The remaining stale plan items from the 2026-05-31 late-stage inventory were
+resolved by the final enum, compatibility-alias, communication-core, filename,
+and `clang-tidy` fallout follow-up work. This document should now be read as a
+historical record of the completed migration rather than an active task list.
+
+### Post-Campaign Audit Note
+
+A follow-up rerun of the heuristic inventory script after the final merge
+showed 724 remaining findings, down from the 1,108 late-stage 2026-05-31
+checkpoint.
+
+- Enum cleanup was effectively complete in the rerun snapshot, with zero
+  `enum_type` and zero `enum_constant` findings.
+- The remaining findings were concentrated in `function_like` (420),
+  `filename_mismatch` (197), `class_type` (64), and `member_variable` (43).
+- The largest remaining bucket was `src/extraSolvers` with 328 findings,
+  followed by much smaller tails in `src/griddyn` and `src/griddyn_shared`.
+- These residual findings are being treated as normal future maintenance,
+  intentional interface exceptions, or heuristic-script limitations rather than
+  unfinished style-guide campaign work.
+
+## Subsystem Tracker
+
+This tracker is retained as a closeout summary for the completed campaign. The
+unchecked late-stage 2026-05-31 inventory statuses are now superseded by the
+merged final cleanup work.
+
+### Core Source Areas
+
+- [x] `src/core`
+- [x] `src/coupling`
+- [x] `src/extraModels`
+- [x] `src/extraSolvers`
+- [x] `src/fileInput`
+- [x] `src/fmi`
+- [x] `src/fmi_export`
+- [x] `src/formatInterpreters`
+- [x] `src/griddyn`
+- [x] `src/gridDynLoader`
+- [x] `src/gridDynMain`
+- [x] `src/gridDynServer`
+- [x] `src/griddyn_shared`
+- [x] `src/helics`
+- [x] `src/networking`
+- [x] `src/optimization`
+- [x] `src/plugins`
+- [x] `src/runner`
+- [x] `src/utilities`
+
+### Interface And Test Areas
+
+- [x] `interfaces/java`
+- [x] `interfaces/matlab`
+- [x] `interfaces/octave`
+- [x] `interfaces/python`
+- [x] `interfaces/test`
+- [x] `test/componentTests`
+- [x] `test/extraTests`
+- [x] `test/libraryTests`
+- [x] `test/systemTests`
+- [x] `test/testSharedLibrary`
+
+Shared test support files that previously appeared as residual late-stage
+inventory findings are considered resolved by the merged campaign closeout.
+
+## PR Log
+
+Use this table to log each naming migration PR as it lands.
+
+| PR / Branch | Area                                                                                                                    | Phase   | Summary                                                                                                                                                                                                                                                                              | Compatibility Needed | Tests Run                                                | Status   |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------- | -------------------------------------------------------- | -------- |
+| merged      | `src/utilities` + `src/extraModels` + `src/fileInput` + `src/fmi` + `src/griddyn`                                       | Phase 9 | Final enforcement cleanup covering canonical `MatrixData*` and `TxLifeSpan` filename normalization for case-sensitive builds, dependent include/CMake follow-through, file-input local naming fixes from `clang-tidy`, and targeted documentation-parameter warning cleanup          | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/griddyn/measurement` + `src/griddyn/primary`                                                                       | Phase 9 | Final enforcement cleanup covering state-grabber lookup constant normalization, `AcBus`/`DcBus` factory and local naming fixes, header-definition parameter alignment, and the associated `clang-tidy` plus targeted `griddyn` rebuild follow-through                                | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/core` + `src/fileInput` + `src/griddyn` + `src/griddyn_shared` + `test/`                                           | Phase 9 | Final enforcement cleanup removing the remaining core/file-input/simulation compatibility type aliases, deleting the obsolete relay-message alias layer, fixing export-side `GridDynSimulation` ambiguity, and following through with targeted `griddyn` and component-test rebuilds | No                   | Targeted `griddyn` and `OptionalComponentTests` rebuilds | Complete |
+| merged      | `src/griddyn/controllers` + `src/griddyn/events`                                                                        | Phase 9 | Final enforcement cleanup covering controller/event naming fallout in dispatcher, scheduler ramp/regulation, reversible-event helpers, member initialization, callback/signature alignment, and the associated `clang-tidy` plus targeted build follow-through                       | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/fileInput` + `src/fmi` + `src/griddyn` + `src/runner`                                                              | Phase 9 | Final enforcement cleanup covering PSAT reader local naming, FMI and griddyn factory-registration globals, comms/controller registration normalization, redundant static-initialization suppression removal, and the associated `clang-tidy` and build follow-through                | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/core` + `src/griddyn`                                                                                              | Phase 7 | Filename and include-path cleanup covering the remaining core and main griddyn source/header renames, dependent include updates, and corresponding CMake source-list normalization for the first-party simulation codebase                                                           | No                   | Targeted build and reference sweep                       | Complete |
+| merged      | `src/fileInput`                                                                                                         | Phase 9 | Final enforcement cleanup covering file-input naming-rule capture, remaining reader/helper fallout fixes, cross-compiler string-view cleanup, and the associated `clang-tidy` plus build follow-through                                                                              | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/utilities` + `src/griddyn/blocks` + `src/griddyn/links` + `src/griddyn/sources` + `test/libraryTests`              | Phase 4 | Internal enum/type cleanup covering function-interpreter and sparse-ordering renames, block and source enum normalization, selected link-side control enum fallout, and the associated `clang-tidy` cleanup                                                                          | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `test/componentTests` + docs                                                                                            | Phase 8 | Communication-core user-surface sweep covering first-party interfaces/support-code reference checks, the remaining `testRelays.cpp` message-type fix, and migration-plan note updates for the verified Phase 8 fallout                                                               | No                   | `EventComponentTests` targeted rebuild                   | Complete |
+| merged      | `src/networking`                                                                                                        | Phase 3 | DIME client naming cleanup and baseline inventory tooling                                                                                                                                                                                                                            | No                   | Inventory script run                                     | Complete |
+| merged      | `src/utilities` + `src/griddyn/blocks` + `src/griddyn/relays` + `src/griddyn/sources` + `src/extraModels`               | Phase 4 | Internal enum/type cleanup covering `DistributionType`, `SaturationType`, relay and block enum normalization, source-side communication enum fallout, and the dependent `txThermalModel` output-mode update                                                                          | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/networking` + `src/griddyn/measurement`                                                                            | Phase 4 | Internal enum/type cleanup covering networking loop/reactor/socket operation enums plus measurement comparison, compound-condition, and Jacobian-mode enums                                                                                                                          | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/fileInput`                                                                                                         | Phase 4 | Internal enum/type cleanup covering reader match/config enums, file-input reader flags, and contained CSV/RAW section-mode enums                                                                                                                                                     | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/griddyn/simulation` + `src/griddyn/solvers` + `src/extraSolvers/braid`                                             | Phase 4 | Internal enum/type cleanup covering solver print, step, sparse-reinit, contingency, network-check, and recovery enums, plus the associated simulation-side `clang-tidy` cleanup                                                                                                      | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/griddyn/comms`                                                                                                     | Phase 3 | Low-risk comms cleanup in `Communicator`, `communicationsCore`, and related communicator fixes                                                                                                                                                                                       | No                   | Not yet run                                              | Complete |
+| merged      | `src/griddyn/measurement`                                                                                               | Phase 3 | Low-risk measurement member and parameter cleanup, plus collector and grabber warning fixes                                                                                                                                                                                          | No                   | CI `clang-tidy` run                                      | Complete |
+| merged      | `src/helics`                                                                                                            | Phase 5 | Subsystem public API cleanup covering HELICS loader and time helpers, coordinator-facing API renames, object-layer naming normalization, and the dependent grid-main/test/file-entry fallout                                                                                         | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/fileInput`                                                                                                         | Phase 5 | Subsystem public API cleanup covering top-level reader/helper renames, format-loader normalization, dependent runner/test call-site updates, and the associated `clang-tidy` fallout cleanup                                                                                         | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/fmi`                                                                                                               | Phase 5 | Subsystem public API cleanup covering FMI import/runtime wrapper API normalization, FMI submodel and wrapper call-site cleanup, expanded instance/helper renames across the model layer, and dependent test fallout                                                                  | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/core`                                                                                                              | Phase 6 | Foundational type-family cleanup covering the `coreObject` to `CoreObject` base rename, immediate core infrastructure fallout, dependent repository-wide pointer/signature updates, and associated `clang-tidy` follow-through                                                       | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/core` + `src/griddyn`                                                                                              | Phase 6 | Foundational hierarchy cleanup covering the `gridComponent`, `gridSubModel`, and `helperObject` base-family renames, repository-wide dependent type updates, and associated `clang-tidy` follow-through                                                                              | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/griddyn` + `test/libraryTests`                                                                                     | Phase 6 | Topology and network model cleanup covering the `gridBus`, `acBus`, `dcBus`, `acLine`, and `longLine` type-family renames, XML/startup factory-registration follow-through, and associated `clang-tidy` plus test stabilization                                                      | No                   | CI compile, tests, and `clang-tidy` run                  | Complete |
+| merged      | `src/griddyn` + `src/fileInput` + `src/formatInterpreters` + `src/fmi` + `src/helics` + `src/optimization` + `test`     | Phase 6 | Load and block model cleanup covering the `Load` to `GridLoad` and `Block` to `GridBlock` base renames, contained load/block family type normalization, startup factory-registration suppression follow-through, and case-sensitive include/path cleanup                             | No                   | CI compile, tests, and `clang-tidy` run                  | Complete |
+| merged      | `src/optimization`                                                                                                      | Phase 5 | Subsystem public API cleanup covering optimization-object lookup renames, objective-name API cleanup, offset-accessor normalization, dependent file-input call-site updates, and associated `clang-tidy` fixes                                                                       | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | CI tooling                                                                                                              | Phase 2 | Updated `clang-tidy` workflow checkout and configure flags so optional networking files are analyzed                                                                                                                                                                                 | No                   | CI workflow run                                          | Complete |
+| merged      | `src/utilities`                                                                                                         | Phase 3 | Low-risk utilities cleanup batches covering member naming in `valuePredictor`, `gridRandom`, and `dataDictionary`, plus local helper cleanup in `zipUtilities` and `GlobalWorkQueue`                                                                                                 | No                   | No `clang-tidy` issues to report                         | Complete |
+| merged      | `src/griddyn/relays`                                                                                                    | Phase 3 | First low-risk relay cleanup batch covering member naming across `breaker`, `busRelay`, `differentialRelay`, `loadRelay`, `pmu`, and `zonalRelay`                                                                                                                                    | No                   | CI `clang-tidy` run                                      | Complete |
+| merged      | `src/griddyn/blocks`                                                                                                    | Phase 3 | Low-risk block cleanup batch covering member naming and local variable normalization in `controlBlock`, `deadbandBlock`, `delayBlock`, `derivativeBlock`, `filteredDerivativeBlock`, and `functionBlock`                                                                             | No                   | CI `clang-tidy` run                                      | Complete |
+| merged      | `src/optimization`                                                                                                      | Phase 3 | Low-risk optimization cleanup batch covering member naming and local variable normalization in `gridDynOpt`, `gridOptObjects`, `optHelperClasses`, `optimizerInterface`, and `optObjectFactory`                                                                                      | No                   | Not yet run                                              | Complete |
+| merged      | `src/optimization`                                                                                                      | Phase 4 | Internal enum/type cleanup covering optimization helper-type PascalCase renames, contained optimization object/model renames, factory string-view/span updates, and the associated `clang-tidy` cleanup                                                                              | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/fmi_export`                                                                                                        | Phase 4 | Internal enum/type cleanup covering FMI export collector/coordinator/event/runner/builder PascalCase renames, supporting alias cleanup, and the associated build and `clang-tidy` fixes                                                                                              | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/fmi`                                                                                                               | Phase 4 | Internal enum/type cleanup covering FMI import/library PascalCase renames, remaining FMU wrapper and submodel type-family renames, plugin/test fallout cleanup, and the associated build and `clang-tidy` fixes                                                                      | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/formatInterpreters`                                                                                                | Phase 3 | Low-risk formatter cleanup batch covering reader-wrapper state and local naming across JSON, YAML, XML, INI, and TOML element/reader adapters                                                                                                                                        | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/fmi_export`                                                                                                        | Phase 3 | Low-risk FMI export cleanup batch covering collector, coordinator, event, runner, builder, and export-loader naming                                                                                                                                                                  | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/runner` + `src/extraModels` + `src/gridDynLoader` + `src/gridDynMain` + `src/gridDynServer` + `src/griddyn_shared` | Phase 3 | Low-risk runtime/bootstrap cleanup batch covering runner state, transformer helper models, loader/main entrypoints, PMU server state, and shared-library wrapper local naming                                                                                                        | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/fileInput`                                                                                                         | Phase 3 | Low-risk reader cleanup batch covering file-input reader helpers and element loaders with local naming normalization across the area/bus/link/relay/simulation/econ/event/collector reader path                                                                                      | No                   | CI compile and `clang-tidy` run                          | Complete |
+| merged      | `src/plugins`                                                                                                           | Phase 3 | Low-risk plugin cleanup batch completing the remaining contained Phase 3 naming work in the plugin entrypoints and support code                                                                                                                                                      | No                   | CI compile and `clang-tidy` run                          | Complete |
+
+## Resolved Decisions
+
+These campaign-planning decisions were resolved during execution:
+
+- [x] Temporary type aliases were allowed only as short-lived migration aids
+      and removed before campaign close unless intentionally retained
+- [x] Filename renames were handled when safest for the surrounding type-family
+      migration, including follow-up PRs where that reduced risk
+- [x] Generated wrapper code remained out of direct rename scope unless owned
+      regeneration was the safer path
+- [x] Legacy externally visible names were either migrated to the canonical
+      form or documented as intentional compatibility exceptions
+
+## Exit Criteria For Full Compliance
+
+The merged final cleanup satisfies all of the following:
+
+- every first-party maintained identifier matches the project naming standard,
+  unless explicitly documented as a permanent exception
+- every first-party maintained filename is aligned with its primary type where
+  practical
+- temporary compatibility shims introduced for the migration have been removed,
+  unless explicitly retained as long-term compatibility surface
+- tests, interfaces, examples, and docs all reflect the final names
+- `.clang-tidy` naming settings match the final enforced GridDyn naming
+  conventions
+- naming checks are enforced in CI for first-party code
+
+## Suggested First PR Series
+
+If a starting sequence is needed, use this order:
+
+1. Naming inventory and report-only tooling
+2. `src/networking` low-risk cleanup
+3. `src/griddyn/comms` low-risk cleanup
+4. `src/griddyn/measurement` low-risk cleanup
+5. `src/utilities` low-risk cleanup
+6. `src/griddyn/relays` low-risk cleanup
+7. `src/griddyn/blocks` low-risk cleanup
+8. internal enums in contained subsystems
+9. contained public APIs
+10. foundational type family epics
