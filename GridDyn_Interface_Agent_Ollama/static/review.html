@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GridDyn AI Output Review</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: light-dark(#f5f7fb, #11151c);
+      --surface: light-dark(#ffffff, #1a202b);
+      --surface-2: light-dark(#eef2f7, #222a37);
+      --text: light-dark(#17202b, #eef3f9);
+      --muted: light-dark(#5c6877, #9aa8b8);
+      --line: light-dark(#d5dce6, #354150);
+      --accent: light-dark(#2457d6, #7ea2ff);
+      --good: light-dark(#0a7b4f, #64d5a5);
+      --warn: light-dark(#a65a00, #ffbd69);
+      --bad: light-dark(#b42318, #ff8d83);
+      --shadow: 0 18px 45px rgb(10 25 50 / 0.08);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    button, textarea, select, input { font: inherit; }
+    button { cursor: pointer; }
+    .shell { max-width: 1500px; margin: 0 auto; padding: 28px; }
+    header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 22px; }
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { margin-bottom: 5px; font-size: clamp(1.55rem, 3vw, 2.15rem); letter-spacing: -0.03em; }
+    h2 { margin-bottom: 12px; font-size: 1.12rem; }
+    h3 { margin-bottom: 8px; font-size: .98rem; }
+    .subtitle, .muted { color: var(--muted); }
+    .subtitle { margin-bottom: 0; max-width: 850px; }
+    .local-tag { border: 1px solid var(--line); border-radius: 999px; padding: 7px 11px; color: var(--muted); white-space: nowrap; }
+    .top-actions { display: flex; gap: 9px; flex-wrap: wrap; justify-content: flex-end; }
+    .layout { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 20px; align-items: start; }
+    .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow); }
+    .controls { padding: 18px; position: sticky; top: 18px; }
+    .content { display: grid; gap: 16px; min-width: 0; }
+    .panel-body { padding: 18px; }
+    .button { display: inline-block; border: 1px solid var(--line); border-radius: 9px; padding: 10px 13px; background: var(--surface-2); color: var(--text); font-weight: 700; text-decoration: none; }
+    .button.primary { border-color: var(--accent); background: var(--accent); color: white; }
+    .button.danger { border-color: color-mix(in srgb, var(--bad) 55%, var(--line)); color: var(--bad); }
+    .button:disabled { cursor: wait; opacity: .6; }
+    label { display: block; margin: 14px 0 6px; font-weight: 650; }
+    textarea, select, input[type="text"] { width: 100%; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); color: var(--text); padding: 10px; }
+    textarea { min-height: 280px; resize: vertical; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .actions { display: grid; gap: 9px; margin-top: 16px; }
+    .note { margin-top: 15px; padding: 11px; border-left: 3px solid var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); color: var(--muted); font-size: .86rem; }
+    .alert { display: none; padding: 12px 14px; border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 12px; background: var(--surface); }
+    .alert.visible { display: block; }
+    .alert.error { border-left-color: var(--bad); }
+    .summary-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }
+    .summary-card { padding: 13px; background: var(--surface-2); border-radius: 11px; min-width: 0; }
+    .summary-card .label { color: var(--muted); font-size: .78rem; }
+    .summary-card .value { margin-top: 4px; font-weight: 800; overflow-wrap: anywhere; }
+    .gate { display: flex; align-items: center; justify-content: space-between; gap: 14px; border: 1px solid var(--line); border-left: 5px solid var(--accent); border-radius: 12px; padding: 15px 16px; background: var(--surface); }
+    .gate.ready { border-left-color: var(--good); }
+    .gate.review { border-left-color: var(--warn); }
+    .gate.hold { border-left-color: var(--bad); }
+    .gate-title { font-size: 1.05rem; font-weight: 850; }
+    .gate-detail { color: var(--muted); margin-top: 3px; }
+    .badge { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 999px; padding: 5px 10px; font-size: .78rem; font-weight: 800; white-space: nowrap; }
+    .badge.pass, .status-pass { color: var(--good); }
+    .badge.warning, .status-warning { color: var(--warn); }
+    .badge.fail, .status-fail { color: var(--bad); }
+    .two-col { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+    .checks, .claims, .solutions, .history { display: grid; gap: 9px; }
+    .check, .claim, .solution, .history-item { padding: 12px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface-2); }
+    .check { display: grid; grid-template-columns: 70px minmax(0, 1fr); gap: 10px; align-items: start; }
+    .check-status { font-weight: 850; font-size: .76rem; letter-spacing: .05em; }
+    .check-message, .claim-text, .solution p { margin: 0; overflow-wrap: anywhere; }
+    .path { margin-top: 4px; color: var(--muted); font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+    .claim-head, .solution-head, .history-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .claim-title, .solution-title { font-weight: 800; }
+    .solution p { margin-top: 8px; }
+    .solution-meta { display: grid; gap: 6px; margin-top: 10px; color: var(--muted); font-size: .86rem; }
+    .chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+    .chip { border: 1px solid var(--line); border-radius: 999px; padding: 3px 7px; color: var(--muted); font: 11px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+    .solution-select { display: flex; align-items: flex-start; gap: 8px; margin-top: 10px; color: var(--muted); font-size: .86rem; }
+    .solution-select input { margin-top: 4px; }
+    .review-form { display: grid; gap: 12px; }
+    .issue-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .issue { display: flex; gap: 8px; align-items: flex-start; padding: 9px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); color: var(--muted); font-size: .88rem; }
+    .issue input { margin-top: 4px; }
+    pre { margin: 0; max-height: 360px; overflow: auto; padding: 13px; border-radius: 10px; background: #0e131a; color: #d7e2f1; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    details { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 12px; }
+    summary { cursor: pointer; color: var(--muted); font-weight: 700; }
+    .empty { color: var(--muted); padding: 12px 0; }
+    .hidden { display: none !important; }
+    @media (max-width: 1100px) { .summary-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+    @media (max-width: 860px) { .shell { padding: 18px; } .layout, .two-col { grid-template-columns: 1fr; } .controls { position: static; } .top-actions { justify-content: flex-start; margin-top: 14px; } }
+    @media (max-width: 520px) { .summary-grid, .issue-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } header { display: block; } .local-tag { display: inline-block; margin-top: 12px; } .gate { display: block; } .gate .badge { margin-top: 10px; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div>
+        <h1>AI Agent output review</h1>
+        <p class="subtitle">A human-readable, evidence-gated workspace for reviewing GridDyn recommendations before they are considered by an operator.</p>
+      </div>
+      <div class="top-actions">
+        <a class="button" href="/">GridDyn interface</a>
+        <span class="local-tag">localhost · no grid controls</span>
+      </div>
+    </header>
+
+    <div class="layout">
+      <aside class="panel controls">
+        <h2>1. Load context</h2>
+        <p class="muted">The agent response must be checked against the exact HELICS context packet it used.</p>
+        <div class="actions">
+          <button id="liveContextButton" class="button primary">Load live HELICS context</button>
+          <button id="demoContextButton" class="button">Load demo context</button>
+          <button id="demoOutputButton" class="button">Load demo agent response</button>
+        </div>
+        <div class="note">Live context requires <code>agent_gateway.py</code> on port 8766. Demo values are synthetic and are never suitable for operational decisions.</div>
+
+        <h2 style="margin-top:24px">2. Submit agent response</h2>
+        <p class="muted">Paste the structured JSON returned by the AI Agent, or use the demo response to exercise the workflow.</p>
+        <label for="outputEditor">Agent response JSON</label>
+        <textarea id="outputEditor" spellcheck="false" placeholder="Load a demo response or paste an agent_recommendation JSON object."></textarea>
+        <div class="actions">
+          <button id="submitButton" class="button primary">Check before human review</button>
+          <button id="refreshButton" class="button">Refresh review state</button>
+        </div>
+        <div class="note">The checker requires evidence IDs for the summary, every claim, and every possible solution. It also blocks direct command fields and solutions that do not require approval.</div>
+      </aside>
+
+      <main class="content">
+        <div id="alert" class="alert" role="alert"></div>
+
+        <section class="panel panel-body">
+          <h2>Context received from GridDyn through HELICS</h2>
+          <div id="contextSummary" class="summary-grid"></div>
+          <div id="contextEmpty" class="empty">No context loaded yet.</div>
+          <details>
+            <summary>Show context packet</summary>
+            <pre id="contextJson">No context loaded.</pre>
+          </details>
+        </section>
+
+        <section id="gatePanel" class="gate hidden">
+          <div>
+            <div id="gateTitle" class="gate-title">No response checked</div>
+            <div id="gateDetail" class="gate-detail">Submit an agent response to run the pre-human validation gate.</div>
+          </div>
+          <span id="gateBadge" class="badge">WAITING</span>
+        </section>
+
+        <section class="two-col">
+          <section class="panel panel-body">
+            <h2>Pre-human validation checks</h2>
+            <div id="checks" class="checks"><div class="empty">No validation results yet.</div></div>
+          </section>
+          <section class="panel panel-body">
+            <h2>Agent claims</h2>
+            <div id="claims" class="claims"><div class="empty">No checked claims yet.</div></div>
+          </section>
+        </section>
+
+        <section class="panel panel-body">
+          <div class="claim-head">
+            <div>
+              <h2>Possible solutions</h2>
+              <p class="muted">These are advisory options only. Selecting one records what the operator reviewed; it does not execute anything.</p>
+            </div>
+          </div>
+          <div id="solutions" class="solutions"><div class="empty">No checked solutions yet.</div></div>
+        </section>
+
+        <section class="panel panel-body">
+          <h2>Human feedback to the AI Agent</h2>
+          <p class="muted">If there is still an issue, describe it precisely. The console turns this into a recheck request the agent can retrieve at <code>/api/agent/recheck</code>.</p>
+          <div class="review-form">
+            <label for="decision">Review decision</label>
+            <select id="decision">
+              <option value="request_recheck">Request agent recheck</option>
+              <option value="accept">Accept for advisory discussion</option>
+              <option value="reject">Reject this response</option>
+            </select>
+            <label>Issue types</label>
+            <div class="issue-grid">
+              <label class="issue"><input type="checkbox" value="unsupported_claim"> Unsupported claim or missing evidence</label>
+              <label class="issue"><input type="checkbox" value="stale_data"> Stale, held, or missing data</label>
+              <label class="issue"><input type="checkbox" value="missing_context"> Missing unit, limit, topology, or constraint</label>
+              <label class="issue"><input type="checkbox" value="wrong_interpretation"> Possible misinterpretation</label>
+              <label class="issue"><input type="checkbox" value="unsafe_action"> Unsafe or overly direct action language</label>
+              <label class="issue"><input type="checkbox" value="unclear_solution"> Solution needs more detail</label>
+            </div>
+            <label for="feedback">Operator feedback</label>
+            <textarea id="feedback" style="min-height:120px" placeholder="Example: Recheck the line-loading claim. The packet has a value but no equipment rating, so do not state that a thermal limit was exceeded."></textarea>
+            <button id="reviewButton" class="button primary">Record review and send feedback</button>
+          </div>
+        </section>
+
+        <section id="recheckPanel" class="panel panel-body hidden">
+          <div class="claim-head">
+            <div>
+              <h2>Pending agent recheck</h2>
+              <p class="muted">The agent should retrieve this request, correct its response, and submit a new structured output.</p>
+            </div>
+            <button id="copyRecheckButton" class="button">Copy request</button>
+          </div>
+          <pre id="recheckJson"></pre>
+        </section>
+
+        <section class="panel panel-body">
+          <h2>Review history</h2>
+          <div id="history" class="history"><div class="empty">No human review recorded yet.</div></div>
+        </section>
+
+        <section class="panel panel-body">
+          <h2>Checked agent response</h2>
+          <pre id="outputJson">No response checked yet.</pre>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let currentState = {};
+    let currentContext = null;
+
+    function escapeText(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"}[char]));
+    }
+
+    function setAlert(message, error = false) {
+      const element = $("alert");
+      element.textContent = message || "";
+      element.classList.toggle("visible", Boolean(message));
+      element.classList.toggle("error", Boolean(error));
+    }
+
+    async function requestJson(url, options = {}) {
+      const response = await fetch(url, {...options, cache: "no-store"});
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || data.hint || `Request failed (${response.status}).`);
+      return data;
+    }
+
+    function pretty(value) {
+      return JSON.stringify(value ?? {}, null, 2);
+    }
+
+    function renderContext(context) {
+      currentContext = context || null;
+      if (!context) {
+        $("contextSummary").innerHTML = "";
+        $("contextEmpty").classList.remove("hidden");
+        $("contextJson").textContent = "No context loaded.";
+        return;
+      }
+      $("contextEmpty").classList.add("hidden");
+      const source = context.source || {};
+      const simulation = context.simulation || {};
+      const quality = context.quality || {};
+      const cards = [
+        ["Packet", context.packet_id || "unknown"],
+        ["Source mode", source.mode || "unknown"],
+        ["Simulation time", `${simulation.time_s ?? "unknown"} ${simulation.time_unit || ""}`],
+        ["Quality", quality.overall || "unknown"],
+        ["Evidence records", `${(context.observations || []).length} observations · ${(context.events || []).length} events`]
+      ];
+      $("contextSummary").innerHTML = cards.map(([label, value]) => `<div class="summary-card"><div class="label">${escapeText(label)}</div><div class="value">${escapeText(value)}</div></div>`).join("");
+      $("contextJson").textContent = pretty(context);
+    }
+
+    function statusClass(status) {
+      return status === "pass" ? "status-pass" : status === "fail" ? "status-fail" : "status-warning";
+    }
+
+    function renderGate(validation) {
+      const panel = $("gatePanel");
+      if (!validation) {
+        panel.classList.add("hidden");
+        return;
+      }
+      panel.classList.remove("hidden");
+      const gate = validation.status === "blocked" ? "hold" : validation.status === "needs_review" ? "review" : "ready";
+      panel.className = `gate ${gate}`;
+      $("gateTitle").textContent = validation.status === "blocked" ? "Response held before human decision use" : validation.status === "needs_review" ? "Response checked, but additional review is required" : "Response passed the evidence gate";
+      $("gateDetail").textContent = `${validation.error_count || 0} blocking error(s), ${validation.warning_count || 0} warning(s). ${validation.instructions || ""}`;
+      $("gateBadge").textContent = validation.presentation_gate || validation.status.toUpperCase();
+      $("gateBadge").className = `badge ${validation.status === "blocked" ? "fail" : validation.status === "needs_review" ? "warning" : "pass"}`;
+    }
+
+    function renderChecks(validation) {
+      const element = $("checks");
+      if (!validation || !validation.checks || !validation.checks.length) {
+        element.innerHTML = `<div class="empty">No validation results yet.</div>`;
+        return;
+      }
+      element.innerHTML = validation.checks.map(item => `
+        <div class="check">
+          <div class="check-status ${statusClass(item.status)}">${escapeText(item.status.toUpperCase())}</div>
+          <div><p class="check-message">${escapeText(item.message)}</p><div class="path">${escapeText(item.path || item.code)}</div>${item.evidence_ids?.length ? `<div class="chip-row">${item.evidence_ids.map(id => `<span class="chip">${escapeText(id)}</span>`).join("")}</div>` : ""}</div>
+        </div>`).join("");
+    }
+
+    function renderClaims(output) {
+      const element = $("claims");
+      if (!output || !Array.isArray(output.claims) || !output.claims.length) {
+        element.innerHTML = `<div class="empty">No checked claims yet.</div>`;
+        return;
+      }
+      element.innerHTML = output.claims.map((claim, index) => `
+        <div class="claim">
+          <div class="claim-head"><div class="claim-title">${escapeText(claim.claim_id || `Claim ${index + 1}`)}</div><span class="badge">${escapeText(claim.source_kind || "unlabeled")}</span></div>
+          <p class="claim-text" style="margin-top:8px">${escapeText(claim.text)}</p>
+          <div class="chip-row">${(claim.evidence_ids || []).map(id => `<span class="chip">${escapeText(id)}</span>`).join("")}</div>
+        </div>`).join("");
+    }
+
+    function renderSolutions(output, validation) {
+      const element = $("solutions");
+      if (!output || !Array.isArray(output.possible_solutions) || !output.possible_solutions.length) {
+        element.innerHTML = `<div class="empty">No checked solutions yet.</div>`;
+        return;
+      }
+      const held = validation && validation.status === "blocked";
+      element.innerHTML = (held ? `<div class="note" style="margin-top:0;border-left-color:var(--bad)">These options are displayed for error diagnosis only. The validator has held them from advisory use until the agent corrects the response.</div>` : "") + output.possible_solutions.map((solution, index) => `
+        <article class="solution">
+          <div class="solution-head"><div class="solution-title">${escapeText(solution.title || `Solution ${index + 1}`)}</div><span class="badge">${escapeText(solution.source_kind || "unlabeled")}</span></div>
+          <p>${escapeText(solution.description)}</p>
+          <div class="solution-meta"><div><strong>Why:</strong> ${escapeText(solution.rationale)}</div><div><strong>Expected effect:</strong> ${escapeText(solution.expected_effect)}</div><div><strong>Risks:</strong> ${escapeText((solution.risks || []).join("; ") || "Not supplied")}</div><div><strong>Check first:</strong> ${escapeText((solution.constraints_to_check || []).join("; ") || "Not supplied")}</div></div>
+          <div class="chip-row">${(solution.evidence_ids || []).map(id => `<span class="chip">${escapeText(id)}</span>`).join("")}</div>
+          <label class="solution-select"><input type="checkbox" data-solution-id="${escapeText(solution.solution_id || "")}"> I reviewed this advisory option</label>
+        </article>`).join("");
+    }
+
+    function renderHistory(history) {
+      const element = $("history");
+      if (!history || !history.length) {
+        element.innerHTML = `<div class="empty">No human review recorded yet.</div>`;
+        return;
+      }
+      element.innerHTML = history.map(item => `
+        <div class="history-item"><div class="history-head"><strong>${escapeText(item.decision)}</strong><span class="muted">${escapeText(item.created_at_utc)}</span></div><div style="margin-top:6px">${escapeText(item.feedback || "No additional feedback.")}</div>${item.issue_types?.length ? `<div class="chip-row">${item.issue_types.map(issue => `<span class="chip">${escapeText(issue)}</span>`).join("")}</div>` : ""}</div>`).join("");
+    }
+
+    function renderState(state) {
+      currentState = state || {};
+      renderContext(state?.context || currentContext);
+      renderGate(state?.validation);
+      renderChecks(state?.validation);
+      renderClaims(state?.agent_output);
+      renderSolutions(state?.agent_output, state?.validation);
+      renderHistory(state?.review_history);
+      $("outputJson").textContent = state?.agent_output ? pretty(state.agent_output) : "No response checked yet.";
+      const recheck = state?.recheck_request;
+      $("recheckPanel").classList.toggle("hidden", !recheck);
+      $("recheckJson").textContent = recheck ? pretty(recheck) : "";
+    }
+
+    async function loadDemoContext() {
+      setAlert("", false);
+      try {
+        const data = await requestJson("/api/agent/demo-context");
+        currentContext = data.context;
+        renderContext(currentContext);
+        setAlert("Synthetic context loaded. It is suitable only for testing this review workflow.");
+      } catch (error) { setAlert(error.message, true); }
+    }
+
+    async function loadLiveContext() {
+      setAlert("Loading HELICS context…", false);
+      try {
+        const data = await requestJson("/api/agent/live-context");
+        currentContext = data.context;
+        renderContext(currentContext);
+        setAlert("Live HELICS context loaded. Submit the agent response that was generated from this packet.");
+      } catch (error) { setAlert(error.message, true); }
+    }
+
+    async function loadDemoOutput() {
+      setAlert("", false);
+      try {
+        const data = await requestJson("/api/agent/demo-output");
+        currentContext = data.context;
+        renderContext(currentContext);
+        $("outputEditor").value = pretty(data.output);
+        setAlert("Demo agent response loaded. Click the check button to run the gate.");
+      } catch (error) { setAlert(error.message, true); }
+    }
+
+    async function submitOutput() {
+      setAlert("", false);
+      let output;
+      try { output = JSON.parse($("outputEditor").value); } catch (error) { setAlert(`Agent response is not valid JSON: ${error.message}`, true); return; }
+      if (!currentContext) { setAlert("Load a live or demo HELICS context before checking the agent response.", true); return; }
+      const button = $("submitButton");
+      button.disabled = true;
+      button.textContent = "Checking…";
+      try {
+        const state = await requestJson("/api/agent/submit", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({context: currentContext, output})});
+        renderState(state);
+        setAlert(state.validation?.status === "blocked" ? "The response is held. Review the failed checks and request a correction." : "The response was checked before being shown in the review surface.", state.validation?.status === "blocked");
+      } catch (error) { setAlert(error.message, true); }
+      finally { button.disabled = false; button.textContent = "Check before human review"; }
+    }
+
+    async function refreshState() {
+      try { renderState(await requestJson("/api/agent/review-state")); } catch (error) { setAlert(error.message, true); }
+    }
+
+    async function recordReview() {
+      if (!currentState.validation) { setAlert("Check an agent response before recording human review.", true); return; }
+      const decision = $("decision").value;
+      const feedback = $("feedback").value.trim();
+      if ((decision === "request_recheck" || decision === "reject") && !feedback) { setAlert("Add operator feedback so the agent knows what to recheck.", true); return; }
+      const issueTypes = Array.from(document.querySelectorAll(".issue input:checked")).map(input => input.value);
+      const selectedSolutionIds = Array.from(document.querySelectorAll("[data-solution-id]:checked")).map(input => input.dataset.solutionId);
+      try {
+        const state = await requestJson("/api/agent/review", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({decision, feedback, issue_types: issueTypes, selected_solution_ids: selectedSolutionIds})});
+        renderState(state);
+        setAlert(decision === "request_recheck" || decision === "reject" ? "Feedback recorded. The recheck request is ready for the AI Agent." : "Review recorded as advisory acceptance. No grid command was sent.");
+      } catch (error) { setAlert(error.message, true); }
+    }
+
+    async function copyRecheck() {
+      const text = $("recheckJson").textContent;
+      try { await navigator.clipboard.writeText(text); setAlert("Recheck request copied to the clipboard."); }
+      catch (error) { setAlert("Clipboard access was unavailable. Select and copy the request manually.", true); }
+    }
+
+    $("liveContextButton").addEventListener("click", loadLiveContext);
+    $("demoContextButton").addEventListener("click", loadDemoContext);
+    $("demoOutputButton").addEventListener("click", loadDemoOutput);
+    $("submitButton").addEventListener("click", submitOutput);
+    $("refreshButton").addEventListener("click", refreshState);
+    $("reviewButton").addEventListener("click", recordReview);
+    $("copyRecheckButton").addEventListener("click", copyRecheck);
+    refreshState();
+  </script>
+</body>
+</html>

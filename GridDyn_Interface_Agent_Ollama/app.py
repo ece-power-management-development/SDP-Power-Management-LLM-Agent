@@ -27,15 +27,21 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import agent_review
+
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
 CASE_DIR = ROOT / "cases"
 REPORT_DIR = ROOT / "reports"
+REVIEW_HTML = STATIC_DIR / "review.html"
+AGENT_OUTPUT_SCHEMA = ROOT / "agent_output.schema.json"
 MAX_REQUEST_BYTES = 50 * 1024 * 1024
 
 CASE_DIR.mkdir(exist_ok=True)
 REPORT_DIR.mkdir(exist_ok=True)
+
+REVIEW_STORE = agent_review.ReviewStore()
 
 
 def utc_now() -> str:
@@ -399,7 +405,38 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         if parsed.path == "/api/status":
-            self.send_json({"tooling": detect_tooling(), "server": "local-only"})
+            self.send_json({"tooling": detect_tooling(), "server": "local-only", "review_console": "/review"})
+            return
+        if parsed.path in ("/review", "/review.html"):
+            self.send_file(REVIEW_HTML, "text/html; charset=utf-8")
+            return
+        if parsed.path == "/api/agent/review-state":
+            self.send_json(REVIEW_STORE.snapshot())
+            return
+        if parsed.path == "/api/agent/recheck":
+            self.send_json({"recheck_request": REVIEW_STORE.snapshot()["recheck_request"]})
+            return
+        if parsed.path == "/api/agent/output-schema":
+            self.send_json(json.loads(AGENT_OUTPUT_SCHEMA.read_text(encoding="utf-8")))
+            return
+        if parsed.path == "/api/agent/demo-context":
+            self.send_json({"context": agent_review.build_demo_context()})
+            return
+        if parsed.path == "/api/agent/demo-output":
+            context = agent_review.build_demo_context()
+            self.send_json({"context": context, "output": agent_review.build_demo_agent_output(context)})
+            return
+        if parsed.path == "/api/agent/live-context":
+            try:
+                self.send_json({"context": agent_review.load_live_context()})
+            except Exception as exc:
+                self.send_json(
+                    {
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "hint": "Start agent_gateway.py on localhost:8766 or load the demo context.",
+                    },
+                    502,
+                )
             return
         if parsed.path == "/" or parsed.path == "/index.html":
             self.send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
@@ -408,22 +445,33 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path != "/api/run":
-            self.send_error(404, "Not found")
-            return
-
-        length = int(self.headers.get("Content-Length", "0"))
-        if length <= 0 or length > MAX_REQUEST_BYTES:
-            self.send_json({"error": "Request body is missing or too large."}, 413)
-            return
         try:
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            if not isinstance(payload, dict):
-                raise ValueError("Request must be a JSON object.")
-            result = execute_request(payload)
-            self.send_json({"analysis": result})
+            payload = self.read_json_body()
+            if parsed.path == "/api/run":
+                result = execute_request(payload)
+                self.send_json({"analysis": result})
+                return
+            if parsed.path == "/api/agent/context":
+                self.send_json(REVIEW_STORE.set_context(payload.get("context", payload)))
+                return
+            if parsed.path == "/api/agent/submit":
+                self.send_json(REVIEW_STORE.submit(payload))
+                return
+            if parsed.path == "/api/agent/review":
+                self.send_json(REVIEW_STORE.record_review(payload))
+                return
+            self.send_error(404, "Not found")
         except Exception as exc:
             self.send_json({"error": f"{type(exc).__name__}: {exc}"}, 400)
+
+    def read_json_body(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0 or length > MAX_REQUEST_BYTES:
+            raise ValueError("Request body is missing or too large.")
+        payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Request must be a JSON object.")
+        return payload
 
 
 def main() -> None:

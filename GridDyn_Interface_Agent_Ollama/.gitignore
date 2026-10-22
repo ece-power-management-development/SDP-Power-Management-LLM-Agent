@@ -1,5 +1,7 @@
 __pycache__/
 *.py[cod]
+.venv/
+*.log
 cases/*
 reports/*
 !reports/.gitkeep

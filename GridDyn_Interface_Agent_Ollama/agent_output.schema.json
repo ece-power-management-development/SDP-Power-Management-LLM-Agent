@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/griddyn-agent-output.schema.json",
+  "title": "GridDyn AI Agent Recommendation Output",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "output_type",
+    "response_id",
+    "generated_at_utc",
+    "summary",
+    "summary_evidence_ids",
+    "claims",
+    "possible_solutions",
+    "unknowns"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "output_type": {"const": "agent_recommendation"},
+    "response_id": {"type": "string"},
+    "generated_at_utc": {"type": "string", "format": "date-time"},
+    "summary": {"type": "string"},
+    "summary_evidence_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+    "claims": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["claim_id", "text", "evidence_ids", "source_kind"],
+        "properties": {
+          "claim_id": {"type": "string"},
+          "text": {"type": "string"},
+          "evidence_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+          "source_kind": {"enum": ["observed", "simulated", "inferred"]},
+          "severity": {"type": "string"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "possible_solutions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "solution_id",
+          "title",
+          "description",
+          "rationale",
+          "evidence_ids",
+          "expected_effect",
+          "risks",
+          "constraints_to_check",
+          "approval_required",
+          "source_kind"
+        ],
+        "properties": {
+          "solution_id": {"type": "string"},
+          "title": {"type": "string"},
+          "description": {"type": "string"},
+          "rationale": {"type": "string"},
+          "evidence_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+          "expected_effect": {"type": "string"},
+          "risks": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+          "constraints_to_check": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+          "approval_required": {"const": true},
+          "source_kind": {"const": "recommended"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "unknowns": {"type": "array", "items": {"type": "string"}},
+    "limitations": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": true
+}

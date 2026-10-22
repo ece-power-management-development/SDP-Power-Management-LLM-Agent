@@ -1,0 +1,53 @@
+{
+  "protocol": "local-http-json",
+  "base_url": "http://127.0.0.1:8765",
+  "service": "GridDyn AI Agent Output Review",
+  "read_only_to_grid": true,
+  "tools": [
+    {
+      "name": "submit_agent_output_for_check",
+      "method": "POST",
+      "path": "/api/agent/submit",
+      "description": "Submit the exact HELICS context packet used by the agent plus a structured agent_recommendation response. The server validates evidence IDs, quality, source labels, unknowns, approval requirements, and prohibited command fields before human review. Body: {\"context\": {...}, \"output\": {...}}"
+    },
+    {
+      "name": "get_review_state",
+      "method": "GET",
+      "path": "/api/agent/review-state",
+      "description": "Return the checked agent response, validation gate, human review history, and pending recheck request."
+    },
+    {
+      "name": "get_recheck_request",
+      "method": "GET",
+      "path": "/api/agent/recheck",
+      "description": "Retrieve the operator's structured request for the AI Agent to re-read context and correct errors."
+    },
+    {
+      "name": "get_agent_output_schema",
+      "method": "GET",
+      "path": "/api/agent/output-schema",
+      "description": "Return the JSON Schema required for a structured agent_recommendation response."
+    },
+    {
+      "name": "record_human_review",
+      "method": "POST",
+      "path": "/api/agent/review",
+      "description": "Record accept, request_recheck, or reject feedback. Recheck and reject require operator feedback. Body: {\"decision\":\"request_recheck\",\"issue_types\":[],\"feedback\":\"...\"}"
+    },
+    {
+      "name": "load_live_grid_context",
+      "method": "GET",
+      "path": "/api/agent/live-context",
+      "description": "Load the latest context from the local HELICS Agent Gateway at port 8766 for use in a checked submission."
+    }
+  ],
+  "agent_rules": [
+    "Submit the exact context packet used for reasoning so evidence references can be resolved.",
+    "Use evidence_ids for the summary, every claim, and every possible solution.",
+    "Keep observed, simulated, inferred, and recommended source_kind labels distinct.",
+    "Do not state that an equipment limit is exceeded unless the limit and unit are present and supported.",
+    "Return possible solutions as advisory options with risks, constraints_to_check, and approval_required=true.",
+    "Never include direct control commands, target setpoints, or execute_now fields.",
+    "If a recheck request exists, retrieve it and submit corrected output rather than defending unsupported claims."
+  ]
+}
