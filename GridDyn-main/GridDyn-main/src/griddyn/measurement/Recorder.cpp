@@ -1,0 +1,175 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "Recorder.h"
+
+#include "core/CoreExceptions.h"
+#include "core/ObjectInterpreter.h"
+#include "gmlc/utilities/stringOps.h"
+#include <filesystem>
+#include <memory>
+#include <string>
+#include <utility>
+
+namespace griddyn {
+using gmlc::utilities::fsize_t;
+
+Recorder::Recorder(CoreTime time0, CoreTime period): Collector(time0, period) {}
+Recorder::Recorder(const std::string& name): Collector(name) {}
+Recorder::~Recorder()
+{
+    // check to make sure there is no unrecorded data
+    if (!mFileName.empty()) {
+        try {
+            saveFile();
+        }
+        catch (const std::exception& e)  // no exceptions in a destructor
+        {
+            Collector::getObject()->log(Collector::getObject(), PrintLevel::ERROR, e.what());
+        }
+    }
+}
+
+std::unique_ptr<Collector> Recorder::clone() const
+{
+    std::unique_ptr<Collector> col = std::make_unique<Recorder>();
+    cloneTo(col.get());
+    return col;
+}
+
+void Recorder::cloneTo(Collector* col) const
+{
+    Collector::cloneTo(col);
+    auto* nrec = dynamic_cast<Recorder*>(col);
+    if (nrec == nullptr) {
+        return;
+    }
+    nrec->mFileName = mFileName;
+    nrec->mDirectory = mDirectory;
+    nrec->mBinaryFile = mBinaryFile;
+    nrec->mPrecision = mPrecision;
+    nrec->mAutosave = mAutosave;
+}
+
+void Recorder::set(std::string_view param, double val)
+{
+    if (param == "precision") {
+        mPrecision = static_cast<decltype(mPrecision)>(val);
+    } else if ((param == "reserve") || (param == "reservecount")) {
+        mDataset.reserve(static_cast<fsize_t>(val));
+    } else if (param == "autosave") {
+        mAutosave = static_cast<count_t>(val);
+    } else {
+        Collector::set(param, val);
+    }
+}
+
+void Recorder::set(std::string_view param, std::string_view val)
+{
+    if ((param == "file") || (param == "fileName")) {
+        mFileName = val;
+        const std::filesystem::path filePath(mFileName);
+        const std::string ext = gmlc::utilities::convertToLowerCase(filePath.extension().string());
+        mBinaryFile = ((ext != ".csv") && (ext != ".txt"));
+    } else if (param == "directory") {
+        mDirectory = val;
+    } else {
+        Collector::set(param, val);
+    }
+}
+
+void Recorder::saveFile(const std::string& fileName)
+{
+    bool bFile = mBinaryFile;
+    std::filesystem::path savefileName(mFileName);
+    if (!fileName.empty()) {
+        savefileName = std::filesystem::path(fileName);
+
+        const std::string ext =
+            gmlc::utilities::convertToLowerCase(savefileName.extension().string());
+        bFile = ((ext != ".csv") && (ext != ".txt"));
+    } else {
+        if (mTriggerTime == mLastSaveTime) {
+            return;  // no work todo
+        }
+    }
+    if (!savefileName.empty()) {
+        if (!mDirectory.empty()) {
+            if (!savefileName.has_root_directory()) {
+                savefileName = std::filesystem::path(mDirectory) / savefileName;
+            }
+        }
+        // check to make sure the directories exist if not create them
+        auto tmp = savefileName.parent_path();
+        if (!tmp.empty()) {
+            if (!std::filesystem::exists(tmp)) {
+                std::filesystem::create_directories(tmp);
+            }
+        }
+        // recheck the columns if necessary
+        if (mRecheck) {
+            recheckColumns();
+        }
+        mDataset.description = getName() + ": " + getDescription();
+        const bool append = (mLastSaveTime > negTime);
+
+        // create the file based on extension
+        if (bFile) {
+            mDataset.writeBinaryFile(savefileName.string(), append);
+        } else {
+            mDataset.writeTextFile(savefileName.string(), mPrecision, append);
+        }
+        mLastSaveTime = mTriggerTime;
+    } else {
+        throw(InvalidFileName());
+    }
+}
+
+void Recorder::reset()
+{
+    mDataset.clear();
+}
+void Recorder::setSpace(CoreTime span)
+{
+    auto pts = static_cast<count_t>(std::floor(span / mTimePeriod));
+    mDataset.reserve(pts + 1);
+}
+
+void Recorder::addSpace(CoreTime span)
+{
+    auto pts = static_cast<count_t>(std::floor(span / mTimePeriod));
+    mDataset.reserve(static_cast<fsize_t>(mDataset.time().capacity()) + pts + 1);
+}
+
+void Recorder::fillDatasetFields()
+{
+    mDataset.setFields(Collector::getColumnDescriptions());
+}
+ChangeCode Recorder::trigger(CoreTime time)
+{
+    Collector::trigger(time);
+    if (mFirstTrigger) {
+        mDataset.setCols(static_cast<fsize_t>(mData.size()));
+        fillDatasetFields();
+        mFirstTrigger = false;
+    }
+    mDataset.addData(time, mData);
+    if ((mAutosave > 0) && std::cmp_greater_equal(mDataset.size(), mAutosave)) {
+        saveFile();
+        mDataset.clear();
+    }
+    return ChangeCode::NO_CHANGE;
+}
+
+void Recorder::flush()
+{
+    saveFile();
+}
+const std::string& Recorder::getSinkName() const
+{
+    return getFileName();
+}
+}  // namespace griddyn

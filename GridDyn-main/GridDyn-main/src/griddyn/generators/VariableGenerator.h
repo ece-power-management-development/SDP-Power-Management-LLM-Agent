@@ -1,0 +1,80 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "DynamicGenerator.h"
+#include <string>
+
+namespace griddyn {
+class GridBus;
+class GridBlock;
+
+/** @brief class defining some additional components for a variable generator such as a renewable
+  source like wind and solar the generator includes the addition of a source and a filter block to
+  define some sort of input and a filtering function on that input*/
+class VariableGenerator: public DynamicGenerator {
+  protected:
+    Source* m_source = nullptr;  //!< reference to the generation source block
+    GridBlock* m_cBlock = nullptr;  //!< reference to the control block
+    model_parameter mp_Vcutout = -1.0;  //!<[pu] the cutout voltage
+    model_parameter mp_Vmax = kBigNum;  //!< [pu] the maximum operating voltage
+  public:
+    //!< @brief new submodel locations for the extra variable generator block extends the ones
+    //!< defined in Generator
+    enum ExtraBlockLocations { SOURCE_LOC = 5, CONTROL_BLOCK_LOC = 6 };
+    /** @brief default constructor*/
+    explicit VariableGenerator(const std::string& objName = "varGen_$");
+    VariableGenerator(DynModel dynModel, const std::string& objName = "varGen_$");
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+
+  protected:
+    // virtual void pFlowObjectInitializeA (CoreTime time0, std::uint32_t flags) override;
+
+    virtual void dynObjectInitializeB(const IOdata& inputs,
+                                      const IOdata& desiredOutput,
+                                      IOdata& fieldSet) override;
+
+  public:
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+
+    virtual void add(CoreObject* obj) override;
+
+    virtual void add(GridSubModel* obj) override;
+
+    virtual void residual(const IOdata& inputs,
+                          const StateData& stateDataValue,
+                          double resid[],
+                          const SolverMode& sMode) override;
+
+    virtual void jacobianElements(const IOdata& inputs,
+                                  const StateData& stateDataValue,
+                                  MatrixData<double>& matrixDataValue,
+                                  const IOlocs& inputLocs,
+                                  const SolverMode& sMode) override;
+
+    virtual double getAdjustableCapacityUp(CoreTime /*time*/ = maxTime) const override
+    {
+        return 0.0;
+    }  // get the available adjustment Up within the specified timeframe
+    virtual double getAdjustableCapacityDown(CoreTime /*time*/ = maxTime) const override
+    {
+        return 0.0;
+    }  // get the available adjustment Up within the specified timeframe
+    virtual void generationAdjust(double /*adjustment*/) override {}
+    virtual CoreObject* find(std::string_view object) const override;
+    virtual CoreObject* getSubObject(std::string_view typeName, index_t num) const override;
+
+  protected:
+    virtual double pSetControlUpdate(const IOdata& inputs,
+                                     const StateData& stateDataValue,
+                                     const SolverMode& sMode) override;
+    virtual index_t pSetLocation(const SolverMode& sMode) override;
+};
+
+}  // namespace griddyn

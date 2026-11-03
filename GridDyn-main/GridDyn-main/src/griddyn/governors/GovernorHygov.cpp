@@ -1,0 +1,738 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "GovernorHygov.h"
+
+#include "core/CoreExceptions.h"
+#include "core/CoreObjectTemplates.hpp"
+#include "utilities/MatrixData.hpp"
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <string>
+#include <vector>
+
+namespace griddyn::governors {
+// The equations below mirror the published block diagram. Extra precedence
+// parentheses obscure the signal flow without changing the calculation.
+// NOLINTBEGIN(readability-math-missing-parentheses)
+namespace {
+    constexpr index_t pmechOutput = 0;
+    constexpr index_t filterState = 0;
+    constexpr index_t gatePositionState = 1;
+    constexpr index_t servoState = 2;
+    constexpr index_t flowState = 3;
+    constexpr double minimumGate = 1e-8;
+    constexpr double rateLimitTolerance = 1e-7;
+    constexpr double positionLimitTolerance = 1e-7;
+    // Root-only hysteresis absorbs small input changes without loosening the
+    // physical rate and gate-position limits above.
+    constexpr double rateLimitRootTolerance = 1e-4;
+    constexpr double rateLimitSpeedNoiseTolerance = 1e-5;
+    constexpr double rateLimitReleaseMargin = 2.0;
+    constexpr double positionLimitRootTolerance = 1e-3;
+}  // namespace
+
+GovernorHygov::GovernorHygov(const std::string& objName): Governor(objName)
+{
+    K = 20.0;  // 1 / R
+    Pmax = 0.9;
+    Pmin = 0.0;
+    opFlags.set(IGNORE_DEADBAND);
+    opFlags.set(IGNORE_FILTER);
+    opFlags.set(IGNORE_THROTTLE);
+    opFlags.set(USES_POWER_LIMITS);
+    opFlags.set(USES_RAMP_LIMITS);
+}
+
+CoreObject* GovernorHygov::clone(CoreObject* obj) const
+{
+    auto* governorClone = cloneBase<GovernorHygov, Governor>(this, obj);
+    if (governorClone == nullptr) {
+        return obj;
+    }
+    governorClone->temporaryDroop = temporaryDroop;
+    governorClone->Tr = Tr;
+    governorClone->Tf = Tf;
+    governorClone->Tg = Tg;
+    governorClone->Tw = Tw;
+    governorClone->VELM = VELM;
+    governorClone->At = At;
+    governorClone->Dturb = Dturb;
+    governorClone->qNL = qNL;
+    governorClone->h0 = h0;
+    return governorClone;
+}
+
+GovernorHygov::~GovernorHygov() = default;
+
+void GovernorHygov::dynObjectInitializeA(CoreTime time0, std::uint32_t flags)
+{
+    setInitialLimitPolicy(flags);
+    if (!std::isfinite(K) || !std::isfinite(temporaryDroop) || !std::isfinite(Tr) ||
+        !std::isfinite(Tf) || !std::isfinite(Tg) || !std::isfinite(Tw) || !std::isfinite(VELM) ||
+        !std::isfinite(Pmax) || !std::isfinite(Pmin) || !std::isfinite(At) ||
+        !std::isfinite(Dturb) || !std::isfinite(qNL) || !std::isfinite(h0) || (K <= 0.0) ||
+        (temporaryDroop <= 0.0) || (Tr <= 0.0) || (Tf <= 0.0) || (Tg <= 0.0) || (Tw <= 0.0) ||
+        (VELM < 0.0) || (Pmax < Pmin) || (At <= 0.0) || (h0 <= 0.0)) {
+        throw InvalidParameterValue("HYGOV parameters");
+    }
+
+    auto& local = offsets.local().local;
+    local.algSize = 1;
+    local.diffSize = 4;
+    local.algRoots = 2;
+    local.diffRoots = 0;
+    local.jacSize = 32;
+    prevTime = time0;
+    opFlags.reset(GATE_RATE_LIMITED);
+    opFlags.reset(GATE_RATE_LIMIT_HIGH);
+    opFlags.reset(GATE_POSITION_LIMITED);
+    opFlags.reset(GATE_POSITION_LIMIT_HIGH);
+    rateRootTransitionPending = false;
+    positionRootTransitionPending = false;
+}
+
+void GovernorHygov::dynObjectInitializeB(const IOdata& inputs,
+                                         const IOdata& desiredOutput,
+                                         IOdata& fieldSet)
+{
+    const double originalUpperLimit = Pmax;
+    if (desiredOutput.empty() || !std::isfinite(desiredOutput[pmechOutput])) {
+        throw InvalidParameterValue("HYGOV initial mechanical power");
+    }
+    const double initialPower = desiredOutput[pmechOutput];
+    const double initialFlow = initialPower / (At * h0) + qNL;
+    const double initialGate = initialFlow / std::sqrt(h0);
+    if (!std::isfinite(initialGate) || (std::abs(initialGate) < minimumGate)) {
+        throw InvalidParameterValue("HYGOV initial gate is singular");
+    }
+    if ((initialGate < Pmin) || !adjustInitialUpperLimit(initialGate, "HYGOV initial gate")) {
+        throw InvalidParameterValue("HYGOV initial gate outside limits");
+    }
+    Pset = initialGate / K;
+
+    const index_t algOffset = offsets.getAlgOffset(cLocalSolverMode);
+    const index_t diffOffset = offsets.getDiffOffset(cLocalSolverMode);
+    m_state[algOffset + pmechOutput] = initialPower;
+    m_state[diffOffset + filterState] = 0.0;
+    m_state[diffOffset + gatePositionState] = initialGate;
+    m_state[diffOffset + servoState] = initialGate;
+    m_state[diffOffset + flowState] = initialFlow;
+    // Keep the filter at its steady value after moving the unconstrained
+    // gate request beyond an active position bound.  This preserves all
+    // differential initial conditions, including the filter equation.
+    const double correction = std::max(0.0, Pmax - originalUpperLimit);
+    const double gateMargin =
+        std::max(0.2 * correction,
+                 10.0 * positionLimitRootTolerance * std::abs(K * temporaryDroop * Tr));
+    if (initialGate >= Pmax) {
+        Pset += gateMargin / K;
+    } else if (initialGate <= Pmin) {
+        Pset -= gateMargin / K;
+    }
+    m_state[diffOffset + filterState] = governorError(inputs, m_state.data() + diffOffset);
+    fieldSet.resize(2);
+    fieldSet[govpSetInLocation] = Pset;
+    // Select the active branch before the first root evaluation.
+    updateLimitFlags(inputs, m_state.data() + diffOffset);
+}
+
+double GovernorHygov::speedDeviation(const IOdata& inputs)
+{
+    return inputs[govOmegaInLocation] - 1.0;
+}
+
+double GovernorHygov::governorError(const IOdata& inputs, const double diffState[]) const
+{
+    const double permanentDroop = 1.0 / K;
+    return Pset - speedDeviation(inputs) - permanentDroop * diffState[gatePositionState];
+}
+
+double GovernorHygov::filterDerivative(const IOdata& inputs, const double diffState[]) const
+{
+    return (governorError(inputs, diffState) - diffState[filterState]) / Tf;
+}
+
+double GovernorHygov::temporaryDroopLeadOutput(const IOdata& inputs, const double diffState[]) const
+{
+    return (Tr * filterDerivative(inputs, diffState) + diffState[filterState]) /
+        (temporaryDroop * Tr);
+}
+
+double GovernorHygov::regularizedGate(const double diffState[])
+{
+    // H = (Q/G)^2 is physically singular at G = 0. Continuous HYGOV
+    // trajectories initialized with nonzero G and nonnegative gate commands do
+    // not cross zero, but the signed floor prevents a trial solver state from
+    // producing NaN or infinity. The Jacobian uses zero dH/dG inside this flat
+    // regularization interval.
+    const double gate = diffState[servoState];
+    if (std::abs(gate) >= minimumGate) {
+        return gate;
+    }
+    return std::copysign(minimumGate, gate);
+}
+
+double GovernorHygov::turbineHead(const double diffState[])
+{
+    const double gate = regularizedGate(diffState);
+    const double ratio = diffState[flowState] / gate;
+    return ratio * ratio;
+}
+
+double GovernorHygov::mechanicalPower(const IOdata& inputs, const double diffState[]) const
+{
+    const double gate = diffState[servoState];
+    const double flow = diffState[flowState];
+    const double localHead = turbineHead(diffState);
+    return At * localHead * (flow - qNL) - Dturb * speedDeviation(inputs) * gate;
+}
+
+double GovernorHygov::unlimitedGateRate(const IOdata& inputs, const double diffState[]) const
+{
+    return temporaryDroopLeadOutput(inputs, diffState);
+}
+
+double GovernorHygov::limitedGateRate(const IOdata& inputs, const double diffState[]) const
+{
+    return std::clamp(unlimitedGateRate(inputs, diffState),
+                      -static_cast<double>(VELM),
+                      static_cast<double>(VELM));
+}
+
+int GovernorHygov::gateRateLimitStatus(const IOdata& inputs, const double diffState[]) const
+{
+    const double rate = unlimitedGateRate(inputs, diffState);
+    // Preserve the active branch through the roundoff-sized gap at a root.
+    // rootCheck() may be called before IDA has advanced away from the event;
+    // clearing the flag there would make the same root immediately active
+    // again.
+    if (opFlags[GATE_RATE_LIMITED]) {
+        if (opFlags[GATE_RATE_LIMIT_HIGH]) {
+            return (rate >= (VELM - rateLimitTolerance)) ? 1 : 0;
+        }
+        return (rate <= (-VELM + rateLimitTolerance)) ? -1 : 0;
+    }
+    if (rate >= VELM) {
+        return 1;
+    }
+    return (rate <= -VELM) ? -1 : 0;
+}
+
+int GovernorHygov::gatePositionLimitStatus(const IOdata& inputs, const double diffState[]) const
+{
+    const double rate = limitedGateRate(inputs, diffState);
+    // A zero-rate state at a gate bound is a valid equilibrium, not an
+    // already-engaged position limiter.  In particular, permissive
+    // initialization can raise GMAX to the dispatched gate position.  Latching
+    // that artificial boundary makes roundoff-sized rate changes alternate
+    // between the constrained and unconstrained Jacobians.
+    if ((diffState[gatePositionState] >= Pmax) && (rate > positionLimitTolerance)) {
+        return 1;
+    }
+    if ((diffState[gatePositionState] <= Pmin) && (rate < -positionLimitTolerance)) {
+        return -1;
+    }
+    return 0;
+}
+
+void GovernorHygov::residual(const IOdata& inputs,
+                             const StateData& stateData,
+                             double resid[],
+                             const SolverMode& sMode)
+{
+    const auto locations = offsets.getLocations(stateData, resid, sMode, this);
+    if (hasAlgebraic(sMode)) {
+        locations.destLoc[pmechOutput] =
+            mechanicalPower(inputs, locations.diffStateLoc) - locations.algStateLoc[pmechOutput];
+    }
+    if (!hasDifferential(sMode)) {
+        return;
+    }
+    derivative(inputs, stateData, resid, sMode);
+    for (index_t state = 0; state < locations.diffSize; ++state) {
+        locations.destDiffLoc[state] -= locations.dstateLoc[state];
+    }
+}
+
+void GovernorHygov::derivative(const IOdata& inputs,
+                               const StateData& stateData,
+                               double deriv[],
+                               const SolverMode& sMode)
+{
+    if (!hasDifferential(sMode)) {
+        return;
+    }
+    const auto locations = offsets.getLocations(stateData, deriv, sMode, this);
+    const double* state = locations.diffStateLoc;
+    double* stateDerivative = locations.destDiffLoc;
+    const double gateRate =
+        (gatePositionLimitStatus(inputs, state) == 0) ? limitedGateRate(inputs, state) : 0.0;
+    stateDerivative[filterState] = filterDerivative(inputs, state);
+    stateDerivative[gatePositionState] = gateRate;
+    stateDerivative[servoState] = (state[gatePositionState] - state[servoState]) / Tg;
+    stateDerivative[flowState] = (h0 - turbineHead(state)) / Tw;
+}
+
+void GovernorHygov::algebraicUpdate(const IOdata& inputs,
+                                    const StateData& stateData,
+                                    double update[],
+                                    const SolverMode& sMode,
+                                    double /*alpha*/)
+{
+    if (!hasAlgebraic(sMode)) {
+        return;
+    }
+    const auto locations = offsets.getLocations(stateData, update, sMode, this);
+    locations.destLoc[pmechOutput] = mechanicalPower(inputs, locations.diffStateLoc);
+}
+
+void GovernorHygov::jacobianElements(const IOdata& inputs,
+                                     const StateData& stateData,
+                                     MatrixData<double>& matrixData,
+                                     const IOlocs& inputLocs,
+                                     const SolverMode& sMode)
+{
+    const auto locations = offsets.getLocations(stateData, sMode, this);
+    const index_t algOffset = locations.algOffset;
+    const index_t diffOffset = locations.diffOffset;
+    const double* state = locations.diffStateLoc;
+    const double gate = regularizedGate(state);
+    const double physicalGate = state[servoState];
+    const double flow = state[flowState];
+    const double localHead = turbineHead(state);
+    const double dHeadDGate =
+        (std::abs(physicalGate) >= minimumGate) ? -2.0 * localHead / physicalGate : 0.0;
+    const double dHeadDFlow = 2.0 * flow / (gate * gate);
+    const bool rateLimited = gateRateLimitStatus(inputs, state) != 0;
+    const bool positionLimited = gatePositionLimitStatus(inputs, state) != 0;
+    const double permanentDroop = 1.0 / K;
+    const double dLeadDFilter = (1.0 / temporaryDroop) * (1.0 / Tr - 1.0 / Tf);
+    const double dLeadDGatePosition = -permanentDroop / (temporaryDroop * Tf);
+    const double dLeadDOmega = -1.0 / (temporaryDroop * Tf);
+
+    if (hasAlgebraic(sMode)) {
+        matrixData.assign(algOffset + pmechOutput, algOffset + pmechOutput, -1.0);
+        if (!isAlgebraicOnly(sMode)) {
+            matrixData.assign(algOffset + pmechOutput,
+                              diffOffset + servoState,
+                              At * dHeadDGate * (flow - qNL) - Dturb * speedDeviation(inputs));
+            matrixData.assign(algOffset + pmechOutput,
+                              diffOffset + flowState,
+                              At * (dHeadDFlow * (flow - qNL) + localHead));
+        }
+        matrixData.assignCheckCol(algOffset + pmechOutput,
+                                  inputLocs[govOmegaInLocation],
+                                  -Dturb * state[servoState]);
+    }
+    if (!hasDifferential(sMode)) {
+        return;
+    }
+
+    matrixData.assign(diffOffset + filterState, diffOffset + filterState, -1.0 / Tf - stateData.cj);
+    matrixData.assign(diffOffset + filterState,
+                      diffOffset + gatePositionState,
+                      -permanentDroop / Tf);
+    matrixData.assignCheckCol(diffOffset + filterState, inputLocs[govOmegaInLocation], -1.0 / Tf);
+
+    if (rateLimited || positionLimited) {
+        matrixData.assign(diffOffset + gatePositionState,
+                          diffOffset + gatePositionState,
+                          -stateData.cj);
+    } else {
+        matrixData.assign(diffOffset + gatePositionState, diffOffset + filterState, dLeadDFilter);
+        matrixData.assign(diffOffset + gatePositionState,
+                          diffOffset + gatePositionState,
+                          dLeadDGatePosition - stateData.cj);
+        matrixData.assignCheckCol(diffOffset + gatePositionState,
+                                  inputLocs[govOmegaInLocation],
+                                  dLeadDOmega);
+    }
+
+    matrixData.assign(diffOffset + servoState, diffOffset + gatePositionState, 1.0 / Tg);
+    matrixData.assign(diffOffset + servoState, diffOffset + servoState, -1.0 / Tg - stateData.cj);
+
+    matrixData.assign(diffOffset + flowState, diffOffset + servoState, -dHeadDGate / Tw);
+    matrixData.assign(diffOffset + flowState,
+                      diffOffset + flowState,
+                      -dHeadDFlow / Tw - stateData.cj);
+}
+
+void GovernorHygov::timestep(CoreTime time, const IOdata& inputs, const SolverMode& /*sMode*/)
+{
+    derivative(inputs, emptyStateData, m_dstate_dt.data(), cLocalSolverMode);
+    const double timeStep = time - prevTime;
+    const index_t diffOffset = offsets.getDiffOffset(cLocalSolverMode);
+    for (index_t state = 0; state < offsets.local().local.diffSize; ++state) {
+        m_state[diffOffset + state] += timeStep * m_dstate_dt[diffOffset + state];
+    }
+    m_state[diffOffset + gatePositionState] = std::clamp(m_state[diffOffset + gatePositionState],
+                                                         static_cast<double>(Pmin),
+                                                         static_cast<double>(Pmax));
+    m_state[offsets.getAlgOffset(cLocalSolverMode) + pmechOutput] =
+        mechanicalPower(inputs, m_state.data() + diffOffset);
+    updateLimitFlags(inputs, m_state.data() + diffOffset);
+    prevTime = time;
+}
+
+bool GovernorHygov::updateLimitFlags(const IOdata& inputs, const double diffState[])
+{
+    const int rateStatus = gateRateLimitStatus(inputs, diffState);
+    const int positionStatus = gatePositionLimitStatus(inputs, diffState);
+    const bool changed = (opFlags[GATE_RATE_LIMITED] != (rateStatus != 0)) ||
+        (opFlags[GATE_RATE_LIMIT_HIGH] != (rateStatus > 0)) ||
+        (opFlags[GATE_POSITION_LIMITED] != (positionStatus != 0)) ||
+        (opFlags[GATE_POSITION_LIMIT_HIGH] != (positionStatus > 0));
+    opFlags.set(GATE_RATE_LIMITED, rateStatus != 0);
+    opFlags.set(GATE_RATE_LIMIT_HIGH, rateStatus > 0);
+    opFlags.set(GATE_POSITION_LIMITED, positionStatus != 0);
+    opFlags.set(GATE_POSITION_LIMIT_HIGH, positionStatus > 0);
+    return changed;
+}
+
+void GovernorHygov::rootTest(const IOdata& inputs,
+                             const StateData& stateData,
+                             double roots[],
+                             const SolverMode& sMode)
+{
+    const auto locations = offsets.getLocations(stateData, sMode, this);
+    const double* state = locations.diffStateLoc;
+    const index_t rootOffset = offsets.getRootOffset(sMode);
+    const double rate = unlimitedGateRate(inputs, state);
+    if (opFlags[GATE_RATE_LIMITED]) {
+        // Keep the active root just inside the limited region.  IDA restarts
+        // from the event state after rootTrigger(); without this small
+        // hysteresis it can immediately rediscover the same zero repeatedly.
+        // Scale the release margin by the speed-to-rate sensitivity so a
+        // small frequency perturbation does not immediately reverse the root.
+        const double releaseRootTolerance =
+            std::max(rateLimitRootTolerance,
+                     rateLimitReleaseMargin * rateLimitSpeedNoiseTolerance / (temporaryDroop * Tf));
+        roots[rootOffset] =
+            (opFlags[GATE_RATE_LIMIT_HIGH] ? VELM - rate : rate + VELM) - releaseRootTolerance;
+    } else {
+        roots[rootOffset] = std::min(VELM - rate, rate + VELM) + rateLimitRootTolerance;
+    }
+    const double limitedRateValue = limitedGateRate(inputs, state);
+    if (opFlags[GATE_POSITION_LIMITED]) {
+        // Keep a governor parked at a position limit from being reported as
+        // a root at every restart when its release rate is exactly zero.  The
+        // offset is on the release side: a high limit releases for a negative
+        // rate and a low limit releases for a positive rate.
+        roots[rootOffset + 1] = opFlags[GATE_POSITION_LIMIT_HIGH] ?
+            -limitedRateValue - positionLimitRootTolerance :
+            limitedRateValue - positionLimitRootTolerance;
+    } else if (((state[gatePositionState] >= (Pmax - positionLimitTolerance)) &&
+                (limitedRateValue < 0.0)) ||
+               ((state[gatePositionState] <= (Pmin + positionLimitTolerance)) &&
+                (limitedRateValue > 0.0))) {
+        // At a geometric boundary with an inward rate the governor is not
+        // limited, but the distance-only root would still be exactly zero.
+        // Keep IDA away from that non-eventful surface.
+        roots[rootOffset + 1] = positionLimitRootTolerance;
+    } else if ((std::abs(limitedRateValue) <= positionLimitTolerance) &&
+               (((state[gatePositionState] >= (Pmax - positionLimitTolerance)) &&
+                 (state[gatePositionState] <= (Pmax + positionLimitTolerance))) ||
+                ((state[gatePositionState] >= (Pmin - positionLimitTolerance)) &&
+                 (state[gatePositionState] <= (Pmin + positionLimitTolerance))))) {
+        // Likewise, a zero-rate operating point on a position bound is not a
+        // crossing.  Return a small positive value until the rate gives a
+        // definite direction for a real limiter entry or release.
+        roots[rootOffset + 1] = positionLimitRootTolerance;
+    } else {
+        roots[rootOffset + 1] =
+            std::min(Pmax - state[gatePositionState], state[gatePositionState] - Pmin) +
+            positionLimitRootTolerance;
+    }
+}
+
+void GovernorHygov::rootTrigger(CoreTime time,
+                                const IOdata& inputs,
+                                const std::vector<int>& rootMask,
+                                const SolverMode& sMode)
+{
+    const index_t rootOffset = offsets.getRootOffset(sMode);
+    if ((rootMask[rootOffset] == 0) && (rootMask[rootOffset + 1] == 0)) {
+        return;
+    }
+    double* state = m_state.data() + offsets.getDiffOffset(cLocalSolverMode);
+    const bool wasRateLimited = opFlags[GATE_RATE_LIMITED];
+    const bool wasRateLimitHigh = opFlags[GATE_RATE_LIMIT_HIGH];
+    const bool wasPositionLimited = opFlags[GATE_POSITION_LIMITED];
+    const bool wasPositionLimitHigh = opFlags[GATE_POSITION_LIMIT_HIGH];
+    const double rootRate = unlimitedGateRate(inputs, state);
+    const bool rateRootTransition = rootMask[rootOffset] != 0;
+    bool positionLimitNudged = false;
+
+    // At a limiter root, evaluating the status again can land infinitesimally
+    // inside the unsaturated region.  Use the root direction to latch the
+    // transition, otherwise IDA can report the same root indefinitely without
+    // ever entering the limited Jacobian branch.
+    if (rootMask[rootOffset] != 0) {
+        rateRootTransitionPending = true;
+        const bool limited = (rootMask[rootOffset] < 0);
+        opFlags.set(GATE_RATE_LIMITED, limited);
+        opFlags.set(GATE_RATE_LIMIT_HIGH, limited && (rootRate >= 0.0));
+        if (rateRootTransition && (limited != wasRateLimited)) {
+            // The state copied back from an IDA root return can be a small
+            // interpolation distance inside the limiter boundary.  Nudge the
+            // filter state so the active root function starts on the limited
+            // side after the solver restart.  This is equivalent to the
+            // limiter-state nudge used by the exciter models and avoids an
+            // immediate repeat of the entry root.
+            const double rateStateSlope = (1.0 - Tr / Tf) / (temporaryDroop * Tr);
+            if (std::abs(rateStateSlope) > std::numeric_limits<double>::epsilon()) {
+                double targetRate;
+                if (limited) {
+                    targetRate = opFlags[GATE_RATE_LIMIT_HIGH] ? VELM + rateLimitTolerance :
+                                                                 -VELM - rateLimitTolerance;
+                } else {
+                    targetRate = wasRateLimitHigh ? VELM - 2.0 * rateLimitTolerance :
+                                                    -VELM + 2.0 * rateLimitTolerance;
+                }
+                state[filterState] += (targetRate - rootRate) / rateStateSlope;
+            }
+        }
+    }
+    if (rootMask[rootOffset + 1] != 0) {
+        positionRootTransitionPending = true;
+        const bool limited = (rootMask[rootOffset + 1] < 0);
+        opFlags.set(GATE_POSITION_LIMITED, limited);
+        const double midpoint = (Pmax + Pmin) / 2.0;
+        const bool limitHigh = limited && (state[gatePositionState] >= midpoint);
+        opFlags.set(GATE_POSITION_LIMIT_HIGH, limitHigh);
+        if (wasPositionLimited && limited && (wasPositionLimitHigh == limitHigh)) {
+            // A negative-direction position root while the same position
+            // limiter is already active is not a new branch transition: it
+            // is the release test returning to the constrained side.  IDA
+            // has stopped exactly on that test surface, so put the filter
+            // infinitesimally inside the active branch before restarting.
+            // Without this, the unchanged limiter can immediately return the
+            // same root again and cause event chatter.
+            const double rateStateSlope = (1.0 - Tr / Tf) / (temporaryDroop * Tr);
+            if (std::abs(rateStateSlope) > std::numeric_limits<double>::epsilon()) {
+                state[filterState] -= rootRate / rateStateSlope;
+                positionLimitNudged = true;
+            }
+        }
+    }
+    state[gatePositionState] =
+        std::clamp(state[gatePositionState], static_cast<double>(Pmin), static_cast<double>(Pmax));
+    const bool changed = (wasRateLimited != opFlags[GATE_RATE_LIMITED]) ||
+        (wasRateLimitHigh != opFlags[GATE_RATE_LIMIT_HIGH]) ||
+        (wasPositionLimited != opFlags[GATE_POSITION_LIMITED]) ||
+        (wasPositionLimitHigh != opFlags[GATE_POSITION_LIMIT_HIGH]);
+    if (changed) {
+        alert(this, JAC_COUNT_CHANGE);
+    }
+    if (changed || positionLimitNudged) {
+        // Position-limit transitions also change the gate derivative.  Refresh
+        // yp after every branch change or boundary nudge so IDA does not
+        // restart from a state/derivative pair that belongs to the previous
+        // limiter condition.
+        const StateData stateData(time, m_state.data());
+        derivative(inputs, stateData, m_dstate_dt.data(), cLocalSolverMode);
+    }
+}
+
+ChangeCode GovernorHygov::rootCheck(const IOdata& inputs,
+                                    const StateData& /*stateData*/,
+                                    const SolverMode& /*sMode*/,
+                                    CheckLevel /*level*/)
+{
+    double* state = m_state.data() + offsets.getDiffOffset(cLocalSolverMode);
+    state[gatePositionState] =
+        std::clamp(state[gatePositionState], static_cast<double>(Pmin), static_cast<double>(Pmax));
+    const bool wasRateLimited = opFlags[GATE_RATE_LIMITED];
+    const bool wasRateLimitHigh = opFlags[GATE_RATE_LIMIT_HIGH];
+    const bool wasPositionLimited = opFlags[GATE_POSITION_LIMITED];
+    const bool wasPositionLimitHigh = opFlags[GATE_POSITION_LIMIT_HIGH];
+    const bool transitionRateLimited = opFlags[GATE_RATE_LIMITED];
+    const bool transitionRateLimitHigh = opFlags[GATE_RATE_LIMIT_HIGH];
+    const bool transitionPositionLimited = opFlags[GATE_POSITION_LIMITED];
+    const bool transitionPositionLimitHigh = opFlags[GATE_POSITION_LIMIT_HIGH];
+    const bool rateTransitionPending = rateRootTransitionPending;
+    const bool positionTransitionPending = positionRootTransitionPending;
+    rateRootTransitionPending = false;
+    positionRootTransitionPending = false;
+    updateLimitFlags(inputs, state);
+    // Root transitions are authoritative for the piecewise limiter state.  A
+    // root check can see an interpolated value just inside the boundary during
+    // the solver restart; the release root will clear the branch once the
+    // hysteresis margin has actually been crossed.
+    if (rateTransitionPending) {
+        opFlags.set(GATE_RATE_LIMITED, transitionRateLimited);
+        opFlags.set(GATE_RATE_LIMIT_HIGH, transitionRateLimitHigh);
+    } else if (wasRateLimited) {
+        opFlags.set(GATE_RATE_LIMITED, true);
+        opFlags.set(GATE_RATE_LIMIT_HIGH, wasRateLimitHigh);
+    }
+    if (positionTransitionPending) {
+        opFlags.set(GATE_POSITION_LIMITED, transitionPositionLimited);
+        opFlags.set(GATE_POSITION_LIMIT_HIGH, transitionPositionLimitHigh);
+    } else if (wasPositionLimited) {
+        opFlags.set(GATE_POSITION_LIMITED, true);
+        opFlags.set(GATE_POSITION_LIMIT_HIGH, wasPositionLimitHigh);
+    }
+    const bool changed = (wasRateLimited != opFlags[GATE_RATE_LIMITED]) ||
+        (wasRateLimitHigh != opFlags[GATE_RATE_LIMIT_HIGH]) ||
+        (wasPositionLimited != opFlags[GATE_POSITION_LIMITED]) ||
+        (wasPositionLimitHigh != opFlags[GATE_POSITION_LIMIT_HIGH]);
+    if (changed) {
+        alert(this, JAC_COUNT_CHANGE);
+        return ChangeCode::JACOBIAN_CHANGE;
+    }
+    return ChangeCode::NO_CHANGE;
+}
+
+void GovernorHygov::set(std::string_view param, std::string_view val)
+{
+    Governor::set(param, val);
+}
+
+void GovernorHygov::set(std::string_view param, double val, units::unit unitType)
+{
+    if (param == "r") {
+        if (!std::isfinite(val) || (val <= 0.0)) {
+            throw InvalidParameterValue("HYGOV R must be positive and finite");
+        }
+        Governor::set(param, val, unitType);
+    } else if ((param == "temporarydroop") || (param == "rtmp") || (param == "rtemp")) {
+        if (!std::isfinite(val) || (val <= 0.0)) {
+            throw InvalidParameterValue("HYGOV temporary droop must be positive and finite");
+        }
+        temporaryDroop = val;
+    } else if ((param == "tr") || (param == "t_r") || (param == "t1")) {
+        if (!std::isfinite(val) || (val <= 0.0)) {
+            throw InvalidParameterValue("HYGOV Tr must be positive and finite");
+        }
+        Tr = val;
+    } else if ((param == "tf") || (param == "t_f")) {
+        if (!std::isfinite(val) || (val <= 0.0)) {
+            throw InvalidParameterValue("HYGOV Tf must be positive and finite");
+        }
+        Tf = val;
+    } else if ((param == "tg") || (param == "t_g")) {
+        if (!std::isfinite(val) || (val <= 0.0)) {
+            throw InvalidParameterValue("HYGOV Tg must be positive and finite");
+        }
+        Tg = val;
+    } else if ((param == "velm") || (param == "velmax")) {
+        if (!std::isfinite(val) || (val < 0.0)) {
+            throw InvalidParameterValue("HYGOV VELM must be nonnegative and finite");
+        }
+        VELM = val;
+    } else if ((param == "gmax") || (param == "pmax")) {
+        if (!std::isfinite(val)) {
+            throw InvalidParameterValue("HYGOV maximum gate limit must be finite");
+        }
+        Pmax = val;
+    } else if ((param == "gmin") || (param == "pmin")) {
+        if (!std::isfinite(val)) {
+            throw InvalidParameterValue("HYGOV minimum gate limit must be finite");
+        }
+        Pmin = val;
+    } else if ((param == "tw") || (param == "t_w")) {
+        if (!std::isfinite(val) || (val <= 0.0)) {
+            throw InvalidParameterValue("HYGOV Tw must be positive and finite");
+        }
+        Tw = val;
+    } else if ((param == "at") || (param == "a_t")) {
+        if (!std::isfinite(val) || (val <= 0.0)) {
+            throw InvalidParameterValue("HYGOV At must be positive and finite");
+        }
+        At = val;
+    } else if ((param == "dt") || (param == "dturb") || (param == "d_turb")) {
+        if (!std::isfinite(val)) {
+            throw InvalidParameterValue("HYGOV Dturb must be finite");
+        }
+        Dturb = val;
+    } else if ((param == "qnl") || (param == "q_nl")) {
+        if (!std::isfinite(val)) {
+            throw InvalidParameterValue("HYGOV qNL must be finite");
+        }
+        qNL = val;
+    } else if ((param == "h0") || (param == "head0")) {
+        if (!std::isfinite(val) || (val <= 0.0)) {
+            throw InvalidParameterValue("HYGOV h0 must be positive and finite");
+        }
+        h0 = val;
+    } else {
+        Governor::set(param, val, unitType);
+    }
+}
+
+double GovernorHygov::get(std::string_view param, units::unit unitType) const
+{
+    if ((param == "temporarydroop") || (param == "rtmp") || (param == "rtemp")) {
+        return temporaryDroop;
+    }
+    if ((param == "tr") || (param == "t_r") || (param == "t1")) {
+        return Tr;
+    }
+    if ((param == "tf") || (param == "t_f")) {
+        return Tf;
+    }
+    if ((param == "tg") || (param == "t_g")) {
+        return Tg;
+    }
+    if ((param == "velm") || (param == "velmax")) {
+        return VELM;
+    }
+    if ((param == "gmax") || (param == "gmin")) {
+        return (param == "gmax") ? Pmax : Pmin;
+    }
+    if ((param == "tw") || (param == "t_w")) {
+        return Tw;
+    }
+    if ((param == "at") || (param == "a_t")) {
+        return At;
+    }
+    if ((param == "dt") || (param == "dturb") || (param == "d_turb")) {
+        return Dturb;
+    }
+    if ((param == "qnl") || (param == "q_nl")) {
+        return qNL;
+    }
+    if ((param == "h0") || (param == "head0")) {
+        return h0;
+    }
+    if (param == "head") {
+        return turbineHead(m_state.data() + offsets.getDiffOffset(cLocalSolverMode));
+    }
+    return Governor::get(param, unitType);
+}
+
+stringVec GovernorHygov::localStateNames() const
+{
+    return {"pmech", "filter", "gate_position", "gate", "flow"};
+}
+
+index_t GovernorHygov::findIndex(std::string_view field, const SolverMode& sMode) const
+{
+    if ((field == "pm") || (field == "pmech")) {
+        return offsets.getAlgOffset(sMode) + pmechOutput;
+    }
+    if ((field == "filter") || (field == "lg")) {
+        return offsets.getDiffOffset(sMode) + filterState;
+    }
+    if ((field == "gate_position") || (field == "c") || (field == "gtpos")) {
+        return offsets.getDiffOffset(sMode) + gatePositionState;
+    }
+    if ((field == "gate") || (field == "g")) {
+        return offsets.getDiffOffset(sMode) + servoState;
+    }
+    if ((field == "flow") || (field == "q")) {
+        return offsets.getDiffOffset(sMode) + flowState;
+    }
+    if ((field == "head") || (field == "h")) {
+        return kInvalidLocation;
+    }
+    return kInvalidLocation;
+}
+// NOLINTEND(readability-math-missing-parentheses)
+}  // namespace griddyn::governors

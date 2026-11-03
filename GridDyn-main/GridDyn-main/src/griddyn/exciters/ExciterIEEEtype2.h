@@ -1,0 +1,59 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "ExciterIEEEtype1.h"
+#include <string>
+namespace griddyn::exciters {
+
+/** @brief IEEE Type 2 exciter
+ */
+class ExciterIEEEtype2: public ExciterIEEEtype1 {
+  protected:
+    double Tf2 = 1.0;  // [s]    stabilizer time constant
+  public:
+    explicit ExciterIEEEtype2(const std::string& objName = "exciterIEEEtype2_#");
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+    virtual void dynObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+    virtual void dynObjectInitializeB(const IOdata& inputs,
+                                      const IOdata& desiredOutput,
+                                      IOdata& fieldSet) override;
+
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+    virtual double get(std::string_view param,
+                       units::unit unitType = units::defunit) const override;
+
+    virtual stringVec localStateNames() const override;
+
+    virtual void residual(const IOdata& inputs,
+                          const StateData& stateData,
+                          double resid[],
+                          const SolverMode& sMode) override;
+    virtual void derivative(const IOdata& inputs,
+                            const StateData& stateData,
+                            double deriv[],
+                            const SolverMode& sMode) override;
+    virtual void jacobianElements(const IOdata& inputs,
+                                  const StateData& stateData,
+                                  MatrixData<double>& matrixData,
+                                  const IOlocs& inputLocs,
+                                  const SolverMode& sMode) override;
+
+    virtual void rootTest(const IOdata& inputs,
+                          const StateData& stateData,
+                          double roots[],
+                          const SolverMode& sMode) override;
+    virtual ChangeCode rootCheck(const IOdata& inputs,
+                                 const StateData& sD,
+                                 const SolverMode& sMode,
+                                 CheckLevel level) override;
+    // virtual void setTime(CoreTime time){prevTime=time;};
+};
+
+}  // namespace griddyn::exciters

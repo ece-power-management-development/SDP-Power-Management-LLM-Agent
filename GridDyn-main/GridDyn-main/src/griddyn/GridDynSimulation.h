@@ -1,0 +1,802 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+/**
+@file
+@brief define the simulation object itself and several helper classes and enumerations*/
+
+// header files
+#include "simulation/GridDynActions.h"
+#include "simulation/GridSimulation.h"
+// libraries
+#include "griddyn/griddyn-config.h"
+#include <functional>
+#include <memory>
+#include <queue>
+#include <string>
+#include <string_view>
+#include <vector>
+namespace griddyn {
+#define SINGLE (1)
+#define MULTICORE (2)
+#define MULTIPROCESSOR (3)
+
+#define STRINGIFY(x) #x
+
+class Contingency;
+class ContinuationSequence;
+class SolverInterface;
+class ParameterSet;
+class GridLoad;
+
+/** additional flags for the controlFlags bitset*/
+enum GridDynFlags {
+    DENSE_SOLVER = 31,
+    POWER_ADJUST_ENABLED = 32,
+    DC_FLOW_INITIALIZATION = 33,
+    PARALLEL_RESIDUAL_ENABLED = 34,
+    PARALLEL_JACOBIAN_ENABLED = 35,
+    PARALLEL_CONTINGENCY_ENABLED = 36,
+    MPI_CONTINGENCY_ENABLED = 37,
+    FIRST_RUN_LIMITS_ONLY = 38,
+    NO_RESET = 39,
+    VOLTAGE_CONSTRAINTS_FLAG = 40,
+    RECORD_ON_HALT_FLAG = 41,
+    DISABLE_AUTO_SLACK_BUS = 42,
+    DISABLE_AUTO_DISCONNECT = 43,
+    SINGLE_STEP_MODE = 44,
+    DC_MODE = 45,
+    FORCE_POWER_FLOW = 46,
+    POWER_FLOW_ONLY = 47,
+    NO_POWERFLOW_ADJUSTMENTS = 48,
+    SAVE_POWER_FLOW_DATA = 49,
+    NO_POWERFLOW_ERROR_RECOVERY = 50,
+    DAE_INITIALIZATION_FOR_PARTITIONED = 51,
+    FORCE_EXTRA_POWERFLOW = 52,
+    DROOP_POWER_FLOW = 53,
+    SAVE_POWER_FLOW_INPUT_DATA = 54,
+    POWER_FLOW_INPUT_SAVED = 55,
+    DISABLE_AUTOMATIC_LOAD_LOSS = 56,
+    IDA_INITIAL_CONDITION_DIAGNOSTICS = 57,
+    IDA_INITIAL_CONDITION_STOP_ON_FAILURE = 58,
+    IDA_INTEGRATION_DIAGNOSTICS_FLAG = 59,
+    DISABLE_STABILIZERS_FOR_DIAGNOSTICS = 60,
+    PARTITIONED_DIAGNOSTICS_FLAG = 61,
+};
+
+// for the status flags bitset
+
+// extra local flags
+enum GridDynExtraFlags {
+    DC_JAC_COMP_FLAG = OBJECT_FLAG6,
+    RESET_VOLTAGE_FLAG = OBJECT_FLAG7,
+    PREV_SETALL_PQVLIMIT = OBJECT_FLAG8,
+    INVALID_STATE_FLAG = OBJECT_FLAG9,
+    CHECK_RESET_VOLTAGE_FLAG = OBJECT_FLAG10,
+    POWERFLOW_SAVED = OBJECT_FLAG11,
+    LOW_BUS_VOLTAGE = OBJECT_FLAG12,
+};
+
+/** @brief helper structure for containing tolerances
+ */
+struct tolerances {
+    double voltageTolerance = 1e-7;  //!< tolerance on the voltage levels
+    double angleTolerance = 1e-8;  //!< tolerance on the angles
+    double defaultTolerance = 1e-8;  //!< default tolerance on all other variables
+    double toleranceRelaxationFactor = 1.0;  //!< relax the tolerances to help the solver
+    double rtol = 1e-6;  //!< the relative tolerance
+    CoreTime timeTol =
+        kSmallTime;  //!< the allowable time slop in events.  The time span below which the system
+    //! doesn't really care about
+};
+
+class Recorder;
+class Event;
+
+#define HANDLER_NO_RETURN (-500)
+
+enum class ContingencyMode;  // forward declare the enumeration
+/** @brief System-level simulation for power-system networks.
+ *
+ * Extends the general simulation engine with power-system network checks,
+ * steady-state power flow, dynamic initialization and execution, and the
+ * solver modes used by GridDyn. It also coordinates system-level operations
+ * such as load/generation balancing and event-driven actions.
+ */
+class GridDynSimulation: public GridSimulation {
+  public:
+    friend class powerFlowErrorRecovery;
+    friend class dynamicInitialConditionRecovery;
+    friend class faultResetRecovery;
+    //!< define various contingency modes  [probably will be changed in the near future]
+
+    /** @brief Selects the execution path used for a dynamic simulation.
+     *
+     * The setting selects the dynamic run method dispatched by the simulation:
+     * a coupled DAE solve, a partitioned algebraic/differential solve, or the
+     * decoupled dynamic method.
+     */
+    enum class DynamicSolverMethods {
+        DAE,  //!< Solve the coupled differential-algebraic system.
+        PARTITIONED,  //!< Use the partitioned algebraic and differential solver path.
+        DECOUPLED,  //!< Use the decoupled dynamic simulation path.
+    };
+
+    /** @brief Controls parallel evaluation of system residuals.
+     *
+     * Parallel evaluation requires GridDyn's internal OpenMP support. In AUTO
+     * mode, the simulation enables it for networks with at least 1,200 buses.
+     */
+    enum class ResidualParallelMode {
+        OFF,  //!< Evaluate residuals with one thread.
+        ON,  //!< Enable parallel residual evaluation when built with support.
+        AUTO,  //!< Enable parallel residual evaluation for sufficiently large networks.
+    };
+    /** @brief enumeration of ordering schemes for variables*/
+    enum class OffsetOrdering {
+        MIXED = 0,  //!< everything is MIXED through each other
+        GROUPED = 1,  //!< all similar variables are grouped together (angles, then voltage, then
+                      //!< algebraic, then
+        //! differential)
+        ALGEBRAIC_GROUPED = 2,  //!< all the algebraic variables are grouped, then the differential
+        VOLTAGE_FIRST = 3,  //!< grouped with the voltage coming first
+        ANGLE_FIRST = 4,  //!< grouped with the angle coming first
+        DIFFERENTIAL_FIRST = 5,  //!< differential and algebraic grouped with differential first
+
+    };
+
+  protected:
+    // storageSpace for SUNDIALS SolverInterface
+
+    std::bitset<64> controlFlags;  //!< storage container for user settable flags
+    // ---------------solution mode-------------
+    const SolverMode* defPowerFlowMode = &cPflowSolverMode;  //!< link to the default powerFlow mode
+    const SolverMode* defDAEMode = &cDaeSolverMode;  //!< link to the default DAE solver mode
+    const SolverMode* defDynAlgMode =
+        &cDynAlgSolverMode;  //!< link to the default algebraic solver mode
+    const SolverMode* defDynDiffMode =
+        &cDynDiffSolverMode;  //!< link to the default differential solver mode
+
+    DynamicSolverMethods defaultDynamicSolverMethod =
+        DynamicSolverMethods::DAE;  //!< specifies which dynamic solver method to use if it is not
+                                    //!< otherwise
+    //! specified.
+    OffsetOrdering default_ordering =
+        OffsetOrdering::MIXED;  //!< the default_ordering scheme for state variables
+    count_t max_Vadjust_iterations = 30;  //!< maximum number of Voltage adjust iterations
+    count_t max_Padjust_iterations = 15;  //!< maximum number of Power adjust iterations
+    count_t thread_count = 1;  //!< maximum thread count
+    count_t haltCount = 0;  //!< counter for the number of times the solver was halted
+    count_t residCount = 0;  //!< counter for the number of times the residual function was called
+    count_t evalCount = 0;  //!< counter for the number of times the algUpdateFunction was called
+    count_t partitionedAlgebraicCallCount = 0;  //!< counter for partitioned algebraic callbacks
+    count_t JacobianCallCount = 0;  //!< counter for the number of calls to the Jacobian function
+    count_t rootCount = 0;  //!< counter for the number of roots
+    count_t busCount = 0;  //!< counter for the number of buses
+    count_t linkCount = 0;  //!< counter for the number of links
+    count_t networkCount{0};  //!< number of islanded networks in the simulation
+    CoreTime probeStepTime = CoreTime(1e-3);  //!< initial step size
+    double powerAdjustThreshold = 0.01;  //!< tolerance on the power adjust step
+    CoreTime powerFlowStartTime =
+        negTime;  //!< power flow start time  if negTime then it computes based on start time;
+    struct tolerances tols;  //!< structure of the tolerances
+
+    std::string powerFlowFile;  //!< the power flow output file if any
+    std::string powerFlowInputFile;  //!< the power flow before solving the power flow
+    std::vector<std::shared_ptr<SolverInterface>> solverInterfaces;  //!< vector of solver data
+    std::vector<const double*>
+        extraStateInformation;  //!< a vector of additional state information for solveMode pairings
+    std::vector<const double*> extraDerivInformation;  //!< a vector of additional derivative
+                                                       //!< Information for SolverMode pairings
+    std::vector<GridComponent*>
+        singleStepObjects;  //!< objects which require a state update after time step
+    std::vector<GridBus*> slkBusses;  //!< vector of slack buses to aid in powerFlow adjust
+    std::queue<GridDynAction> actionQueue;  //!< queue for actions for GridDyn to execute
+    std::vector<std::shared_ptr<ContinuationSequence>>
+        continList;  //!< set of continuation sequences to run
+    std::vector<std::function<int()>>
+        additionalPowerflowSetupFunctions;  //!< set of additional operations to execute after the
+                                            //!< PflowInitializeA
+    //!< step
+    ResidualParallelMode residualParallelMode =
+        ResidualParallelMode::AUTO;  //!< Residual parallelism policy.
+    /** @brief Select the residual thread count from the configured policy and network size.
+     *
+     * When internal OpenMP support is available, AUTO mode enables parallel
+     * evaluation at 1,200 buses. The chosen count is bounded by the available
+     * OpenMP threads, one thread per roughly 300 buses, and a maximum of eight.
+     * Builds without internal OpenMP support use one residual thread.
+     */
+    void configureResidualParallelism();
+
+  public:
+    /** @ constructor to set the name
+    @param[in] objName the name of the simulation*/
+    explicit GridDynSimulation(const std::string& objName = "gridDynSim_#");
+    ~GridDynSimulation();
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+
+    /** @brief set a particular instantiation of the simulation object to be the master for various
+    purposes this function along with getInstance is used by external libraries to get particular
+    information about the simulation without needing to store a copy of the simulation pointer
+    @param[in] gds a pointer to the simulation intended to be the master*/
+    static void setInstance(GridDynSimulation* gds);
+
+    /** @brief get the master instance of a GridDynSimulation
+    @return a pointer to the master GridDynSimulation object*/
+    static GridDynSimulation* getInstance(void);
+
+    // simulation
+    /** @brief define an enumeration for the network check level*/
+    enum class NetworkCheckType : char {
+        FULL,  //!< a full network check
+        SIMPLIFIED  //!< a simplified version of the network check
+    };
+
+    /** @brief check the simulation network
+     function does checks for connectivity and make sure each subnet has a slack bus attached to it
+    @param[in] checkType  the type of network check to perform
+    @return in indicating success (0) or failure (non-zero)
+    */
+    int checkNetwork(NetworkCheckType checkType);
+
+    /** @brief check for any lines that have slipped angle and trip them
+    @return int indicating the number of lines that were tripped
+    */
+    int tripSlippedLines();
+
+    /** @brief do a rebalance operation on networks potentially do automatic load shedding
+    @return in indicating success (0) or failure (non-zero)
+    */
+    int rebalanceLoadGen();
+
+    /** @brief do a rebalance operation on networks potentially do automatic load shedding
+    @return true if some loadLoss was performed
+    */
+    bool doAutomaticLoadLoss();
+
+    /** @brief perform a power flow calculation
+  @return in indicating success (0) or failure (non-zero)*/
+    int powerflow();
+
+    /** @brief perform a sensitivity analysis
+     this function will likely be changing as the sensitivity analysis is more developed
+    */
+    void pFlowSensitivityAnalysis();
+
+    /** @brief perform a continuation power flow analysis
+    @param[in] contName the name of the continuation analysis to perform
+    @details this function will likely be changing as the continuation analysis develops further
+    */
+    void continuationPowerFlow(std::string_view contName);
+
+    /** @brief function to get the system constraints
+      constraints allowable are >0,  <0, >=0,  <=0
+    this is not used very often
+    @param[out] consData  the array to place the model constraint data
+    @param[in] sMode the solver mode corresponding to array locations in consData
+    */
+    void getConstraints(double consData[], const SolverMode& sMode) override;
+
+    /** @brief check if the system has any constraints
+     *@return true if there is constraints false if not
+     */
+    bool hasConstraints() const
+    {
+        return ((opFlags[HAS_CONSTRAINTS]) || (controlFlags[VOLTAGE_CONSTRAINTS_FLAG]));
+    }
+
+    /**@brief run the simulation until the specified time
+    @param[in] tEnd  the simulation time to stop defaults to the time given in system parameters
+    @return int indicating success (0) or failure (non-zero)*/
+    int run(CoreTime tEnd = negTime) override;
+
+    /**@brief initialize the simulation for power flow at the specified time
+    @param[in] time0 the time of the initialization default to 0
+    @return int indicating success (0) or failure (non-zero)*/
+    int pFlowInitialize(CoreTime time0 = negTime);
+
+    /**@brief step the simulation until the next event or stop point
+    @param[in] nextStep the maximum time to stop
+    @param[out] timeActual the actual time that was achieved
+    @return int indicating success (0) or failure (non-zero)*/
+    int step(CoreTime nextStep, CoreTime& timeActual);
+
+    /**@brief step the simulation until the next event or stop point
+    @param[out] timeActual the actual time that was achieved
+    @return int indicating success (0) or failure (non-zero)*/
+    int step(CoreTime& timeActual) { return step(getSimulationTime() + stepTime, timeActual); }
+
+    /**@brief step the simulation until the next event or stop point
+    @return int indicating success (0) or failure (non-zero)*/
+    int step() override;
+
+    /**@brief run powerFlow in event driven mode,  evaluate the power flow at every given event or
+    iteration time
+    @param[in] tEnd the stopping time for the simulation
+    @param[in] tStep  the step size (the maximum time between powerFlow evaluation is tStep
+    @return int indicating success (0) or failure (non-zero)*/
+    virtual int eventDrivenPowerflow(CoreTime tEnd = negTime, CoreTime tStep = negTime);
+
+    /** @brief execute a specific command
+    *@param[in] cmd  the command to execute
+    @return the return code from the execution (typically 0 upon success)
+    */
+    virtual int execute(std::string_view cmd);
+
+    /** @brief execute a specific command from a griddynAction
+    *@param[in] cmd  the command to execute as an action
+    @return the return code from the execution (typically 0 upon success)
+    */
+    virtual int execute(const GridDynAction& cmd);
+
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+
+    virtual double get(std::string_view param,
+                       units::unit unitType = units::defunit) const override;
+    virtual std::string getString(std::string_view param) const override;
+    virtual void setFlag(std::string_view flag, bool val = true) override;
+
+    /** @brief check an internal simulation control flag */
+    bool isFlagSet(GridDynFlags flag) const
+    {
+        return controlFlags.test(static_cast<std::size_t>(flag));
+    }
+
+    /** @brief get a vector of the states
+    @param[in]  sMode the SolverMode to get the states for
+    @return a vector containing the states
+    */
+    std::vector<double> getState(const SolverMode& sMode = cLocalSolverMode) const;
+    double getState(index_t offset) const override;
+
+    /** @brief get a particular state
+    @param[in] offset the offset of the state to grab
+    @param[in] sMode the SolverMode corresponding to the state to grab
+    @return the value of a particular state
+    */
+    double getState(index_t offset, const SolverMode& sMode) const;
+
+    // saving and loading data
+
+    // function used in initialization
+    /**@brief initialize the simulation for dynamic simulation at the specified time
+    @param[in] tStart the time of the initialization default to 0
+    @return int indicating success (0) or failure (non-zero)*/
+    int dynInitialize(CoreTime tStart = negTime);  // code can detect this default param and use a
+                                                   // previously specified start time
+    void alert(CoreObject* object, int code) override;
+
+    /** @brief function to count the number of MPI objects required for this simulation
+    @param[in] printInfo if set to true the information is printed to the console
+    @return the number of MPI objects
+    */
+    int countMpiObjects(bool printInfo = false) const;
+
+    /** @brief get the number of non-zeros in the most recent Jacobian calculation
+    @param[in] sMode the SolverMode to get the number of non-zeros for
+    @return the number of non-zero elements in the Jacobian
+    */
+    count_t nonZeros(const SolverMode& sMode) const;
+
+    /** @brief compute the network residuals
+      Computes the power-system residual \f$r(\hat{x},\hat{x}')=f(x,x)-f(\hat{x},\hat{x}')\f$
+      so that it approaches zero as \f$x=\hat{x}\f$.
+    @param[in] time  the simulation time of the evaluation
+    @param[in] state  the state information to evaluation
+    @param[in] dstateDt  the time derivative of the state
+    @param[out] resid the storage location for the residual function
+    @param[in] sMode the SolverMode to solve for
+    @return integer indicating success (0) or failure (non-zero)
+    */
+    int residualFunction(CoreTime time,
+                         const double state[],
+                         const double dstateDt[],
+                         double resid[],
+                         const SolverMode& sMode) noexcept;
+
+    /** @brief compute the derivatives for all differential states
+    @param[in] time  the simulation time of the evaluation
+    @param[in] state  the state information to evaluation
+    @param[out] dstateDt  the time derivative of the state
+    @param[in] sMode the SolverMode to solve for
+    @return integer indicating success (0) or failure (non-zero)
+    */
+    int derivativeFunction(CoreTime time,
+                           const double state[],
+                           double dstateDt[],
+                           const SolverMode& sMode) noexcept;
+
+    /** @brief compute an update to all algebraic states
+     Compute \f$x=f(\hat{x})\f$.
+    @param[in] time  the simulation time of the evaluation
+    @param[in] state  the state information to evaluation
+    @param[out] update  the updated state information
+    @param[in] sMode the SolverMode to solve for
+    @param[in] alpha a multiplication factor for updates that are expected to be iterative
+    @return integer indicating success (0) or failure (non-zero)
+    */
+    int algUpdateFunction(CoreTime time,
+                          const double state[],
+                          double update[],
+                          const SolverMode& sMode,
+                          double alpha) noexcept;
+
+    /** @brief compute the Jacobian of the residuals
+      Computes \f$\frac{\partial r}{\partial x}\f$ for all components of the residual.
+    @param[in] time  the simulation time of the evaluation
+    @param[in] state  the state information to evaluation
+    @param[in] dstateDt  the time derivative of the state
+    @param[out] matrixDataRef the MatrixData object to store the Jacobian information into
+    @param[in] cjValue the constant of integration for use in Jacobian elements using derivatives
+    @param[in] sMode the SolverMode to solve for
+    @return integer indicating success (0) or failure (non-zero)
+    */
+    int jacobianFunction(CoreTime time,
+                         const double state[],
+                         const double dstateDt[],
+                         MatrixData<double>& matrixDataRef,
+                         double cjValue,
+                         const SolverMode& sMode) noexcept;
+
+    /** @brief compute any root values
+      computes the roots for any root finding functions used in the system
+    @param[in] time  the simulation time of the evaluation
+    @param[in] state  the state information to evaluation
+    @param[in] dstateDt  the time derivative of the state
+    @param[out] roots the storage location for the roots
+    @param[in] sMode the SolverMode to solve for
+    @return integer indicating success (0) or failure (non-zero)
+    */
+    int rootFindingFunction(CoreTime time,
+                            const double state[],
+                            const double dstateDt[],
+                            double roots[],
+                            const SolverMode& sMode) noexcept;
+
+    /** @brief Approximate residual or derivative sensitivities to selected parameters.
+     *
+     * Evaluates the selected parameter operators at their supplied values, then
+     * perturbs each value by a forward step of 1e-7 and records the resulting
+     * finite-difference response in the output matrix. Parameter values are
+     * restored before returning.
+     * @param[in] time simulation time for the state evaluation.
+     * @param[in] parameterOperators parameter operators indexed by `indices`.
+     * @param[in] indices indices of the parameter operators to perturb.
+     * @param[in] values baseline values corresponding to `indices`.
+     * @param[in] parameterCount number of selected parameters in `indices` and `values`.
+     * @param[in] state state vector at `time`.
+     * @param[in] dstateDt time derivative of `state` for the selected solver mode.
+     * @param[out] matrixDataRef receives the finite-difference partial derivatives.
+     * @param[in] sMode solver mode that selects residual or differential evaluation.
+     */
+    void parameterDerivatives(CoreTime time,
+                              ParameterSet& parameterOperators,
+                              const index_t indices[],
+                              const double values[],
+                              count_t parameterCount,
+                              const double state[],
+                              const double dstateDt[],
+                              MatrixData<double>& matrixDataRef,
+                              const SolverMode& sMode);
+
+    /** @brief solve for the algebraic components of a system for use with the ode solvers
+@param[in] time  the simulation time of the evaluation
+@param[in] diffState  the current derivative information
+@param[in] deriv the current derivative information
+@param[in] sMode the SolverMode to solve related to the differential state information
+@return integer indicating success (0) or failure (non-zero)
+*/
+    int dynAlgebraicSolve(CoreTime time,
+                          const double diffState[],
+                          const double deriv[],
+                          const SolverMode& sMode) noexcept;
+
+    /**
+     * @brief Write an opt-in partitioned-solver diagnostic record.
+     *
+     * This bypasses the normal console logger so a callback trace is retained
+     * even when console logging is disabled while investigating a solver
+     * failure.
+     */
+    void partitionedDiagnostic(std::string_view message) const;
+
+    // SolverMode and SolverInterface search functions
+
+    /** @brief get the SolverMode dependent on a particular index of the solver data structure
+    @param[in] index the index into the SolverInterface storage array
+    @return the SolverMode named by the string or a blank one if none can be found
+    */
+    const SolverMode& getSolverMode(index_t index) const;
+
+    /** @brief get the SolverMode named by a string
+    @param[in] solverType the name of the SolverInterface to get the SolverMode for
+    @return the SolverMode named by the string or a blank one if none can be found
+    */
+    SolverMode getSolverMode(std::string_view solverType);
+
+    /** @brief get the SolverInterface referenced by a particular index into the SolverInterface
+  array
+  @param[in] index the index into the SolverInterface storage array
+  @return a shared pointer to a SolverInterface
+  */
+    std::shared_ptr<const SolverInterface> getSolverInterface(index_t index) const;
+
+    /** @brief get the SolverInterface referenced by a particular index into the SolverInterface
+    array
+    @param[in] index the index into the SolverInterface storage array
+    @return a shared pointer to a SolverInterface
+    */
+    std::shared_ptr<SolverInterface> getSolverInterface(index_t index);
+
+    /** @brief get a shared pointer to a SolverInterface object
+    @param[in] sMode the solver mode to get the residual information for
+    @return a shared pointer to an SolverInterface object
+    */
+    std::shared_ptr<const SolverInterface> getSolverInterface(const SolverMode& sMode) const;
+
+    /** @brief get a shared pointer to a SolverInterface object
+     non-const version that can create new SolverInterface objects if necessary
+    @param[in] sMode the solver mode to get the residual information for
+    @return a shared pointer to an SolverInterface object
+    */
+    std::shared_ptr<SolverInterface> getSolverInterface(const SolverMode& sMode);
+
+    /** @brief get the SolverInterface referenced by name
+    @param[in] solverName string representing the SolverInterface name,  can be customized name or a
+    particular type
+    @return a shared pointer to a SolverInterface
+    */
+    std::shared_ptr<SolverInterface> getSolverInterface(std::string_view solverName);
+
+    using GridSimulation::add;  // use the add functions from GridSimulation
+
+    /** @brief  add a SolverInterface object to the solverDat storage array
+    @param[in] nSolver the SolverInterface to add to the storage array
+  */
+    void add(std::shared_ptr<SolverInterface> nSolver);
+
+    /** @brief  add an action to the queue
+    @param[in] actionString a string containing the action to add
+    */
+    void add(std::string_view actionString);
+
+    /** @brief  add an action to the run queue
+    @param[in] newAction the action to add to the queue
+    */
+    void add(GridDynAction& newAction);
+
+    /** @brief enumeration of the solution modes of operation*/
+    enum class SolutionModes {
+        POWERFLOW_MODE,  //!< mode for power flow solutions
+        DAE_MODE,  //!< mode for DAE solutions
+        ALGEBRAIC_MODE,  //!< mode for algebraic solutions
+        DIFFERENTIAL_MODE,  //!< mode for differential equation solutions
+    };
+
+    /** @brief set the default solver for particular solution types to a specific solver
+    @param[in] mode  the solution mode to set the solver For
+    @param[in] sMode the SolverMode corresponding to a particular solver
+    */
+    void setDefaultMode(SolutionModes mode, const SolverMode& sMode);
+
+    /** @brief check if the simulation object has dynamic models
+     basically checks if there are any differential states in the default solution mode
+    */
+    bool hasDynamics() const;
+
+    /** @brief set a numeric parameter in a particular solver
+     finds a solver by name then calls the solver set function
+    @param[in] solverName  the name of the solver
+    @param[in] field the field to set on the solver
+    @param[in] val the value to the set the property to
+    */
+    virtual void solverSet(std::string_view solverName, std::string_view field, double val);
+
+    /** @brief set a string parameter in a particular solver
+     finds a solver by name then calls the solver set function
+    @param[in] solverName  the name of the solver
+    @param[in] field the field to set on the solver
+    @param[in] val the value to the set the property to
+    */
+    virtual void
+        solverSet(std::string_view solverName, std::string_view field, std::string_view val);
+
+    /** @brief get the current SolverMode from the simulation
+    @param[in] sMode  input SolverMode to check
+    @return if sMode is valid it returns that if not it finds the current active mode and returns a
+    reference to that
+    */
+    SolverMode getCurrentMode(const SolverMode& sMode = cEmptySolverMode) const;
+
+    /** @brief makes sure the SolverInterface object is ready to run solutions
+    @param[in] solver pointer to a solver to make ready
+    */
+    void getSolverReady(std::shared_ptr<SolverInterface>& solver);
+    /** @brief load a StateData object with extra state information if necessary
+    @param[in] stateDataRef the StateData object to load
+    @param[in] sMode the SolverMode of the state Data object
+    */
+    void fillExtraStateData(StateData& stateDataRef, const SolverMode& sMode) const;
+    /** @brief add an initialization function that will execute prior to the internal initialization
+    in HELICS
+    @param fptr a function object that returns an int.  if the value is non-zero it returns a
+    failure the initialization will halt
+    */
+    void addInitOperation(std::function<int()> fptr);
+
+  protected:
+    /** @brief makes sure the specified mode has the correct offsets
+    @param[in] sMode the SolverMode of the offsets to check
+    */
+    void checkOffsets(const SolverMode& sMode);
+
+    /** @brief get and update a SolverInterface object
+     the difference here is that the object may not exist, in which case it is created and loaded
+    with recent information from the models
+    @param[in] sMode the SolverMode to get the data for
+    @return a shared pointer to the SolverInterface object
+    */
+    std::shared_ptr<SolverInterface> updateSolver(const SolverMode& sMode);
+
+    /** @brief get a pointer to a SolverMode based on a string
+    @param[in] solverType the string representing the SolverMode, this can be a particular type of
+    SolverMode or the name of a solver
+    @return the SolverMode named by the string or a blank one if none can be found
+    */
+    const SolverMode* getSolverModePtr(std::string_view solverType) const;
+
+    /** @brief get a pointer to a SolverMode dependent on a particular index of the solver data
+    structure
+    @param[in] index the index into the SolverInterface storage array
+    @return the SolverMode named by the string or a blank one if none can be found
+    */
+    const SolverMode* getSolverModePtr(index_t index) const;
+
+    /** @brief reinitialize the power flow solver
+    @param[in] sMode the solver Mode to reinitialize
+    @param[in] change the adjustment mode
+    */
+    void reInitpFlow(const SolverMode& sMode, ChangeCode change = ChangeCode::NO_CHANGE);
+
+    /** @brief perform a global generator adjustment operation
+    @param[in] adjustment the amount of power to distribute to the allowed generators
+    @return true if any changes were made
+    */
+    virtual bool generatorAdjust(double adjustment);
+
+    /** @brief perform a load balance operation on the power system
+    @param[in] prevPower the previous total power output from slack bus generators
+    @param[in] prevSlkGen the specifics of the power output from each slackbus
+    @return true if any changes were made
+    */
+    virtual bool loadBalance(double prevPower, const std::vector<double>& prevSlkGen);
+
+    /** @brief update the offsets associated with a particular mode
+    @param[in] sMode the solver Mode to update the offsets for
+    */
+    virtual void updateOffsets(const SolverMode& sMode);
+
+    /** @brief make the simulator ready to perform a particular simulation
+    @param[in] desiredState the desired state
+    @param[in] sMode the SolverMode to make the operations in
+    @return FUNCTION_EXECUTION_SUCCESS(0) if successful negative number if not
+    */
+    int makeReady(GridState desiredState, const SolverMode& sMode);
+
+    /** @brief set the maximum number of non-zeros in the Jacobian
+    @param[in] sMode the solver mode to set the max number of non-zeros in the Jacobian
+    @param[in] nonZeros the size to set
+    */
+    void setMaxNonZeros(const SolverMode& sMode, count_t nonZeros);
+
+    /** @brief reinitialize the dynamic simulation
+    @param[in] sMode the solver mode to reinitialize
+    @return FUNCTION_EXECUTION_SUCCESS(0) if successful negative number if not
+    */
+    int reInitDyn(const SolverMode& sMode);
+
+    /** @brief execute a DAE simulation until the given stop time
+    @param[in] tStop the stop time for the simulation
+    @return FUNCTION_EXECUTION_SUCCESS(0) if successful negative number if not
+    */
+    virtual int dynamicDAE(CoreTime tStop);
+
+    /** @brief execute a partitioned dynamic simulation
+    @param[in] tStop the stop time for the simulation
+    @param[in] tStep the step interval (defaults to the step size parameter stored in the simulation
+   @return FUNCTION_EXECUTION_SUCCESS(0) if successful negative number if not
+    */
+    virtual int dynamicPartitioned(CoreTime tStop, CoreTime tStep = negTime);
+
+    /** @brief execute a decoupled dynamic simulation
+    @param[in] tStop the stop time for the simulation
+    @param[in] tStep the step interval (defaults to the step size parameter stored in the simulation
+   @return FUNCTION_EXECUTION_SUCCESS(0) if successful negative number if not
+    */
+    virtual int dynamicDecoupled(CoreTime tStop, CoreTime tStep = negTime);
+
+    /** @brief ensure that the simulation has consistent initial conditions for starting a dynamic
+    simulation
+    @param[in] sMode the solver mode for which to generate the initial conditions
+    @return FUNCTION_EXECUTION_SUCCESS(0) if successful negative number if not
+    */
+    int generateDaeDynamicInitialConditions(const SolverMode& sMode);
+
+    /** @brief Compute initial conditions for a partitioned dynamic simulation.
+     *
+     * Solves using the algebraic and differential modes supplied by the caller.
+     * @param[in] sModeAlg solver mode used for the algebraic portion.
+     * @param[in] sModeDiff solver mode used for the differential portion.
+     * @param[in] advanceTime when true, solve at the next probe time and advance the simulation
+     * time; when false, solve at the current simulation time.
+     * @return FUNCTION_EXECUTION_SUCCESS (0) on success; a negative status otherwise.
+     */
+    int generatePartitionedDynamicInitialConditions(const SolverMode& sModeAlg,
+                                                    const SolverMode& sModeDiff,
+                                                    bool advanceTime = true);
+
+    /** @brief load the offset codes for the objects
+    @param[in] sMode the SolverMode to setup the offsets for
+    @param[in] offsetOrdering the type of ordering to use
+    */
+    virtual void setupOffsets(const SolverMode& sMode, OffsetOrdering offsetOrdering);
+
+    /** @brief function to help with IDA solving steps
+    @param[in] retval the return code from the solver
+    @param[in] timeActual the actual time returned
+    @param[in] dynData the SolverInterface currently in use
+     */
+    void handleEarlySolverReturn(int retval,
+                                 CoreTime timeActual,
+                                 std::shared_ptr<SolverInterface>& dynData);
+
+    /** @brief reset the dynamic simulation
+     function checks for various conditions that cause specific things in the solver or simulation
+    to be reset the nature of the reset can be driven by the reset_code given as an argument or
+    internal flags from alerts or other mechanisms
+    @param[in] sMode the SolverMode to operate on
+    @param[in] change the optional change code that the reset should function to, otherwise
+    automatically detected
+    @return true if the check did something, false if nothing has changed
+    */
+    bool dynamicCheckAndReset(const SolverMode& sMode, ChangeCode change = ChangeCode::NO_CHANGE);
+
+    int handleStateChange(const SolverMode& sMode);
+    void handleRootChange(const SolverMode& sMode, std::shared_ptr<SolverInterface>& dynData);
+
+    int checkAlgebraicRoots(std::shared_ptr<SolverInterface>& dynData);
+    /** @brief checks events for events needing to run and runs them then checks if a reset is
+    needed if so it does so
+    @param[in] cTime the time to run the events
+    @param[in] sMode the SolverMode to run
+    @return true if the reset Function was run and did something
+    */
+    bool checkEventsForDynamicReset(CoreTime cTime, const SolverMode& sMode);
+
+  private:
+    void setupDynamicDAE();
+    void setupDynamicPartitioned();
+
+    int dynamicDAEStartupConditions(std::shared_ptr<SolverInterface>& dynData,
+                                    const SolverMode& sMode);
+    int dynamicPartitionedStartupConditions(std::shared_ptr<SolverInterface>& dynDataDiff,
+                                            std::shared_ptr<SolverInterface>& dynDataAlg,
+                                            const SolverMode& sModeDiff,
+                                            const SolverMode& sModeAlg);
+    int runDynamicSolverStep(std::shared_ptr<SolverInterface>& dynData,
+                             CoreTime nextStop,
+                             CoreTime& timeActual);
+
+    static std::atomic<GridDynSimulation*>
+        s_instance;  //!< static variable to set the master simulation instance
+};
+
+}  // namespace griddyn

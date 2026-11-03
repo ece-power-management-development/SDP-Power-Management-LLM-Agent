@@ -1,0 +1,203 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+/** @file
+define some functions and operations for configuring file reader operations and loading files
+*/
+#include "../griddyn/gridDynDefinitions.hpp"
+#include "ReaderInfo.h"
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace griddyn {
+class Event;
+class Recorder;
+
+class CoreObject;
+
+class GridDynSimulation;
+
+#define READER_VERBOSE_PRINT 3
+#define READER_NORMAL_PRINT 2
+#define READER_SUMMARY_PRINT 1
+#define READER_NO_PRINT 0
+
+#define READER_WARN_ALL 2
+#define READER_WARN_IMPORTANT 1
+#define READER_WARN_NONE 0
+/** namespace for configuring various options about filereaders such as xml or json*/
+namespace readerConfig {
+    extern int printMode;  //!< the print level
+    extern int warnMode;  //!< the warning mode
+    extern int warnCount;  //!< total count of the warnings
+    /** set the printMode to a particular level the higher the level the more gets printed*/
+    void setPrintMode(int level);
+    /** set the warning mode to a specific level*/
+    void setWarnMode(int level);
+    /** set the printMode via a string
+@details "none,summary,normal, verbose"*/
+    void setPrintMode(const std::string& level);
+    /** set the warning mode to a specific level via a string
+@details "none,important,normal"*/
+    void setWarnMode(const std::string& level);
+    /** set the case matching mode
+@details can be "exact,  capital, or any  capital checks a few possible matches for capitalization
+*/
+    void setDefaultMatchType(const std::string& matchType);
+    /** @brief enumeration describing how the matching should be done
+     */
+    enum class MatchType {
+        STRICT_CASE_MATCH,  //!< match only the cases given
+        CAPITAL_CASE_MATCH,  //!< match where the first letter can be either case, or all lower
+                             //!< case, or all capitals
+        ANY_CASE_MATCH,  //!< match where any letter can be any case
+
+    };
+
+    constexpr double PI = 3.141592653589793;
+    extern MatchType defMatchType;  //!< control for how names are matches in the xm
+}  // namespace readerConfig
+
+/** @brief defined flags for the ReaderInfo*/
+enum ReaderFlags {
+    IGNORE_STEP_UP_TRANSFORMER = 1,  //!< ignore any step up transformer definitions
+    ASSUME_POWERFLOW_ONLY =
+        4,  //!< specify that some object construction may assume it will never be used for dynamics
+    USE_BUS_VOLTAGE_TARGETS =
+        5,  //!< use the bus voltage specification instead of generator VG targets
+    NO_GENERATOR_BUS_VOLTAGE_RESET =
+        USE_BUS_VOLTAGE_TARGETS,  //!< legacy alias for USE_BUS_VOLTAGE_TARGETS
+
+};
+
+std::unique_ptr<GridDynSimulation> readSimXMLFile(const std::string& fileName,
+                                                  ReaderInfo* readerInfoPtr = nullptr);
+
+void addFlags(BasicReaderInfo& bri, const std::string& flags);
+
+void loadFile(std::unique_ptr<GridDynSimulation>& gds,
+              const std::string& fileName,
+              ReaderInfo* readerInf = nullptr,
+              const std::string& ext = "");
+
+void loadFile(CoreObject* parentObject,
+              const std::string& fileName,
+              ReaderInfo* readerInf = nullptr,
+              std::string ext = "");
+
+void loadGdz(CoreObject* parentObject, const std::string& fileName, ReaderInfo& ReaderInformation);
+
+void loadCdf(CoreObject* parentObject,
+             const std::string& fileName,
+             const BasicReaderInfo& readerOptions = defInfo);
+
+void loadPsp(CoreObject* parentObject,
+             const std::string& fileName,
+             const BasicReaderInfo& readerOptions = defInfo);
+void loadPti(CoreObject* parentObject,
+             const std::string& fileName,
+             const BasicReaderInfo& readerOptions = defInfo);
+
+void loadRaw(CoreObject* parentObject,
+             const std::string& fileName,
+             const BasicReaderInfo& readerOptions = defInfo);
+
+/** Import PowerWorld AUX static power-flow network DATA sections.
+ *  This can create a network or supplement one already loaded.
+ */
+void loadAux(CoreObject* parentObject,
+             const std::string& fileName,
+             const BasicReaderInfo& readerOptions = defInfo);
+
+/** Named PowerWorld object whose numeric ID can be referenced by other AUX rows. */
+struct AuxNamedRecord {
+    int mNumber = 0;
+    std::string mName;
+};
+
+struct AuxSubstationRecord {
+    int mNumber = 0;
+    std::string mName;
+    std::optional<double> mLatitude;
+    std::optional<double> mLongitude;
+};
+
+/** Geographic and organizational references from an AUX Bus row. */
+struct AuxBusMetadata {
+    int mBusNumber = 0;
+    int mAreaNumber = 0;
+    int mZoneNumber = 0;
+    int mOwnerNumber = 0;
+    int mSubstationNumber = 0;
+    int mBalancingAuthorityNumber = 0;
+    std::optional<double> mLatitude;
+    std::optional<double> mLongitude;
+};
+
+/** Metadata that does not have a direct GridDyn simulation object. */
+struct AuxCaseMetadata {
+    std::unordered_map<int, AuxNamedRecord> mOwners;
+    std::unordered_map<int, AuxNamedRecord> mZones;
+    std::unordered_map<int, AuxNamedRecord> mBalancingAuthorities;
+    std::unordered_map<int, AuxSubstationRecord> mSubstations;
+    std::unordered_map<int, AuxBusMetadata> mBuses;
+    std::vector<std::string> mSuperAreas;
+};
+
+/** Read PowerWorld case hierarchy and bus assignments without changing a simulation. */
+[[nodiscard]] AuxCaseMetadata readAuxCaseMetadata(const std::string& fileName);
+
+void loadDyr(CoreObject* parentObject,
+             const std::string& fileName,
+             const BasicReaderInfo& readerOptions = defInfo);
+void loadDyd(CoreObject* parentObject,
+             const std::string& fileName,
+             const BasicReaderInfo& readerOptions = defInfo);
+void loadEpc(CoreObject* parentObject,
+             const std::string& fileName,
+             const BasicReaderInfo& readerOptions = defInfo);
+void loadSav(CoreObject* parentObject,
+             const std::string& fileName,
+             const BasicReaderInfo& readerOptions = defInfo);
+
+// wrapper function to detect m file format for matpower or PSAT
+void loadMatlabFile(CoreObject* parentObject,
+                    const std::string& fileName,
+                    const BasicReaderInfo& readerOptions = defInfo);
+
+/** Export a static AC network as a PYPOWER version-2 Python case. */
+bool savePyPowerCase(const CoreObject* parentObject,
+                     const std::string& fileName,
+                     stringVec* warnings = nullptr);
+
+/** Export a static AC network as a MATPOWER version-2 case. */
+bool saveMatPowerCase(const CoreObject* parentObject,
+                      const std::string& fileName,
+                      stringVec* warnings = nullptr);
+
+void loadCsv(CoreObject* parentObject,
+             const std::string& fileName,
+             ReaderInfo& readerInformation,
+             const std::string& objectName = "");
+
+/** function sets a parameter in an object
+@param[in] label the name to be printed if there is a problem
+@param[in] obj  the object to change the parameter of
+@param[in] param a GridParameter definition
+@return 0 if successful (-1) if the setting failed
+*/
+int setObjectParameter(const std::string& label, CoreObject* obj, GridParameter& param) noexcept;
+
+void addToParent(CoreObject* objectToAdd, CoreObject* parentObject);
+/** @brief attempt to add to a parent object with renaming sequence*/
+void addToParentWithRename(CoreObject* objectToAdd, CoreObject* parentObject);
+
+}  // namespace griddyn

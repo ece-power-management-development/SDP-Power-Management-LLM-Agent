@@ -1,0 +1,257 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+// header files
+#include "../GridArea.h"
+#include "griddyn/griddyn-config.h"
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace helics {
+class Logger;
+class LoggerNoThread;
+}  // namespace helics
+
+namespace griddyn {
+class Link;
+class GridBus;
+
+#define SINGLE (1)
+#define MULTICORE (2)
+#define MULTIPROCESSOR (3)
+
+// define ERROR codes for the error state
+#define GS_NO_ERROR 0
+#define GS_FILE_LOAD_ERROR (-1)
+#define GS_INVALID_FILE_ERROR (-2)
+
+// define PRINT LEVELS
+
+class Collector;
+class Event;
+class Relay;
+class EventQueue;
+class EventAdapter;
+class FunctionEventAdapter;
+
+/** @brief Grid simulation object
+ GridSimulation is a base simulation class its intention is to handle some of the basic
+simulation bookkeeping tasks that would be common to all simulations in GridDyn including things
+like logging, errors,  recording, and a few other topics.  Doesn't really do anything much as far as
+simulating goes the class isn't abstract but it is intended to be built upon for more usable
+simulation objects
+*/
+class GridSimulation: public GridArea {
+  public:
+    std::string sourceFile;  //!< main source file name
+    /** @brief enumeration describing the state of the GridDyn simulation*/
+    enum class GridState : int {
+        HALTED = -2,  //!< the system is halted for some reason
+        GD_ERROR = -1,  //!< the system has an error
+        STARTUP = 0,  //!< the system is starting up either loaded or unloaded
+        INITIALIZED = 1,  //!< the system has completed a power flow initialization step and is
+                          //!< ready to proceed to
+        //! power flow calculations
+        POWERFLOW_COMPLETE = 2,  //!< the system has completed a power flow calculation successfully
+        DYNAMIC_INITIALIZED = 3,  //!< the system has completed a dynamic initialization step
+        DYNAMIC_COMPLETE =
+            4,  //!< the system has completed a dynamic system calculation and advanced to the
+        //! desired time successfully
+        DYNAMIC_PARTIAL = 5,  //!< the system has completed a dynamic system calculation but has not
+                              //!< reached the desired time
+    };
+    PrintLevel consolePrintLevel =
+        PrintLevel::SUMMARY;  //!< logging level for printing to the console
+    PrintLevel logPrintLevel =
+        PrintLevel::SUMMARY;  //!< logging level for saving to a file (if a file was specified)
+  protected:
+    std::string logFile;  //!< log file name
+
+    std::string stateFile;  //!< record file for the state
+    std::string recordDirectory;  //!< folder location for storing recorded files
+    std::string version;  //!< storage for the version string
+    CoreTime state_record_period = negTime;  //!< how often to record the state
+#ifdef ENABLE_MULTITHREADING
+    std::unique_ptr<helics::Logger> gridLog;  //!< the object that does the logging
+#else
+    std::unique_ptr<helics::LoggerNoThread> gridLog;  //!< the object that does the logging
+#endif
+    std::function<void(int, const std::string&)>
+        customLogger;  //!< callback for a custom logging function
+    std::shared_ptr<FunctionEventAdapter>
+        stateRecorder;  //!< a recorder for recording the state on a periodic basis
+    GridState pState =
+        GridState::STARTUP;  //!< the system state keeps track of which state the solver is in
+    int errorCode{
+        GS_NO_ERROR};  //!< for storage of an ERROR code if one exists (intended to be expandable to
+    //! children objects so using int instead of enum)
+    count_t alertCount = 0;  //!< count the number of alerts
+    count_t warnCount = 0;  //!<  count the number of warnings from objects
+    count_t errorCount = 0;  //!< count the number of logged warnings
+    // ---------------- clock ----------------
+
+    CoreTime startTime = timeZero;  //!< [s]  start time
+    CoreTime stopTime = 30.0;  //!< [s]  end time
+    CoreTime currentTime = timeZero;  //!< [s] the current time
+    std::atomic<CoreTime> simulationTime;  //!< [s]  current time
+    CoreTime stepTime = CoreTime(0.05);  //!< [s]  time step
+    CoreTime timeReturn = timeZero;  //!< [s]  time returned by the solver
+    CoreTime nextStopTime = negTime;  //!< next time to stop the dynamic Simulation
+
+    CoreTime minUpdateTime = CoreTime(0.0001);  //!< minimum time period to go between updates; for
+                                                //!< the hybrid simultaneous partitioned solution
+    CoreTime maxUpdateTime = maxTime;  //!<(s) max time period to go between updates
+    double absTime = 0;  //!< [s] seconds in unix time of the system start time;
+
+    // ---------------- recorders ----------------
+    CoreTime recordStart = negTime;  //!< [s]  recorder start time
+    CoreTime recordStop = maxTime;  //!< [s]  recorder stop time
+    std::vector<std::shared_ptr<Collector>> collectorList;  //!< vector storing recorder objects
+    CoreTime nextRecordTime = maxTime;  //!< time for the next set of recorders
+
+    CoreTime lastStateRecordTime = negTime;  //!< last time the full state was recorded
+
+    // ----------------timestepP -----------------
+    std::unique_ptr<EventQueue> EvQ;  //!< the event queue for the simulation system
+
+  public:
+    /** @brief constructor*/
+    explicit GridSimulation(const std::string& objName = "sim_#");
+
+    /** @brief destructor
+     */
+    ~GridSimulation();
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+
+    /** @brief get the current state of the simulation
+    @return the current state
+    */
+    GridState currentProcessState() const { return pState; }
+    /** @brief set the error code,  also sets the state to GD_ERROR
+    @param[in] ecode the error code
+    */
+    void setErrorCode(int ecode);
+    /** @brief get the current error code
+    @return the current error code
+    */
+    int getErrorCode() const { return errorCode; }
+
+    // add components
+    using GridArea::add;  // use the add function of GridArea
+    /** @brief function to add collectors to the system
+    @param[in] col the Collector to add into the simulation
+    */
+    virtual void add(std::shared_ptr<Collector> col);
+    /** @brief function to add events to the system
+    @param[in] evnt the event to add into the simulation
+    */
+    virtual void add(std::shared_ptr<Event> evnt);
+    /** @brief function to add a list of events to the system
+    @param[in] elist a vector of events to add in
+    */
+    virtual void add(const std::vector<std::shared_ptr<Event>>& elist);
+    /** @brief function to add an event Adapter to the event Queue
+    @param[in] eventAdapter the eventAdpater to add
+    */
+    virtual void add(std::shared_ptr<EventAdapter> eventAdapter);
+
+    // TODO(phlpt): Recheck whether this function is actually needed.
+    /** @brief reset all object counters to 0*/
+    static void resetObjectCounters();
+
+    /** @brief function to find a specific Collector by name
+    @param[in] collectorName  the name of the recorder to find
+    @return a shared_ptr to the recorder that was found or an empty shared ptr*/
+    std::shared_ptr<Collector> findCollector(const std::string& collectorName);
+    /** @brief get all collectors owned by the simulation */
+    const std::vector<std::shared_ptr<Collector>>& getCollectors() const { return collectorList; }
+    /** @brief get all the objects from the event Queue */
+    void getEventObjects(std::vector<CoreObject*>& objV) const;
+
+    virtual void timestep(CoreTime time, const IOdata& inputs, const SolverMode& sMode) override;
+    /** @brief run the simulator
+    @param[in] finishTime  the time to run to
+    @return return code 0 for success other for failure
+    */
+    virtual int run(CoreTime finishTime = negTime);
+    /** @brief have the simulator step forward in time
+    @return return code 0 for success other for failure
+    */
+    virtual int step();
+
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+
+    virtual std::string getString(std::string_view param) const override;
+    virtual double get(std::string_view param,
+                       units::unit unitType = units::defunit) const override;
+
+    void alert(CoreObject* object, int code) override;
+    virtual void log(CoreObject* object, PrintLevel level, const std::string& message) override;
+    virtual bool shouldLog(PrintLevel level) const override;
+
+    /** @brief save all the recorder data to files
+     all the recorders have files associated with them that get automatically saved at certain
+    points this function forces them to do a save operation*/
+    void saveRecorders();
+
+    /**
+     * @brief Gets the current simulation time.
+     @details currentTime is atomic and can be used in a multithreaded context to observe the
+     current progress of an asyncrhonously running dynamic simulation
+     * @return a CoreTime representing the current simulation time.
+
+     */
+    CoreTime getSimulationTime() const { return currentTime; }
+
+    /**
+     * @brief Gets the simulation start time.
+     * @return a double representing the simulation start time, in seconds.
+     */
+    CoreTime getStartTime() const { return startTime; }
+    /**
+     * @brief Gets the simulation stop time.
+     * @return a double representing the simulation start time, in seconds.
+     */
+    CoreTime getStopTime() const { return stopTime; }
+    /**
+     * @brief Gets the simulation step time.
+     * @return a time representing the simulation start time, in seconds.
+     */
+    CoreTime getStepTime() const { return stepTime; }
+
+    /**
+     * @brief gets the next event time.
+     * @return a double representing the next scheduled event in GridDyn.
+     */
+    CoreTime getEventTime() const;
+    /**
+     * @brief gets the next event time.
+     * @param[in] eventCode a code corresponding to a specific type of event
+     * @return a time representing the next scheduled event in GridDyn.
+     */
+    CoreTime getEventTime(int eventCode) const;
+
+    /** set a custom logging function
+     */
+    void setLogger(std::function<void(int, const std::string&)> loggingFunction);
+};
+
+/** @brief find an object that has the same properties as obj1 located int the tree from src in the
+tree given by sec
+@param[in] obj1  the object to search for
+@param[in] src  the tree the current object is associated with
+@param[in] sec the tree to do the search in
+@return the located object or nullptr
+*/
+CoreObject* findMatchingObject(CoreObject* obj1, GridPrimary* src, GridPrimary* sec);
+
+}  // namespace griddyn

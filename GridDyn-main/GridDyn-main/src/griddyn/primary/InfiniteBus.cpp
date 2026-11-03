@@ -1,0 +1,126 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+// headers
+#include "InfiniteBus.h"
+
+#include "../Link.h"
+#include "core/CoreExceptions.h"
+#include "core/CoreObjectTemplates.hpp"
+#include <string>
+
+namespace griddyn {
+using units::convert;
+using units::puHz;
+using units::puV;
+using units::unit;
+
+infiniteBus::infiniteBus(const std::string& objName): GridBus(objName)
+{
+    // default values
+    type = BusType::SLK;
+    dynType = DynBusType::DYN_SLK;
+}
+
+infiniteBus::infiniteBus(double startVoltage, double startAngle, const std::string& objName):
+    GridBus(startVoltage, startAngle, objName)
+{
+    type = BusType::SLK;
+    dynType = DynBusType::DYN_SLK;
+}
+
+CoreObject* infiniteBus::clone(CoreObject* obj) const
+{
+    auto nobj = cloneBase<infiniteBus, GridBus>(this, obj);
+    if (nobj == nullptr) {
+        return obj;
+    }
+    nobj->dvdt = dvdt;
+    nobj->dfdt = dfdt;
+    return nobj;
+}
+
+void infiniteBus::updateVoltageAngle(CoreTime time)
+{
+    auto dt = static_cast<double>(time - prevTime);
+
+    angle += 2.0 * kPI * dt * (dfdt / 2.0 + (freq - 1.0));
+    freq += dfdt * dt;
+    voltage += dvdt * dt;
+}
+
+void infiniteBus::timestep(CoreTime time, const IOdata& inputs, const SolverMode& sMode)
+{
+    updateVoltageAngle(time);
+    GridBus::timestep(time, inputs, sMode);
+}
+
+void infiniteBus::setState(CoreTime time,
+                           const double state[],
+                           const double dstate_dt[],
+                           const SolverMode& sMode)
+{
+    updateVoltageAngle(time);
+    GridBus::setState(time, state, dstate_dt, sMode);
+}
+
+// set properties
+void infiniteBus::set(std::string_view param, std::string_view val)
+{
+    if (param == "type") {
+        if (val != "infinite") {
+            throw(InvalidParameterValue(std::string{param} + ':' + std::string{val}));
+        }
+    } else {
+        GridBus::set(param, val);
+    }
+}
+
+void infiniteBus::set(std::string_view param, double val, unit unitType)
+{
+    if (param == "dvdt") {
+        dvdt = convert(val, unitType, puV, systemBasePower, localBaseVoltage);
+    } else if (param == "dfdt") {
+        dfdt = convert(val, unitType, puHz, systemBaseFrequency);
+    } else {
+        GridBus::set(param, val, unitType);
+    }
+}
+
+double infiniteBus::getVoltage(const double /*state*/[], const SolverMode& /*sMode*/) const
+{
+    return voltage;
+}
+
+double infiniteBus::getAngle(const double /*state*/[], const SolverMode& /*sMode*/) const
+{
+    return angle;
+}
+
+double infiniteBus::getVoltage(const StateData& sD, const SolverMode& /*sMode*/) const
+{
+    const double dt = (!sD.empty()) ? static_cast<double>(sD.time - prevTime) : 0.0;
+    return voltage + dt * dvdt;
+}
+
+double infiniteBus::getAngle(const StateData& sD, const SolverMode& /*sMode*/) const
+{
+    const double dt = (!sD.empty()) ? static_cast<double>(sD.time - prevTime) : 0.0;
+    return angle + 2 * kPI * (dt * ((freq - 1.0) + dfdt / 2));
+}
+
+double infiniteBus::getFreq(const StateData& sD, const SolverMode& /*sMode*/) const
+{
+    double dt = (!sD.empty()) ? static_cast<double>(sD.time - prevTime) : 0.0;
+    return freq + dt * dfdt;
+}
+
+bool infiniteBus::checkCapable()
+{
+    return true;
+}
+
+}  // namespace griddyn

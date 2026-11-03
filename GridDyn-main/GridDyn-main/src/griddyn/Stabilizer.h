@@ -1,0 +1,64 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "GridSubModel.h"
+#include <string>
+#include <vector>
+
+namespace griddyn {
+inline constexpr int pssOmegaInLocation = 0;
+inline constexpr int pssVoltageInLocation = 1;
+inline constexpr int pssPmechInLocation = 2;
+inline constexpr int pssElectricalPowerInLocation = 3;
+inline constexpr count_t pssInputCount = 4;
+
+class Stabilizer: public GridSubModel {
+  public:
+  protected:
+    double mp_Tw;
+    double mp_Teps;
+    double mp_Kw;
+    double mp_Kp;
+    double mp_Kv;
+    double mp_Smax;
+    double mp_Smin;
+
+  public:
+    explicit Stabilizer(const std::string& objName = "pss_#");
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+    virtual ~Stabilizer();
+    virtual void dynObjectInitializeB(const IOdata& inputs,
+                                      const IOdata& desiredOutput,
+                                      IOdata& fieldSet) override;
+
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+
+    virtual void residual(const IOdata& inputs,
+                          const StateData& sD,
+                          double resid[],
+                          const SolverMode& sMode) override;
+    virtual void jacobianElements(const IOdata& inputs,
+                                  const StateData& sD,
+                                  MatrixData<double>& md,
+                                  const IOlocs& inputLocs,
+                                  const SolverMode& sMode) override;
+
+    virtual void derivative(const IOdata& inputs,
+                            const StateData& sD,
+                            double deriv[],
+                            const SolverMode& sMode) override;
+
+    virtual const std::vector<stringVec>& inputNames() const override;
+    virtual const std::vector<stringVec>& outputNames() const override;
+
+    virtual index_t findIndex(std::string_view field, const SolverMode& sMode) const override;
+};
+
+}  // namespace griddyn

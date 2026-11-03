@@ -1,0 +1,140 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "ControllerSignals.h"
+#include "GridSubModel.h"
+#include "units/units_decl.hpp"
+#include <string>
+#include <string_view>
+#include <vector>
+namespace griddyn {
+class Generator;
+/** @brief the exciter class defines the interface for power grid exciters and implements a very
+ * simple version of such a device
+ */
+
+inline constexpr int exciterVoltageInLocation = 0;
+inline constexpr int exciterVsetInLocation = 1;
+inline constexpr int exciterPmechInLocation = 2;
+inline constexpr int exciterOmegaInLocation = 3;
+inline constexpr int exciterMachineSignalBase = 4;
+inline constexpr int exciterIdInLocation =
+    exciterMachineSignalBase + static_cast<int>(MachineControllerSignal::ID);
+inline constexpr int exciterIqInLocation =
+    exciterMachineSignalBase + static_cast<int>(MachineControllerSignal::IQ);
+inline constexpr int exciterVdInLocation =
+    exciterMachineSignalBase + static_cast<int>(MachineControllerSignal::VD);
+inline constexpr int exciterVqInLocation =
+    exciterMachineSignalBase + static_cast<int>(MachineControllerSignal::VQ);
+inline constexpr int exciterElectricalPowerInLocation =
+    exciterMachineSignalBase + static_cast<int>(MachineControllerSignal::ELECTRICAL_POWER);
+inline constexpr int exciterElectricalTorqueInLocation =
+    exciterMachineSignalBase + static_cast<int>(MachineControllerSignal::ELECTRICAL_TORQUE);
+inline constexpr int exciterXadIfdInLocation =
+    exciterMachineSignalBase + static_cast<int>(MachineControllerSignal::XADIFD);
+inline constexpr int exciterVssInLocation = exciterMachineSignalBase + machineControllerSignalCount;
+inline constexpr int exciterVuelInLocation = exciterVssInLocation + 1;
+inline constexpr int exciterVoelInLocation = exciterVuelInLocation + 1;
+inline constexpr count_t exciterInputCount = exciterVoelInLocation + 1;
+
+enum class ExciterLimiterSignal { UNDER, OVER };
+
+/** class defining the interface for an exciter as well a trivial implementation of such
+ */
+class Exciter: public GridSubModel {
+  public:
+    enum ExciterFlags {
+        OUTSIDE_VOLTAGE_LIMITS = OBJECT_FLAG3,
+        TRIGGER_HIGH = OBJECT_FLAG4,
+    };
+
+  protected:
+    // model_parameter Vrmin = -5.1;  //!< [pu] lower voltage limit
+    model_parameter Vrmin{-5.1};  //!< [pu] lower voltage limit
+    model_parameter Vrmax = 6;  //!< [pu] upper voltage limit
+    model_parameter Vref = 1.0;  //!< [pu] reference voltage for voltage regulator
+    model_parameter Ka = 10;  //!< [pu] amplifier gain
+    model_parameter Ta = 0.004;  //!< [s]    amplifier time constant
+    model_parameter vBias = 0.0;  //!< bias field level for adjusting the field output so the ref
+                                  //!< can remain at some nominal level
+    int limitState = 0;  //!< indicator of which state has the limits applied
+    bool strictInitialLimitChecking = false;  //!< reject initial outputs above upper limits
+  public:
+    /** @brief constructor*/
+    explicit Exciter(const std::string& objName = "exciter_#");
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+
+    virtual void dynObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+    virtual void dynObjectInitializeB(const IOdata& inputs,
+                                      const IOdata& desiredOutput,
+                                      IOdata& fieldSet) override;
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+
+    virtual stringVec localStateNames() const override;
+
+    virtual void residual(const IOdata& inputs,
+                          const StateData& stateData,
+                          double resid[],
+                          const SolverMode& SolverMode) override;
+    virtual void derivative(const IOdata& inputs,
+                            const StateData& stateData,
+                            double deriv[],
+                            const SolverMode& SolverMode) override;
+    virtual void jacobianElements(const IOdata& inputs,
+                                  const StateData& stateData,
+                                  MatrixData<double>& matrix,
+                                  const IOlocs& inputLocs,
+                                  const SolverMode& SolverMode) override;
+    // handle the rootfinding functions
+    virtual void rootTest(const IOdata& inputs,
+                          const StateData& stateData,
+                          double root[],
+                          const SolverMode& SolverMode) override;
+    virtual void rootTrigger(CoreTime time,
+                             const IOdata& inputs,
+                             const std::vector<int>& rootMask,
+                             const SolverMode& SolverMode) override;
+    virtual ChangeCode rootCheck(const IOdata& inputs,
+                                 const StateData& stateData,
+                                 const SolverMode& SolverMode,
+                                 CheckLevel level) override;
+
+    // virtual void setTime(CoreTime time){prevTime=time;};
+    virtual const std::vector<stringVec>& inputNames() const override;
+    virtual const std::vector<stringVec>& outputNames() const override;
+    /** Whether this exciter implements the named external limiter action. */
+    virtual bool supportsLimiterSignal(ExciterLimiterSignal signal) const;
+
+  protected:
+    // Keep limiter roots outside the solver's near-zero band at an exactly
+    // initialized bound. Individual models may use a larger margin when their
+    // input gain amplifies terminal-voltage noise.
+    static constexpr double limiterRootTolerance = 2e-6;
+    /** Configure the initial exciter-limit policy from simulation flags. */
+    void setInitialLimitPolicy(std::uint32_t flags);
+
+    /**
+     * Check an initialized value against an exciter upper limit.
+     *
+     * The default policy raises the supplied upper limit above an exceeded
+     * initialized value by the larger requested headroom and emits a warning.
+     * Callers that omit headroom retain the exact-value adjustment. Strict initialization returns
+     * false so the caller can retain its model-specific initialization error.
+     */
+    bool adjustInitialUpperLimit(double initialValue,
+                                 double& upperLimit,
+                                 std::string_view limitName,
+                                 double fractionalHeadroom = 0.0,
+                                 double minimumHeadroom = 0.0);
+
+    void checkForLimits();
+};
+
+}  // namespace griddyn

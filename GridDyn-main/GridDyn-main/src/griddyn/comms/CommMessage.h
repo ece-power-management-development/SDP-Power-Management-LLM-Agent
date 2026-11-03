@@ -1,0 +1,370 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "../gridDynDefinitions.hpp"
+#include <cereal/archives/portable_binary.hpp>
+#include <cereal/types/polymorphic.hpp>
+#include <cereal/types/vector.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+// #include <cereal/archives/json.hpp>
+
+namespace griddyn {
+struct CommMessageStringHash {
+    using is_transparent = void;
+
+    std::size_t operator()(std::string_view value) const noexcept
+    {
+        return std::hash<std::string_view>{}(value);
+    }
+};
+
+class CommPayload {
+  public:
+    virtual ~CommPayload() = default;
+
+    template<class Archive>
+    void serialize(Archive& /*ar*/)
+    {
+    }
+    virtual std::string to_string(uint32_t type, uint32_t code) const = 0;
+    virtual void from_string(uint32_t type,
+                             uint32_t code,
+                             std::string_view fromString,
+                             size_t offset = 0) = 0;
+};
+
+#define BASE_RELAY_MESSAGE_NUMBER 400
+
+/** basic message class */
+class CommMessage {
+  public:
+    /** define the most basic of message types*/
+    enum CommMessageType : std::uint32_t {
+        IGNORE_MESSAGE_TYPE = 0,  //!< a message that can be ignored
+        PING_MESSAGE_TYPE = 1,  //!< a message sending a ping
+        REPLY_MESSAGE_TYPE = 2,  //!< a message responding to a ping
+        UNKNOWN_MESSAGE_TYPE = 0xFFFFFFFF,  //!< I don't know what this message means
+    };
+    enum RelayMessageType : std::uint32_t {
+        NO_EVENT = BASE_RELAY_MESSAGE_NUMBER,
+        LOCAL_FAULT_EVENT = BASE_RELAY_MESSAGE_NUMBER + 3,
+        REMOTE_FAULT_EVENT = BASE_RELAY_MESSAGE_NUMBER + 4,
+        BREAKER_TRIP_EVENT = BASE_RELAY_MESSAGE_NUMBER + 5,
+        BREAKER_CLOSE_EVENT = BASE_RELAY_MESSAGE_NUMBER + 6,
+        LOCAL_FAULT_CLEARED = BASE_RELAY_MESSAGE_NUMBER + 7,
+        REMOTE_FAULT_CLEARED = BASE_RELAY_MESSAGE_NUMBER + 8,
+        BREAKER_TRIP_COMMAND = BASE_RELAY_MESSAGE_NUMBER + 9,
+        BREAKER_CLOSE_COMMAND = BASE_RELAY_MESSAGE_NUMBER + 10,
+        BREAKER_OOS_COMMAND = BASE_RELAY_MESSAGE_NUMBER + 11,
+        ALARM_TRIGGER_EVENT = BASE_RELAY_MESSAGE_NUMBER + 12,
+        ALARM_CLEARED_EVENT = BASE_RELAY_MESSAGE_NUMBER + 13,
+    };
+
+    /**constructor from a message type */
+    CommMessage() = default;
+    explicit CommMessage(std::uint32_t type);
+    CommMessage(std::uint32_t type, std::uint32_t code);
+    /** get the message type*/
+    std::uint32_t getMessageType() const { return m_messageType; }
+    /** explicitly set the message type of a message object*/
+    void setMessageType(std::uint32_t type) { m_messageType = type; }
+
+    template<class payLoadType>
+    payLoadType* getPayload()
+    {
+        switch (ptype) {
+            case PayloadType::none:
+            default:
+                return nullptr;
+            case PayloadType::shared:
+                return (payload) ? dynamic_cast<payLoadType*>(payload.get()) : nullptr;
+            case PayloadType::vector:
+                return reinterpret_cast<payLoadType*>(payload_V.data());
+            case PayloadType::raw:
+                return reinterpret_cast<payLoadType*>(payloadData);
+        }
+    }
+
+    auto getPayloadPointer() { return payload; }
+
+    void setPayload(std::shared_ptr<CommPayload> ptr)
+    {
+        ptype = (ptr) ? PayloadType::shared : PayloadType::none;
+        payload = std::move(ptr);
+    }
+    void setPayload(const std::vector<char>& vec)
+    {
+        payload_V = vec;
+        ptype = PayloadType::vector;
+    }
+    void setPayload(std::vector<char>&& vec)
+    {
+        payload_V = std::move(vec);
+        ptype = PayloadType::vector;
+    }
+    void setPayload(void* data, size_t dsize)
+    {
+        payloadData = data;
+        payloadSize = dsize;
+        if ((data == nullptr) || (dsize == 0)) {
+            ptype = PayloadType::none;
+        } else {
+            ptype = PayloadType::raw;
+        }
+    }
+    /** generate a string describing the message*/
+    std::string to_string() const;
+    /** load a message definition from a string*/
+    void from_string(std::string_view fromString);
+
+    /** convert a command to a raw data bytes
+    @param[out] data pointer to memory to store the command
+    @param[in] bufferSize the size of the buffer
+    @return the size of the buffer actually used
+    */
+    int toByteArray(char* data, size_t bufferSize) const;
+    /** convert to a data string using a reference*/
+    void toDataString(std::string& data) const;
+    /** convert to a data string
+    @details a data string is a string containing raw data*/
+    std::string toDataString() const;
+    /** convert to a byte vector using a reference*/
+    void toVector(std::vector<char>& data) const;
+    /** convert a command to a byte vector*/
+    std::vector<char> toVector() const;
+    /** generate a command from a raw data stream*/
+    void fromByteArray(const char* data, size_t bufferSize);
+    /** read a command from a string*/
+    void fromDataString(std::string_view data);
+    /** read a command from a char vector*/
+    void fromVector(const std::vector<char>& data);
+
+  private:
+    std::uint32_t m_messageType = IGNORE_MESSAGE_TYPE;  //!< the actual type of the message
+  public:
+    std::uint32_t code = 0xFFFFFFFF;
+
+  private:
+    enum class PayloadType : uint8_t { none = 0, shared = 1, vector = 2, raw = 3 };
+    PayloadType ptype = PayloadType::none;
+    std::shared_ptr<CommPayload> payload;
+    void* payloadData = nullptr;  //!< blob pointer for payload data
+    size_t payloadSize = 0;  //!< blob size;
+    std::vector<char> payload_V;  // payload as a vector
+  public:
+    template<class Archive>
+    void save(Archive& ar) const
+    {
+        ar(m_messageType, code);
+        ar(static_cast<uint8_t>(ptype));
+        switch (ptype) {
+            case PayloadType::none:
+                break;
+            case PayloadType::shared:
+                ar(payload);
+                break;
+            case PayloadType::vector:
+                ar(payload_V);
+                break;
+            case PayloadType::raw:
+                // Save number of chars + the data
+                ar(cereal::make_size_tag(payloadSize));
+                if (payloadData != nullptr) {
+                    ar(cereal::binary_data(payloadData, payloadSize));
+                }
+        }
+    }
+    template<class Archive>
+    void load(Archive& ar)
+    {
+        ar(m_messageType, code);
+        uint8_t type;
+        ar(type);
+        ptype = static_cast<PayloadType>(type);
+        switch (ptype) {
+            case PayloadType::none:
+                break;
+            case PayloadType::shared:
+                ar(payload);
+                break;
+            case PayloadType::vector:
+                ar(payload_V);
+                break;
+            case PayloadType::raw:
+                // Save to the vector
+                size_t size;
+                ar(cereal::make_size_tag(size));
+                payload_V.resize(static_cast<std::size_t>(size));
+                ar(cereal::binary_data(payload_V.data(), size));
+        }
+    }
+};
+
+// defining a number of alarm codes
+enum AlarmCode {
+    OVERCURRENT_ALARM = 101,
+    UNDERCURRENT_ALARM = 102,
+    OVERVOLTAGE_ALARM = 111,
+    UNDERVOLTAGE_ALARM = 112,
+    TEMPERATURE_ALARM1 = 201,
+    TEMPERATURE_ALARM2 = 202,
+    UNDERFREQUENCY_ALARM = 301,
+    OVERFREQUENCY_ALARM = 303,
+
+};
+
+std::uint32_t getAlarmCode(std::string_view alarmStr);
+
+// component factory is a template class that inherits from cFactory to actually to the construction
+// of a specific object
+
+class MessageTypeRegistry {
+  public:
+    /** destructor*/
+    ~MessageTypeRegistry() = default;
+    /** get a pointer to the underlying factory*/
+    static MessageTypeRegistry& instance();
+    /** insert a factory in the coreMessageFactory
+    @param[in] name the string used to find the message factory in subsequent operations
+    @param[in] type the message type to store in the registry*/
+    void registerType(std::string_view name, std::uint32_t type);
+
+    uint32_t getType(std::string_view name) const;
+    std::string getTypeString(int32_t type) const;
+
+  private:
+    /** private constructor defined in a singleton class*/
+    MessageTypeRegistry() = default;
+
+    std::unordered_map<std::string, uint32_t, CommMessageStringHash, std::equal_to<>>
+        typeMapA;  //!< the map of the strings and types
+    std::unordered_map<uint32_t, std::string> typeMapB;  //!< the map of the strings and types
+};
+
+class TypeRegister {
+  private:
+    std::uint32_t type_;
+
+  public:
+    TypeRegister(std::string_view name, std::uint32_t type): type_(type)
+    {
+        MessageTypeRegistry::instance().registerType(name, type);
+    };
+    // implicit conversion
+    operator uint32_t() { return type_; }
+};
+
+/** macro used to register types with the type registry*/
+#define REGISTER_MESSAGE_TYPE(name, namestr, type) static const TypeRegister name(namestr, type)
+
+/** class definitions for the message factories that can create the message
+messageFactory is a virtual base class for message Construction functions
+*/
+class PayloadFactory {
+  public:
+    std::string name;  //!< the name of the factory
+    /** constructor taking the name as an argument*/
+    explicit PayloadFactory(std::string_view typeName): name(typeName) {}
+    /** virtual destructor*/
+    virtual ~PayloadFactory() = default;
+
+    /** build a default message*/
+    virtual std::shared_ptr<CommPayload> makePayload() = 0;
+    /** check if a given message type is within the valid range of a specific message object*/
+    virtual bool inRange(std::uint32_t) const { return true; }
+
+    virtual std::uint32_t range() const
+    {
+        return 0xFFFFFFF0;
+    }  // return a very big range but leave a little room for special message codes
+};
+
+// TODO(phlpt): Merge with the coreTypeFactory and related templates if the extra message-specific
+// functions required create a high level object factory for the coreMessageFactory class
+typedef std::unordered_map<std::string, PayloadFactory*, CommMessageStringHash, std::equal_to<>>
+    mfMap;
+/** core message factory class for building messages of a specified type
+ */
+class CorePayloadFactory {
+  public:
+    /** destructor*/
+    ~CorePayloadFactory() = default;
+    /** get a pointer to the underlying factory*/
+    static CorePayloadFactory& instance();
+    /** insert a factory in the coreMessageFactory
+    @param[in] name the string used to find the message factory in subsequent operations
+    @param[in] messageFactory pointer to a message factory to store in the core factory*/
+    void registerFactory(std::string_view name, PayloadFactory* messageFactory);
+    /** insert a factory in the coreMessageFactory
+    @param[in] messageFactory pointer to a message factory to store in the core factory*/
+    void registerFactory(PayloadFactory* messageFactory);
+    /** get a list of all the valid message types*/
+    std::vector<std::string> getPayloadTypeNames();
+    /** build a default message of the type defined in messageType*/
+    std::shared_ptr<CommPayload> createPayload(std::string_view messageType);
+    /** build a default message of the type defined in messageType
+    @param messageType string describing the class of messages
+    @param type the specific message code for the message*/
+    std::shared_ptr<CommPayload> createPayload(std::string_view messageType, std::uint32_t type);
+    /** build a message payload of the specific type, deriving the general type from the valid
+  ranges of specific types defining in the factory
+  @param type the specific message code for the message*/
+    std::shared_ptr<CommPayload> createPayload(std::uint32_t type);
+    /** get a pointer to a specific factory*/
+    PayloadFactory* getFactory(std::string_view factoryName);
+    /** get a pointer to a factory that builds a specific type of message*/
+    PayloadFactory* getFactory(std::uint32_t type);
+    /** check if a string represents a valid message class*/
+    bool isValidMessage(std::string_view messageType);
+
+  private:
+    /** private constructor defined in a singleton class*/
+    CorePayloadFactory() = default;
+
+    mfMap m_factoryMap;  //!< the map containing the factories from a string
+};
+
+/** template for making a specific message from the factory
+ */
+template<class PayloadType, std::uint32_t minCodeValue, std::uint32_t maxCodeValue>
+class DPayloadFactory: public PayloadFactory {
+    static_assert(std::is_base_of<CommPayload, PayloadType>::value,
+                  "factory class must have CommMessage as base");
+
+  public:
+    explicit DPayloadFactory(std::string_view typeName): PayloadFactory(typeName)
+    {
+        CorePayloadFactory::instance().registerFactory(typeName, this);
+    }
+
+    virtual std::shared_ptr<CommPayload> makePayload() override
+    {
+        std::shared_ptr<CommPayload> cm = std::make_shared<PayloadType>();
+        return cm;
+    }
+
+    /** default generator for a specific instantiation of a message factory*/
+    std::shared_ptr<PayloadType> makeTypePayload() { return (std::make_shared<PayloadType>()); }
+
+    virtual bool inRange(std::uint32_t code) const override
+    {
+        return ((code >= minCodeValue) && (code <= maxCodeValue));
+    }
+    virtual std::uint32_t range() const override { return (maxCodeValue - minCodeValue); }
+};
+
+}  // namespace griddyn

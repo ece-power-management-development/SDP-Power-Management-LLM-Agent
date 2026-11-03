@@ -1,0 +1,120 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "../Block.h"
+#include <string>
+#include <vector>
+
+namespace griddyn::blocks {
+/**
+ * @brief Ordered serial composition of one or more GridBlock instances.
+ *
+ * For blocks @f$B_0,\ldots,B_n@f$, this composite evaluates
+ * @f$y=B_n(\ldots B_1(B_0(u+b))\ldots)@f$.  It propagates output derivatives,
+ * residuals, analytic Jacobians, roots, and root triggers through the same
+ * ordering.  States remain owned by the child blocks; this class only supplies
+ * the single-input/single-output composition and local-step scheduling.
+ *
+ * `differential_input` causes the first child to receive an input derivative.
+ * BlockSequence is a composite container, not an independently factory-loaded
+ * elementary block.
+ */
+class BlockSequence: public GridBlock {
+  public:
+  protected:
+    enum SequenceFlags {
+        DIFFERENTIAL_INPUT_ACTUAL =
+            OBJECT_FLAG11,  //!< flag specifying that the outer input is differential
+    };
+    std::vector<GridBlock*> blocks;  //!< the building blocks in the sequence
+    std::vector<int> sequence;  //!< a numerical ordering of the sequence
+  private:
+    std::vector<double> blockOutputs;  //!< temporary storage for block outputs
+    std::vector<double> blockDoutDt;  //!< temporary storage for block ramp outputs
+    index_t seqID = 0;  //!< sequence ID for last update
+    // NOTE:: 4 byte gap here
+    double sampleTime = kBigNum;  //!< the minimum local sampling time for local integration
+  public:
+    /** @brief default constructor*/
+    explicit BlockSequence(const std::string& objName = "block_#");
+
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+
+  protected:
+    virtual void dynObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+    virtual void dynObjectInitializeB(const IOdata& inputs,
+                                      const IOdata& desiredOutput,
+                                      IOdata& fieldSet) override;
+
+  public:
+    virtual void add(CoreObject* obj) override;
+    virtual void add(GridBlock* blk);
+
+    virtual void setFlag(std::string_view flag, bool val) override;
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+
+    virtual void blockResidual(double input,
+                               double didt,
+                               const StateData& stateData,
+                               double resid[],
+                               const SolverMode& sMode) override;
+
+    virtual void blockDerivative(double input,
+                                 double didt,
+                                 const StateData& stateData,
+                                 double deriv[],
+                                 const SolverMode& sMode) override;
+
+    virtual void blockAlgebraicUpdate(double input,
+                                      const StateData& stateData,
+                                      double update[],
+                                      const SolverMode& sMode) override;
+
+    virtual void blockJacobianElements(double input,
+                                       double didt,
+                                       const StateData& stateData,
+                                       MatrixData<double>& matrixDataRef,
+                                       index_t argLoc,
+                                       const SolverMode& sMode) override;
+
+    virtual double step(CoreTime time, double input) override;
+    virtual void rootTest(const IOdata& inputs,
+                          const StateData& stateData,
+                          double roots[],
+                          const SolverMode& sMode) override;
+    virtual void rootTrigger(CoreTime time,
+                             const IOdata& inputs,
+                             const std::vector<int>& rootMask,
+                             const SolverMode& sMode) override;
+    virtual ChangeCode rootCheck(const IOdata& inputs,
+                                 const StateData& stateData,
+                                 const SolverMode& sMode,
+                                 CheckLevel level) override;
+    // virtual void setTime(CoreTime time){prevTime=time;};
+    /** get the output of one of the component blocks
+*@param[in] blockNum the index of the block to the get the output of
+@return the output value of the requested block
+*/
+    double subBlockOutput(index_t blockNum) const;
+    /** get the output of one of the component blocks by name
+*@param[in] blockname the name of the block to the get the output of
+@return the output value of the requested block
+*/
+    double subBlockOutput(const std::string& blockname) const;
+
+    virtual void updateLocalCache(const IOdata& inputs,
+                                  const StateData& stateData,
+                                  const SolverMode& sMode) override;
+
+    virtual CoreObject* getSubObject(std::string_view typeName, index_t num) const override;
+
+    virtual CoreObject* findByUserID(std::string_view typeName, index_t searchID) const override;
+};
+}  // namespace griddyn::blocks

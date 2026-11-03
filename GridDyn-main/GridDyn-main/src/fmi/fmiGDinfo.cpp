@@ -1,0 +1,110 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+/*
+Copyright (C) 2012 Modelon AB
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the BSD style license.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+FMILIB_License.txt file for more details.
+
+You should have received a copy of the FMILIB_License.txt file
+along with this program. If not, contact Modelon AB <http://www.modelon.com>.
+*/
+#include "fmiGDinfo.h"
+
+#include "core/ObjectFactoryTemplates.hpp"
+#include "fmi_importGD.h"
+#include "fmi_models/CymeDistLoad.h"
+#include "fmi_models/fmiCoSimLoad.h"
+#include "fmi_models/fmiCoSimLoad3phase.h"
+#include "fmi_models/fmiExciter.h"
+#include "fmi_models/fmiGenModel.h"
+#include "fmi_models/fmiGovernor.h"
+#include "fmi_models/fmiMELoad.h"
+#include "fmi_models/fmiMELoad3phase.h"
+#include "plugins/gridDynPluginApi.h"
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <boost/dll/alias.hpp>  // for BOOST_DLL_ALIAS
+
+// create the component factories
+
+namespace griddyn {
+static ChildTypeFactory<fmi::FmiMELoad, GridLoad>
+    gFmiMeLoadFactory("load", std::to_array<std::string_view>({"fmimeload", "fmi", "me"}));
+static ChildTypeFactory<fmi::FmiCoSimLoad, GridLoad>
+    gFmiCoSimLoadFactory("load", std::to_array<std::string_view>({"fmicosimload", "cosim"}));
+static ChildTypeFactory<fmi::FmiCoSimLoad3phase, GridLoad>
+    gFmiCoSimLoad3Factory("load",
+                          std::to_array<std::string_view>({"fmicosimload3", "fmicosimload3phase"}));
+static ChildTypeFactory<fmi::FmiMELoad3phase, GridLoad> gFmiMeLoad3Factory(
+    "load",
+    std::to_array<std::string_view>(
+        {"fmimeload3", "fmiload3phase", "fmi3phase", "fmimeload3phase", "fmime3phase"}));
+static ChildTypeFactory<fmi::FmiGovernor, Governor>
+    gFmiGovernorFactory("governor",
+                        std::to_array<std::string_view>({"fmigov", "fmigovernor", "fmi"}));
+static ChildTypeFactory<fmi::FmiExciter, Exciter>
+    gFmiExciterFactory("exciter", std::to_array<std::string_view>({"fmiexiter", "fmi"}));
+static ChildTypeFactory<fmi::FmiGenModel, GenModel>
+    gFmiGenModelFactory("genmodel",
+                        std::to_array<std::string_view>({"fmigenmodel", "fmimachine", "fmi"}));
+static ChildTypeFactory<fmi::CymeDistLoadME, GridLoad>
+    gCymeMeFactory("load", std::to_array<std::string_view>({"cyme", "cymeme", "cymefmi"}));
+
+void loadFmiLibrary()
+{
+    static int loaded = 0;
+
+    if (loaded == 0) {
+        loaded = 1;
+    }
+}
+
+}  // namespace griddyn
+
+// Someday I will get plugins to work
+namespace fmi_plugin_namespace {
+namespace {
+    class FmiPlugin: public gridDynPlugInApi {
+        static std::vector<std::shared_ptr<griddyn::ObjectFactory>> mFmiFactories;
+        FmiPlugin() = default;
+
+      public:
+        [[nodiscard]] std::string name() const override { return "fmi"; }
+
+        void load() override
+        {
+            auto factory = std::make_shared<
+                griddyn::ChildTypeFactory<griddyn::fmi::FmiMELoad, griddyn::GridLoad>>(
+                "load", griddyn::stringVec{"fmiload", "fmi"});
+            mFmiFactories.push_back(factory);
+        }
+
+        void load(const std::string& /*section*/) override { load(); }
+        // Factory method
+        static std::shared_ptr<FmiPlugin> create()
+        {
+            return std::shared_ptr<FmiPlugin>(new FmiPlugin());
+        }
+    };
+}  // namespace
+
+std::vector<std::shared_ptr<griddyn::ObjectFactory>> FmiPlugin::mFmiFactories;
+
+/*BOOST_DLL_ALIAS(
+    fmi_plugin_namespace::FmiPlugin::create, // <-- this function is exported with...
+    load_plugin                               // <-- ...this alias name
+)*/
+
+}  // namespace fmi_plugin_namespace

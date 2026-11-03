@@ -1,0 +1,721 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "MotorLoad5.h"
+
+#include "../GridBus.h"
+#include "core/CoreExceptions.h"
+#include "core/CoreObjectTemplates.hpp"
+#include "core/ObjectFactory.hpp"
+#include "gmlc/utilities/vectorOps.hpp"
+#include "utilities/MatrixData.hpp"
+#include <cmath>
+#include <iostream>
+#include <string>
+#include <vector>
+namespace griddyn::loads {
+// MotorLoad5 preserves the established five-state PSS/E state names and
+// equation notation used by MotorLoad3.  The derived CIM models share this
+// implementation, so changing the legacy notation here would obscure the
+// state mapping and make equation comparisons harder to audit.
+// NOLINTBEGIN(readability-identifier-length, readability-identifier-naming,
+//             readability-math-missing-parentheses, misc-const-correctness,
+//             readability-braces-around-statements, google-readability-braces-around-statements,
+//             hicpp-braces-around-statements, readability-isolate-declaration,
+//             readability-qualified-auto, hicpp-member-init,
+//             readability-inconsistent-ifelse-braces, readability-implicit-bool-conversion,
+//             hicpp-named-parameter, readability-named-parameter)
+// setup the load object factories
+
+MotorLoad5::MotorLoad5(const std::string& objName): MotorLoad3(objName)
+{
+    H = 4;
+}
+CoreObject* MotorLoad5::clone(CoreObject* obj) const
+{
+    auto* ld = cloneBase<MotorLoad5, MotorLoad3>(this, obj);
+    if (ld == nullptr) {
+        return obj;
+    }
+
+    ld->T0pp = T0pp;
+    ld->xpp = xpp;
+    ld->r2 = r2;
+    ld->x2 = x2;
+    ld->motorType = motorType;
+    ld->useDirectMachineParameters = useDirectMachineParameters;
+    ld->directX0 = directX0;
+    ld->directXp = directXp;
+    ld->directXpp = directXpp;
+    ld->directT0p = directT0p;
+    ld->directT0pp = directT0pp;
+    return ld;
+}
+
+void MotorLoad5::pFlowObjectInitializeA(CoreTime time0, std::uint32_t flags)
+{
+    // setup the parameters
+    if (useDirectMachineParameters) {
+        x0 = directX0;
+        xp = directXp;
+        xpp = directXpp;
+        T0p = directT0p;
+        T0pp = directT0pp;
+    } else {
+        x0 = x + xm;
+        xp = x + x1 * xm / (x1 + xm);
+        T0p = (x1 + xm) / (systemBaseFrequency * r1);
+
+        if ((r2 <= 0.0) || (x2 <= 0.0)) {
+            // The CIM single-cage form removes the subtransient circuit.  Retain
+            // the five-state formulation with the same short time constant used
+            // by the PSS/E/OpenIPSL equations, so it collapses to the transient
+            // circuit without a divide-by-zero during initialization.
+            xpp = xp;
+            T0pp = 1e-7;
+        } else if (motorType == 2) {
+            // PSS/E CIM Type-B: the two rotor cages are in series for the
+            // transient circuit and in parallel for the subtransient circuit.
+            xp = x + xm * (x1 + x2) / (x1 + x2 + xm);
+            T0p = (x1 + x2 + xm) / (systemBaseFrequency * r2);
+            T0pp = (x1 + xm) * x2 / (x1 + xm + x2) / (systemBaseFrequency * r1);
+            xpp = xp;
+        } else {
+            T0pp = (x2 + x1 * xm / (x1 + xm)) / (systemBaseFrequency * r2);
+            xpp = x + x1 * x2 * xm / (x1 * x2 + x1 * xm + x2 * xm);
+        }
+    }
+
+    scale = mBase / systemBasePower;
+    m_state.resize(7, 0);
+    if (opFlags[INIT_TRANSIENT]) {
+        m_state[2] = init_slip;
+    } else if (Pmot > -kHalfBigNum) {
+        m_state[2] = computeSlip(useDirectMachineParameters && (scale > 0.0) ? Pmot / scale : Pmot);
+    } else {
+        m_state[2] = 1.0;
+        opFlags.set(INIT_TRANSIENT);
+    }
+    // NOLINTNEXTLINE
+    GridLoad::pFlowObjectInitializeA(time0, flags);
+    converge();
+
+    loadStateSizes(cLocalSolverMode);
+    setOffset(0, cLocalSolverMode);
+}
+
+void MotorLoad5::converge()
+{
+    double voltage = bus->getVoltage();
+    double theta = bus->getAngle();
+    double slip = m_state[2];
+    double Qtest = qPower(voltage, m_state[2]);
+    double im;
+    double em;
+    double ir;
+    double er;
+    double Vr = -voltage * Vcontrol * sin(theta);
+    double Vm = voltage * Vcontrol * cos(theta);
+    gmlc::utilities::solve2x2(Vr, Vm, Vm, -Vr, getP(), Qtest, ir, im);
+    double err{10.0};
+    int ccnt{0};
+    double fbs = slip * systemBaseFrequency;
+
+    double perr{10.0};
+    while (err > 1e-6) {
+        double erp = Vr - r * ir + xp * im;
+        double emp = Vm - r * im - xp * ir;
+        gmlc::utilities::solve2x2(fbs,
+                                  -1.0 / T0pp,
+                                  1.0 / T0pp,
+                                  fbs,
+                                  fbs * erp - erp / T0pp + (xp - xpp) / T0pp * ir,
+                                  fbs * emp - emp / T0pp + (xp - xpp) / T0pp * im,
+                                  er,
+                                  em);
+
+        double slipp = (er + (x0 - xp) * im) / T0p / systemBaseFrequency / em;
+        double dslip = slipp - slip;
+        if (getP() > 0) {
+            if (slipp < 0) {
+                slip = slip / 2.0;
+            } else {
+                slip = slipp;
+            }
+        }
+
+        err = std::abs(dslip);
+        if (err > perr) {
+            break;
+        }
+        // just archiving the states in case we need to break;
+        m_state[0] = ir;
+        m_state[1] = im;
+        m_state[2] = slip;
+        m_state[3] = er;
+        m_state[4] = em;
+        m_state[5] = erp;
+        m_state[6] = emp;
+        if (++ccnt > 50) {
+            break;
+        }
+
+        perr = err;
+
+        fbs = slip * systemBaseFrequency;
+        ir = (-fbs * er * T0p - em) / (-(x0 - xp));
+        im = (mechPower(slip) - erp * ir) / emp;
+    }
+}
+
+void MotorLoad5::dynObjectInitializeA(CoreTime /*time0*/, std::uint32_t /*flags*/) {}
+void MotorLoad5::dynObjectInitializeB(const IOdata& inputs,
+                                      const IOdata& /*desiredOutput*/,
+                                      IOdata& /*fieldSet*/)
+{
+    if (opFlags[INIT_TRANSIENT]) {
+        derivative(inputs, emptyStateData, m_dstate_dt.data(), cLocalSolverMode);
+    }
+}
+
+StateSizes MotorLoad5::localStateSizes(const SolverMode& sMode) const
+{
+    StateSizes SS;
+    if (isDynamic(sMode)) {
+        SS.algSize = 2;
+        if (!isAlgebraicOnly(sMode)) {
+            SS.diffSize = 5;
+        }
+    } else {
+        SS.algSize = 7;
+    }
+    return SS;
+}
+
+count_t MotorLoad5::localJacobianCount(const SolverMode& sMode) const
+{
+    count_t localJacSize = 0;
+    if (isDynamic(sMode)) {
+        localJacSize = 8;
+        if (!isAlgebraicOnly(sMode)) {
+            localJacSize += 27;
+        }
+    } else {
+        if (opFlags[INIT_TRANSIENT]) {
+            localJacSize = 31;
+        } else {
+            localJacSize = 35;
+        }
+    }
+    if (useDirectMachineParameters) {
+        // The direct-parameter equations keep the same state variables but
+        // introduce additional sparse couplings through the direct flux
+        // states. Reserve those entries for both the dynamic and algebraic
+        // formulations.
+        localJacSize += isDynamic(sMode) ? 4U : 1U;
+    }
+    return localJacSize;
+}
+
+// set properties
+void MotorLoad5::set(std::string_view param, std::string_view val)
+{
+    if (param.empty()) {
+    } else {
+        MotorLoad3::set(param, val);
+    }
+}
+
+void MotorLoad5::set(std::string_view param, double val, units::unit unitType)
+{
+    if ((param == "mtype") || (param == "type")) {
+        if ((std::abs(val - std::round(val)) > 1e-12) || ((val != 1.0) && (val != 2.0))) {
+            throw InvalidParameterValue("CIM motor type must be 1 (A) or 2 (B)");
+        }
+        motorType = static_cast<int>(val);
+    } else if (param == "r2") {
+        r2 = val;
+    } else if (param == "x2") {
+        x2 = val;
+    } else {
+        MotorLoad3::set(param, val, unitType);
+    }
+}
+
+double MotorLoad5::mechPower(double slip) const
+{
+    return MotorLoad::mechPower(slip);
+}
+
+double MotorLoad5::dmechds(double slip) const
+{
+    return MotorLoad::dmechds(slip);
+}
+
+double MotorLoad5::saturationFactor(double /*erpp*/, double /*empp*/) const
+{
+    return 0.0;
+}
+
+void MotorLoad5::saturationFactorDerivatives(double /*erpp*/,
+                                             double /*empp*/,
+                                             double& derivativeErpp,
+                                             double& derivativeEmpp) const
+{
+    derivativeErpp = 0.0;
+    derivativeEmpp = 0.0;
+}
+
+// residual
+void MotorLoad5::residual(const IOdata& inputs,
+                          const StateData& sD,
+                          double resid[],
+                          const SolverMode& sMode)
+{
+    if (isDynamic(sMode)) {
+        auto Loc = offsets.getLocations(sD, resid, sMode, this);
+
+        double voltage = inputs[VOLTAGE_IN_LOCATION];
+        double theta = inputs[ANGLE_IN_LOCATION];
+        const double* gm = Loc.algStateLoc;
+        const double* gmd = Loc.diffStateLoc;
+        const double* gmp = Loc.dstateLoc;
+
+        double* rva = Loc.destLoc;
+        double* rvd = Loc.destDiffLoc;
+
+        double Vr = -voltage * Vcontrol * sin(theta);
+        double Vm = voltage * Vcontrol * cos(theta);
+
+        if (hasAlgebraic(sMode)) {
+            // ir
+            rva[irA] = Vm - gmd[emppD] - r * gm[imA] - xpp * gm[irA];
+            // im
+            rva[imA] = Vr - gmd[erppD] - r * gm[irA] + xpp * gm[imA];
+        }
+
+        if (isAlgebraicOnly(sMode)) {
+            return;
+        }
+        derivative(inputs, sD, resid, sMode);
+        // Get the exciter field
+
+        // delta
+        rvd[0] -= gmp[0];
+        rvd[1] -= gmp[1];
+        rvd[2] -= gmp[2];
+        rvd[3] -= gmp[3];
+        rvd[4] -= gmp[4];
+    } else {
+        auto offset = offsets.getAlgOffset(sMode);
+        double voltage = inputs[VOLTAGE_IN_LOCATION];
+        double theta = inputs[ANGLE_IN_LOCATION];
+
+        const double* gm = sD.state + offset;
+        double* rv = resid + offset;
+
+        double Vr = -voltage * Vcontrol * sin(theta);
+        double Vm = voltage * Vcontrol * cos(theta);
+
+        // ir
+        rv[irA] = Vm - gm[emppA] - r * gm[imA] - xpp * gm[irA];
+        // im
+        rv[imA] = Vr - gm[erppA] - r * gm[irA] + xpp * gm[imA];
+
+        double slip = gm[slipA];
+        // printf("angle=%f, slip=%f\n", theta, slip);
+        // slip
+        if (opFlags[INIT_TRANSIENT]) {
+            rv[slipA] = slip - m_state[slipA];
+        } else {
+            double Te = gm[erppA] * gm[irA] + gm[emppA] * gm[imA];
+            rv[slipA] = (mechPower(slip) - Te) / (2 * H);
+        }
+        // Erp and Emp
+        const double saturation = saturationFactor(gm[erppA], gm[emppA]);
+        rv[erpA] = systemBaseFrequency * slip * gm[empA] - (gm[erpA] + (x0 - xp) * gm[imA]) / T0p +
+            gm[emppA] * saturation / T0p;
+        rv[empA] = -systemBaseFrequency * slip * gm[erpA] - (gm[empA] - (x0 - xp) * gm[irA]) / T0p -
+            gm[erppA] * saturation / T0p;
+        // Each subtransient axis relaxes toward its corresponding transient
+        // axis; the slip terms provide the cross-axis coupling.
+        rv[erppA] = -systemBaseFrequency * slip * (gm[empA] - gm[emppA]) -
+            (gm[erpA] - gm[erppA] - (xp - xpp) * gm[imA]) / T0pp;
+        rv[emppA] = systemBaseFrequency * slip * (gm[erpA] - gm[erppA]) -
+            (gm[empA] - gm[emppA] + (xp - xpp) * gm[irA]) / T0pp;
+    }
+}
+
+void MotorLoad5::algebraicUpdate(const IOdata& inputs,
+                                 const StateData& sD,
+                                 double update[],
+                                 const SolverMode& sMode,
+                                 double /*alpha*/)
+{
+    if (!hasAlgebraic(sMode)) {
+        return;
+    }
+    auto Loc = offsets.getLocations(sD, update, sMode, this);
+    const double voltage = inputs[VOLTAGE_IN_LOCATION];
+    const double theta = inputs[ANGLE_IN_LOCATION];
+    const double vr = -voltage * Vcontrol * sin(theta);
+    const double vm = voltage * Vcontrol * cos(theta);
+
+    gmlc::utilities::solve2x2(r,
+                              -xpp,
+                              xpp,
+                              r,
+                              vr - Loc.diffStateLoc[erppD],
+                              vm - Loc.diffStateLoc[emppD],
+                              Loc.destLoc[0],
+                              Loc.destLoc[1]);
+}
+
+void MotorLoad5::getStateName(stringVec& stNames,
+                              const SolverMode& sMode,
+                              const std::string& prefix) const
+{
+    std::string prefix2 = prefix + getName();
+    if (isDynamic(sMode)) {
+        if (isAlgebraicOnly(sMode)) {
+            return;
+        }
+        auto offsetA = offsets.getAlgOffset(sMode);
+        auto offsetD = offsets.getDiffOffset(sMode);
+        stNames[offsetA] = prefix2 + ":ir";
+        stNames[offsetA + 1] = prefix2 + ":im";
+        stNames[offsetD] = prefix2 + ":slip";
+        stNames[offsetD + 1] = prefix2 + ":erp";
+        stNames[offsetD + 2] = prefix2 + ":emp";
+        stNames[offsetD + 3] = prefix2 + ":erpp";
+        stNames[offsetD + 4] = prefix2 + ":empp";
+    } else {
+        auto offset = offsets.getAlgOffset(sMode);
+        stNames[offset] = prefix2 + ":ir";
+        stNames[offset + 1] = prefix2 + ":im";
+        stNames[offset + 2] = prefix2 + ":slip";
+        stNames[offset + 3] = prefix2 + ":erp";
+        stNames[offset + 4] = prefix2 + ":emp";
+        stNames[offset + 5] = prefix2 + ":erpp";
+        stNames[offset + 6] = prefix2 + ":empp";
+    }
+}
+void MotorLoad5::timestep(CoreTime time, const IOdata& inputs, const SolverMode& /*sMode*/)
+{
+    StateData sD(time, m_state.data());
+
+    derivative(inputs, sD, m_dstate_dt.data(), cLocalSolverMode);
+    double dt = time - prevTime;
+    m_state[2] += dt * m_dstate_dt[2];
+    m_state[3] += dt * m_dstate_dt[3];
+    m_state[4] += dt * m_dstate_dt[4];
+    m_state[5] += dt * m_dstate_dt[5];
+    m_state[6] += dt * m_dstate_dt[6];
+    prevTime = time;
+    updateCurrents(inputs, sD, cLocalSolverMode);
+}
+
+void MotorLoad5::updateCurrents(const IOdata& inputs, const StateData& sD, const SolverMode& sMode)
+{
+    auto Loc = offsets.getLocations(sD, const_cast<double*>(sD.state), sMode, this);
+    double voltage = inputs[VOLTAGE_IN_LOCATION];
+    double theta = inputs[ANGLE_IN_LOCATION];
+
+    double vr = -voltage * Vcontrol * sin(theta);
+    double vm = voltage * Vcontrol * cos(theta);
+
+    gmlc::utilities::solve2x2(r,
+                              -xpp,
+                              xpp,
+                              r,
+                              vr - Loc.diffStateLoc[3],
+                              vm - Loc.diffStateLoc[4],
+                              Loc.destLoc[0],
+                              Loc.destLoc[1]);
+}
+
+void MotorLoad5::derivative(const IOdata& /*inputs*/,
+                            const StateData& sD,
+                            double deriv[],
+                            const SolverMode& sMode)
+{
+    auto Loc = offsets.getLocations(sD, deriv, sMode, this);
+    const double* ast = Loc.algStateLoc;
+    const double* dst = Loc.diffStateLoc;
+    const double* ddt = Loc.dstateLoc;
+    double* dv = Loc.destDiffLoc;
+    // Get the exciter field
+    double slip = dst[slipD];
+
+    if (Loc.time >= 1.0) {
+        mechPower(slip);
+    }
+
+    // slip
+    if (opFlags[STALLED]) {
+        dv[slipD] = 0;
+    } else {
+        double Te = dst[erppD] * ast[irA] + dst[emppD] * ast[imA];
+        dv[slipD] = (mechPower(slip) - Te) / (2 * H);
+    }
+    // printf("t=%f, slip=%f mp=%f, te=%f, dslip=%e\n", sD.time, slip,mechPower(slip), Te,dv[0]
+    // ); Edp and Eqp
+    const double saturation = saturationFactor(dst[erppD], dst[emppD]);
+    dv[erpD] = systemBaseFrequency * slip * dst[empD] - (dst[erpD] + (x0 - xp) * ast[imA]) / T0p +
+        dst[emppD] * saturation / T0p;
+    dv[empD] = -systemBaseFrequency * slip * dst[erpD] - (dst[empD] - (x0 - xp) * ast[irA]) / T0p -
+        dst[erppD] * saturation / T0p;
+    dv[erppD] = -systemBaseFrequency * slip * (dst[empD] - dst[emppD]) + ddt[erpD] -
+        (dst[erpD] - dst[erppD] - (xp - xpp) * ast[imA]) / T0pp;
+    dv[emppD] = systemBaseFrequency * slip * (dst[erpD] - dst[erppD]) + ddt[empD] -
+        (dst[empD] - dst[emppD] + (xp - xpp) * ast[irA]) / T0pp;
+}
+
+void MotorLoad5::jacobianElements(const IOdata& inputs,
+                                  const StateData& sD,
+                                  MatrixData<double>& md,
+                                  const IOlocs& inputLocs,
+                                  const SolverMode& sMode)
+{
+    index_t refAlg;
+    const double* gm;
+    index_t refDiff;
+    const double* dst;
+    double cj = sD.cj;
+    if (isDynamic(sMode)) {
+        auto Loc = offsets.getLocations(sD, sMode, this);
+
+        refAlg = Loc.algOffset;
+        refDiff = Loc.diffOffset;
+        gm = Loc.algStateLoc;
+        dst = Loc.diffStateLoc;
+        // auto mx = &(offsets.getOffsets (sMode)->jacSize);
+        // auto js = *mx;
+    } else {
+        auto offset = offsets.getAlgOffset(sMode);
+        refAlg = offset;
+        refDiff = offset + 2;
+        gm = sD.state + offset;
+        dst = sD.state + offset + 2;
+        cj = 0;
+    }
+
+    double voltage = inputs[VOLTAGE_IN_LOCATION];
+    double theta = inputs[ANGLE_IN_LOCATION];
+    auto VLoc = inputLocs[VOLTAGE_IN_LOCATION];
+    auto TLoc = inputLocs[ANGLE_IN_LOCATION];
+
+    double Vr = -voltage * Vcontrol * sin(theta);
+    double Vm = voltage * Vcontrol * cos(theta);
+
+    // ir
+    // rva[0] = Vm - gmd[2] - r*gm[1] - xp*gm[0];
+    // im
+    // rva[1] = Vr - gmd[1] - r*gm[0] + xp*gm[1];
+
+    const bool hasAlgebraicRows = !isDynamic(sMode) || hasAlgebraic(sMode);
+    if (hasAlgebraicRows) {
+        // P
+        if (TLoc != kNullLocation) {
+            md.assign(refAlg, TLoc, Vr);
+            md.assign(refAlg + 1, TLoc, -Vm);
+        }
+        // Q
+        if (VLoc != kNullLocation) {
+            md.assign(refAlg, VLoc, Vm / voltage);
+            md.assign(refAlg + 1, VLoc, Vr / voltage);
+        }
+
+        md.assign(refAlg, refAlg, -xpp);
+        md.assign(refAlg, refAlg + 1, -r);
+
+        md.assign(refAlg + 1, refAlg, -r);
+        md.assign(refAlg + 1, refAlg + 1, xpp);
+    }
+    if (isDynamic(sMode) && !hasDifferential(sMode)) {
+        return;
+    }
+    // Ir Differential
+
+    if (hasAlgebraicRows && (!isDynamic(sMode) || hasDifferential(sMode))) {
+        md.assign(refAlg, refDiff + 4, -1);
+        // Im Differential
+        md.assign(refAlg + 1, refDiff + 3, -1);
+    }
+
+    double slip = dst[0];
+    if ((isDynamic(sMode)) || (!opFlags[INIT_TRANSIENT])) {
+        /*
+    // slip
+    double Te = dst[1] * ast[0] + dst[2] * ast[1];
+    dv[0] = (mechPower(slip) - Te) / (2 * H);
+
+    */
+        // slip
+        if (opFlags[STALLED]) {
+            md.assign(refDiff, refDiff, -cj);
+        } else {
+            md.assign(refDiff, refDiff, dmechds(slip) / (2 * H) - cj);
+            md.assign(refDiff, refDiff + 3, -gm[0] / (2 * H));
+            md.assign(refDiff, refDiff + 4, -gm[1] / (2 * H));
+            if (hasAlgebraicRows) {
+                md.assign(refDiff, refAlg, -dst[3] / (2 * H));
+                md.assign(refDiff, refAlg + 1, -dst[4] / (2 * H));
+            }
+        }
+    } else {
+        md.assign(refDiff, refDiff, 1);
+    }
+    // omega
+
+    // Erp and Emp
+    // dv[1] = systemBaseFrequency*slip*dst[2] - (dst[1] + (x0 - xp)*ast[1]) / T0p;
+    // dv[2] = -systemBaseFrequency*slip*dst[1] - (dst[2] + (x0 - xp)*ast[0]) / T0p;
+
+    if (hasAlgebraicRows) {
+        md.assign(refDiff + 1, refAlg + 1, -(x0 - xp) / T0p);
+    }
+    md.assign(refDiff + 1, refDiff, systemBaseFrequency * dst[2]);
+    md.assign(refDiff + 1, refDiff + 1, -1 / T0p - cj);
+    md.assign(refDiff + 1, refDiff + 2, systemBaseFrequency * slip);
+
+    if (hasAlgebraicRows) {
+        md.assign(refDiff + 2, refAlg, (x0 - xp) / T0p);
+    }
+    md.assign(refDiff + 2, refDiff, -systemBaseFrequency * dst[1]);
+    md.assign(refDiff + 2, refDiff + 1, -systemBaseFrequency * slip);
+    md.assign(refDiff + 2, refDiff + 2, -1 / T0p - cj);
+
+    double saturationDerivativeErpp;
+    double saturationDerivativeEmpp;
+    saturationFactorDerivatives(dst[erppD],
+                                dst[emppD],
+                                saturationDerivativeErpp,
+                                saturationDerivativeEmpp);
+    const double saturation = saturationFactor(dst[erppD], dst[emppD]);
+    md.assign(refDiff + 1, refDiff + 3, dst[emppD] * saturationDerivativeErpp / T0p);
+    md.assign(refDiff + 1, refDiff + 4, (saturation + dst[emppD] * saturationDerivativeEmpp) / T0p);
+    md.assign(refDiff + 2,
+              refDiff + 3,
+              -(saturation + dst[erppD] * saturationDerivativeErpp) / T0p);
+    md.assign(refDiff + 2, refDiff + 4, -dst[erppD] * saturationDerivativeEmpp / T0p);
+
+    // Erpp and Empp
+    // dv[3] = -systemBaseFrequency*slip*(dst[2] - dst[4]) + ddt[1] - (dst[1] - dst[3] - (xp -
+    // xpp)*ast[1]) / T0pp; dv[4] = systemBaseFrequency*slip*(dst[1] - dst[3]) + ddt[2] -
+    // (dst[2] - dst[4] + (xp - xpp)*ast[0]) / T0pp;
+    if (hasAlgebraicRows) {
+        md.assign(refDiff + 3, refAlg + 1, (xp - xpp) / T0pp);
+    }
+    md.assign(refDiff + 3, refDiff, -systemBaseFrequency * (dst[2] - dst[4]));
+    md.assign(refDiff + 3, refDiff + 1, -1 / T0pp + cj);
+    md.assign(refDiff + 3, refDiff + 2, -systemBaseFrequency * slip);
+    md.assign(refDiff + 3, refDiff + 3, 1 / T0pp - cj);
+    md.assign(refDiff + 3, refDiff + 4, systemBaseFrequency * slip);
+
+    if (hasAlgebraicRows) {
+        md.assign(refDiff + 4, refAlg, -(xp - xpp) / T0pp);
+    }
+    md.assign(refDiff + 4, refDiff, systemBaseFrequency * (dst[1] - dst[3]));
+    md.assign(refDiff + 4, refDiff + 1, systemBaseFrequency * slip);
+    md.assign(refDiff + 4, refDiff + 2, -1 / T0pp + cj);
+    md.assign(refDiff + 4, refDiff + 3, -systemBaseFrequency * slip);
+    md.assign(refDiff + 4, refDiff + 4, 1 / T0pp - cj);
+}
+
+index_t MotorLoad5::findIndex(std::string_view field, const SolverMode& sMode) const
+{
+    index_t ret = kInvalidLocation;
+    if (field == "erpp") {
+        if (isLocal(sMode)) {
+            ret = 5;
+        } else if (isDynamic(sMode)) {
+            ret = offsets.getDiffOffset(sMode);
+            ret = (ret != kNullLocation) ? ret + 3 : ret;
+        } else {
+            ret = offsets.getAlgOffset(sMode);
+            ret = (ret != kNullLocation) ? ret + 5 : ret;
+        }
+    } else if (field == "empp") {
+        if (isLocal(sMode)) {
+            ret = 6;
+        } else if (isDynamic(sMode)) {
+            ret = offsets.getDiffOffset(sMode);
+            ret = (ret != kNullLocation) ? ret + 4 : ret;
+        } else {
+            ret = offsets.getAlgOffset(sMode);
+            ret = (ret != kNullLocation) ? ret + 6 : ret;
+        }
+    } else {
+        ret = MotorLoad3::findIndex(field, sMode);
+    }
+
+    return ret;
+}
+
+void MotorLoad5::rootTest(const IOdata& /*inputs*/,
+                          const StateData& sD,
+                          double roots[],
+                          const SolverMode& sMode)
+{
+    auto Loc = offsets.getLocations(sD, sMode, this);
+    auto ro = offsets.getRootOffset(sMode);
+    if (opFlags[STALLED]) {
+        double Te = Loc.diffStateLoc[erppD] * Loc.algStateLoc[irA] +
+            Loc.diffStateLoc[emppD] * Loc.algStateLoc[imA];
+        roots[ro] = Te - mechPower(1.0);
+    } else {
+        double slip = Loc.diffStateLoc[0];
+        roots[ro] = 1.0 - slip;
+    }
+}
+
+void MotorLoad5::rootTrigger(CoreTime /*time*/,
+                             const IOdata& inputs,
+                             const std::vector<int>& rootMask,
+                             const SolverMode& sMode)
+{
+    if (rootMask[offsets.getRootOffset(sMode)] == 0) {
+        return;
+    }
+    if (opFlags[STALLED]) {
+        if (inputs[VOLTAGE_IN_LOCATION] > 0.5) {
+            opFlags.reset(STALLED);
+            alert(this, JAC_COUNT_INCREASE);
+            m_state[slipA] = 1.0 - 1e-7;
+        }
+    } else {
+        opFlags.set(STALLED);
+        alert(this, JAC_COUNT_DECREASE);
+        m_state[slipA] = 1.0;
+    }
+}
+
+ChangeCode MotorLoad5::rootCheck(const IOdata& /*inputs*/,
+                                 const StateData& sD,
+                                 const SolverMode& sMode,
+                                 CheckLevel /*level*/)
+{
+    if (opFlags[STALLED]) {
+        auto Loc = offsets.getLocations(sD, sMode, this);
+        double Te = Loc.diffStateLoc[erppD] * Loc.algStateLoc[irA] +
+            Loc.diffStateLoc[emppD] * Loc.algStateLoc[imA];
+        if (Te - mechPower(1.0) > 0) {
+            opFlags.reset(STALLED);
+            alert(this, JAC_COUNT_INCREASE);
+            return ChangeCode::JACOBIAN_CHANGE;
+        }
+    }
+    return ChangeCode::NO_CHANGE;
+}
+}  // namespace griddyn::loads
+// NOLINTEND(readability-identifier-length, readability-identifier-naming,
+//           readability-math-missing-parentheses, misc-const-correctness,
+//           readability-braces-around-statements, google-readability-braces-around-statements,
+//           hicpp-braces-around-statements, readability-isolate-declaration,
+//           readability-qualified-auto, hicpp-member-init,
+//           readability-inconsistent-ifelse-braces, readability-implicit-bool-conversion,
+//           hicpp-named-parameter, readability-named-parameter)

@@ -1,0 +1,158 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "../fmi_models/fmiMESubModel.h"
+#include "fmiWrapper.hpp"
+#include <string>
+#include <vector>
+
+namespace griddyn::fmi {
+template<class BaseObj>
+class FmiMEWrapper: public FmiWrapper<FmiMESubModel, BaseObj> {
+  public:
+    FmiMEWrapper(const std::string& objName): FmiWrapper<FmiMESubModel, BaseObj>(objName) {}
+    virtual CoreObject* clone(CoreObject* obj) const override
+    {
+        auto nobj = cloneBase<FmiMEWrapper, FmiWrapper<FmiMESubModel, BaseObj>>(this, obj);
+        if (nobj == nullptr) {
+            return obj;
+        }
+
+        return nobj;
+    }
+
+    virtual void pFlowObjectInitializeA(CoreTime time0, std::uint32_t flags) override
+    {
+        if (FmiWrapper<FmiMESubModel, BaseObj>::fmisub == nullptr) {
+            this->disable();
+            return;
+        }
+        if (FmiWrapper<FmiMESubModel, BaseObj>::fmisub->isLoaded()) {
+            FmiWrapper<FmiMESubModel, BaseObj>::configureFmiIo();
+            SET_CONTROLFLAG(flags, FORCE_CONSTANT_PFLOW_INITIALIZATION);
+            BaseObj::pFlowObjectInitializeA(time0, flags);
+        } else {
+            this->disable();
+        }
+    }
+
+    virtual void dynObjectInitializeA(CoreTime time0, std::uint32_t flags) override
+    {
+        if (!BaseObj::opFlags[POWERFLOW_INITIALIZED]) {  // just to make sure we actually
+            // initialized and didn't go directly to
+            // the dynamic initialization
+            pFlowObjectInitializeA(time0, flags);
+        }
+    }
+    virtual void residual(const IOdata& inputs,
+                          const StateData& sD,
+                          double resid[],
+                          const SolverMode& sMode) override
+    {
+        if (FmiWrapper<FmiMESubModel, BaseObj>::fmisub == nullptr) {
+            return;
+        }
+        FmiWrapper<FmiMESubModel, BaseObj>::fmisub->residual(inputs, sD, resid, sMode);
+    }
+
+    virtual void derivative(const IOdata& inputs,
+                            const StateData& sD,
+                            double deriv[],
+                            const SolverMode& sMode) override
+    {
+        if (FmiWrapper<FmiMESubModel, BaseObj>::fmisub == nullptr) {
+            return;
+        }
+        FmiWrapper<FmiMESubModel, BaseObj>::fmisub->derivative(inputs, sD, deriv, sMode);
+    }
+
+    virtual void outputPartialDerivatives(const IOdata& inputs,
+                                          const StateData& sD,
+                                          MatrixData<double>& md,
+                                          const SolverMode& sMode) override
+    {
+        if (FmiWrapper<FmiMESubModel, BaseObj>::fmisub == nullptr) {
+            return;
+        }
+        FmiWrapper<FmiMESubModel, BaseObj>::fmisub->outputPartialDerivatives(inputs, sD, md, sMode);
+    }
+    virtual void ioPartialDerivatives(const IOdata& inputs,
+                                      const StateData& sD,
+                                      MatrixData<double>& md,
+                                      const IOlocs& inputLocs,
+                                      const SolverMode& sMode) override
+    {
+        if (FmiWrapper<FmiMESubModel, BaseObj>::fmisub == nullptr) {
+            return;
+        }
+        FmiWrapper<FmiMESubModel, BaseObj>::fmisub->ioPartialDerivatives(
+            inputs, sD, md, inputLocs, sMode);
+    }
+    virtual void jacobianElements(const IOdata& inputs,
+                                  const StateData& sD,
+                                  MatrixData<double>& md,
+                                  const IOlocs& inputLocs,
+                                  const SolverMode& sMode) override
+    {
+        if (FmiWrapper<FmiMESubModel, BaseObj>::fmisub == nullptr) {
+            return;
+        }
+        FmiWrapper<FmiMESubModel, BaseObj>::fmisub->jacobianElements(
+            inputs, sD, md, inputLocs, sMode);
+    }
+
+    virtual void rootTest(const IOdata& inputs,
+                          const StateData& sD,
+                          double roots[],
+                          const SolverMode& sMode) override
+    {
+        if (FmiWrapper<FmiMESubModel, BaseObj>::fmisub == nullptr) {
+            return;
+        }
+        FmiWrapper<FmiMESubModel, BaseObj>::fmisub->rootTest(inputs, sD, roots, sMode);
+    }
+    virtual void rootTrigger(CoreTime time,
+                             const IOdata& inputs,
+                             const std::vector<int>& rootMask,
+                             const SolverMode& sMode) override
+    {
+        if (FmiWrapper<FmiMESubModel, BaseObj>::fmisub == nullptr) {
+            return;
+        }
+        FmiWrapper<FmiMESubModel, BaseObj>::fmisub->rootTrigger(time, inputs, rootMask, sMode);
+    }
+
+    virtual void setState(CoreTime time,
+                          const double state[],
+                          const double dstateDt[],
+                          const SolverMode& sMode) override
+    {
+        if (FmiWrapper<FmiMESubModel, BaseObj>::fmisub == nullptr) {
+            return;
+        }
+        FmiWrapper<FmiMESubModel, BaseObj>::fmisub->setState(time, state, dstateDt, sMode);
+    }
+
+    virtual index_t findIndex(std::string_view field, const SolverMode& sMode) const override
+    {
+        if (FmiWrapper<FmiMESubModel, BaseObj>::fmisub == nullptr) {
+            return kInvalidLocation;
+        }
+        return FmiWrapper<FmiMESubModel, BaseObj>::fmisub->findIndex(field, sMode);
+    }
+
+    virtual void timestep(CoreTime time, const IOdata& inputs, const SolverMode& sMode) override
+    {
+        BaseObj::prevTime = time;
+        if (FmiWrapper<FmiMESubModel, BaseObj>::fmisub == nullptr) {
+            return;
+        }
+        FmiWrapper<FmiMESubModel, BaseObj>::fmisub->timestep(time, inputs, sMode);
+    }
+};
+}  // namespace griddyn::fmi

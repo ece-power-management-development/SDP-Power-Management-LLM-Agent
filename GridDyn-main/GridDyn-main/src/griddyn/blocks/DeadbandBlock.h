@@ -1,0 +1,124 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "../Block.h"
+#include <string>
+#include <vector>
+
+namespace griddyn::blocks {
+/**
+ * @brief Stateful deadband, with optional continuous transition ramps.
+ *
+ * For biased input @f$x=u+b@f$, the normal deadband output is the configured
+ * `level` while @f$x\in[low,high]@f$ and is @f$x@f$ outside that interval.
+ * With the `shifted` flag, the outside branches are offset to meet `level`
+ * continuously at the bounds.  `ramp`, `rampup`, and `rampdown` introduce
+ * linear transition regions instead.  The exposed output is @f$K f(x)@f$ and
+ * inherited GridBlock limits may further clamp it.
+ *
+ * Root events transition among NORMAL, OUTSIDE, SHIFTED, and the two ramp
+ * states.  `reset`, `resethigh`, and `resetlow` provide hysteresis; this is
+ * important for preventing event chatter near a boundary.  `db`/`deadband`
+ * sets symmetric bounds around `level`; `high` and `low` set individual
+ * boundaries.
+ */
+class DeadbandBlock: public GridBlock {
+  public:
+    /** @brief flags for the deadband block*/
+    enum DeadbandBlockFlags {
+        USES_DEADBAND = OBJECT_FLAG10,  //!< flag indicating the deadband is in use
+        USES_SHIFTED_OUTPUT =
+            OBJECT_FLAG11,  //!< flag indicating the output should shift for continuity
+        DB_TRIGGER_HIGH = OBJECT_FLAG12,  //!< flag indicating the deadband has been triggered on
+                                          //!< the high side
+    };
+    /** states for the deadband block*/
+    enum class DeadbandState { NORMAL, RAMP_UP, OUTSIDE, RAMP_DOWN, SHIFTED };
+
+  protected:
+    model_parameter mDeadbandHigh = -kBigNum;  //!< upper limit on the deadband
+    model_parameter mDeadbandLow = kBigNum;  //!< lower deadband limit
+    model_parameter mRampUpBand = 0;  //!< ramp band on the up side
+    model_parameter mRampDownBand = 0;  //!< ramp band on the low side
+    model_parameter mResetHigh = -kBigNum;  //!< the reset level to go off the deadband
+    model_parameter mResetLow =
+        kBigNum;  //!< the reset level to go back in the deadband on the low side
+    model_parameter mDeadbandLevel =
+        0.0;  //!<  the output level while the input is inside the deadband
+    model_parameter mTolerance = 1e-6;  //!< the tolerance for resetting on the check function
+    DeadbandState mDeadbandState =
+        DeadbandState::NORMAL;  //!< the current state of the deadband block
+
+  public:
+    /** @brief the default constructor*/
+    explicit DeadbandBlock(const std::string& objName = "deadband_#");
+    /** @brief alternate constructor with a deadband argument
+@param[in] deadbandWidth the size of the deadband
+*/
+    DeadbandBlock(double deadbandWidth, const std::string& objName = "deadband_#");
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+    virtual void dynObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+    virtual void dynObjectInitializeB(const IOdata& inputs,
+                                      const IOdata& desiredOutput,
+                                      IOdata& fieldSet) override;
+
+    virtual void setFlag(std::string_view flag, bool val) override;
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+    // virtual index_t findIndex(const std::string &field, const SolverMode &sMode) const;
+
+    // virtual void derivative(const IOdata &inputs, const StateData&sD, double deriv[], const
+    // SolverMode &sMode);
+    virtual void blockDerivative(double input,
+                                 double didt,
+                                 const StateData& stateDataRef,
+                                 double deriv[],
+                                 const SolverMode& sMode) override;
+    virtual void blockAlgebraicUpdate(double input,
+                                      const StateData& stateDataRef,
+                                      double update[],
+                                      const SolverMode& sMode) override;
+
+    virtual void blockJacobianElements(double input,
+                                       double didt,
+                                       const StateData& stateDataRef,
+                                       MatrixData<double>& jacobian,
+                                       index_t argLoc,
+                                       const SolverMode& sMode) override;
+    virtual double step(CoreTime time, double input) override;
+    virtual void rootTest(const IOdata& inputs,
+                          const StateData& stateDataRef,
+                          double roots[],
+                          const SolverMode& sMode) override;
+    virtual void rootTrigger(CoreTime time,
+                             const IOdata& inputs,
+                             const std::vector<int>& rootMask,
+                             const SolverMode& sMode) override;
+    virtual ChangeCode rootCheck(const IOdata& inputs,
+                                 const StateData& stateDataRef,
+                                 const SolverMode& sMode,
+                                 CheckLevel level) override;
+    /** @brief get the deadband state
+@return the state of the deadband block
+*/
+    DeadbandState getDBState() const { return mDeadbandState; }
+    /** @brief get the output of the deadband portion {not including the gain and limiters
+@param[in] input the input value
+@return the computed output value
+*/
+    double computeValue(double input) const;
+    /** @brief compute the partial derivative of the output with respect to the input
+@param[in] input the input value
+@return the computed derivative
+*/
+    double computeDoutDin(double input) const;
+    // virtual void setTime(CoreTime time){prevTime=time;};
+};
+
+}  // namespace griddyn::blocks

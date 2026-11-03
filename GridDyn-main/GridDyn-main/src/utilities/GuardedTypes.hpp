@@ -1,0 +1,32 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include <libguarded/atomic_guarded.hpp>
+#include <libguarded/guarded.hpp>
+#include <libguarded/ordered_guarded.hpp>
+#include <libguarded/shared_guarded.hpp>
+#include <mutex>
+#include <shared_mutex>
+
+template<class T>
+using guarded = libguarded::guarded<T>;
+
+template<class T>
+using atomic_guarded = libguarded::atomic_guarded<T>;
+
+template<class T>
+using shared_guarded_m = libguarded::shared_guarded<T, std::mutex>;
+
+template<class T>
+using ordered_guarded_m = libguarded::ordered_guarded<T, std::mutex>;
+
+template<class T>
+using shared_guarded = libguarded::shared_guarded<T, std::shared_mutex>;
+
+template<class T>
+using ordered_guarded = libguarded::ordered_guarded<T, std::shared_mutex>;

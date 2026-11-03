@@ -1,0 +1,100 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "FMI2/fmi2FunctionTypes.h"
+#include "core/CoreOwningPtr.hpp"
+#include "runner/gridDynRunner.h"
+#include <bitset>
+#include <future>
+#include <string>
+
+namespace griddyn {
+class ReaderInfo;
+namespace fmi {
+    class FmiCoordinator;
+
+    /** fmiRunner is the execution object for executing under an fmi context
+it inherits from gridDynRunner and adds some extra features necessary for executing under an fMI
+*/
+    class FmiRunner: public GriddynRunner {
+      private:
+        CoreOwningPtr<FmiCoordinator> mCoordinator;  //!< the coordinator object for managing object
+                                                     //!< that manage the fmi inputs and outputs
+        std::bitset<7> mLoggingCategories;  //!< indicators of which logging categories to use
+        bool mRunAsync = false;  //!< indicator that we should run asynchronously
+        bool mModelExchangeRunner =
+            false;  //!< indicator that the object is running in model exchange mode
+        std::future<void>
+            mAsyncReturn;  //!< the future object corresponding to the asyncrhonous operation
+      public:
+        /** construct an fmurunner object
+    @param name the name of the runner
+    @param resourceLocations the FMU resource location information
+    @param functions a set of helper function from the FMI master
+    @param modelExchange set to true if this is instantiating a model exchange object (optional
+    defaults to false)
+    */
+        FmiRunner(const std::string& name,
+                  const std::string& resourceLocations,
+                  const fmi2CallbackFunctions* functions,
+                  bool modelExchange = false);
+        ~FmiRunner();
+
+      public:
+        virtual CoreTime Run() override;
+
+        /** update the FMI outputs*/
+        void updateOutputs();
+
+        virtual CoreTime Step(CoreTime time) override;
+        virtual void StepAsync(CoreTime time) override;
+        virtual void Finalize() override;
+
+      private:
+        using GriddynRunner::Reset;
+
+      public:
+        virtual int Reset() override;
+
+        id_type_t getId() const;
+
+        virtual bool setValue(index_t valueReference, double inputValue);
+        virtual bool setStringValue(index_t valueReference, const char* stringValue);
+        virtual double getValue(index_t valueReference);
+
+        void setLoggingCategories(std::bitset<7> logCat) { mLoggingCategories = logCat; }
+        /** check whether the runner is set to run asynchronously*/
+        bool runAsynchronously() const { return mRunAsync; }
+        /** set the asyncrhonous mode for operation*/
+        void setAsynchronousMode(bool async)
+        {
+            mRunAsync = (stepFinished != nullptr) ? async : false;
+        }
+
+        /** return true if the object is a model exchange object*/
+        bool isModelExchangeObject() const { return mModelExchangeRunner; }
+        /** check whether an asynchronous step call is finished*/
+        bool isFinished() const;
+        /** locate a value reference from a name*/
+        index_t findVR(const std::string& varName) const;
+
+        void logger(int level, const std::string& logMessage);
+
+      private:
+        // these are used for logging
+        fmi2CallbackLogger loggerFunc = nullptr;  // reference to the logger function
+        fmi2StepFinished stepFinished = nullptr;  //!< reference to a step finished function
+      public:
+        fmi2Component fmiComp = nullptr;
+        std::string identifier;
+        std::string recordDirectory;
+        std::string mResourceLocation;
+    };
+
+}  // namespace fmi
+}  // namespace griddyn

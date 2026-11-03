@@ -1,0 +1,214 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "../gtestHelper.h"
+#include "fileInput/fileInput.h"
+#include "griddyn/links/AcLine.h"
+#include "griddyn/links/AdjustableTransformer.h"
+#include "griddyn/simulation/Diagnostics.h"
+#include <gtest/gtest.h>
+#include <string>
+#include <vector>
+// testP case for CoreObject object
+
+#define TADJ_TEST_DIRECTORY GRIDDYN_TEST_DIRECTORY "/adj_tests/"
+
+using namespace griddyn;
+
+class AdjustableTransformerTests: public GridDynSimulationTestFixture, public ::testing::Test {};
+
+TEST_F(AdjustableTransformerTests, AdjTestSimple)
+{
+    std::string fileName = std::string(TADJ_TEST_DIRECTORY "adj_test1.xml");
+
+    gds = readSimXMLFile(fileName);
+    gds->powerflow();
+    requireState(GridDynSimulation::GridState::POWERFLOW_COMPLETE);
+
+    std::vector<double> state;
+    gds->getVoltage(state);
+    EXPECT_GE(state[2], 0.99);
+    EXPECT_LE(state[2], 1.01);
+
+    // tap changing doesn't do anything in this case we are checking to make sure the tap goes all
+    // the way
+    fileName = std::string(TADJ_TEST_DIRECTORY "adj_test2.xml");
+    gds2 = readSimXMLFile(fileName);
+    gds2->powerflow();
+    requireStates(gds2->currentProcessState(), GridDynSimulation::GridState::POWERFLOW_COMPLETE);
+
+    auto adj = dynamic_cast<links::AdjustableTransformer*>(gds2->getLink(1));
+    ASSERT_NE(adj, nullptr);
+    EXPECT_NEAR(adj->getTap() - 1.1, 0.0, 1e-3);
+}
+
+TEST_F(AdjustableTransformerTests, AdjTestSimple2)
+{
+    // test multiple interacting controllers
+    std::string fileName = std::string(TADJ_TEST_DIRECTORY "adj_test3.xml");
+
+    gds = readSimXMLFile(fileName);
+    gds->powerflow();
+    requireState(GridDynSimulation::GridState::POWERFLOW_COMPLETE);
+
+    std::vector<double> state;
+    gds->getVoltage(state);
+    EXPECT_GE(state[1], 0.99);
+    EXPECT_LE(state[1], 1.01);
+    EXPECT_GE(state[2], 0.99);
+    EXPECT_LE(state[2], 1.01);
+
+    // test multiple interacting controllers voltage reduction mode
+    fileName = std::string(TADJ_TEST_DIRECTORY "adj_test4.xml");
+
+    gds2 = readSimXMLFile(fileName);
+    gds2->powerflow();
+    ASSERT_EQ(gds2->currentProcessState(), GridDynSimulation::GridState::POWERFLOW_COMPLETE);
+
+    gds2->getVoltage(state);
+    EXPECT_GE(state[1], 0.99);
+    EXPECT_LE(state[1], 1.01);
+    EXPECT_GE(state[2], 0.99);
+    EXPECT_LE(state[2], 1.01);
+
+    // test a remote control bus adjustable link between 1 and 3 and controlling bus 4
+    fileName = std::string(TADJ_TEST_DIRECTORY "adj_test5.xml");
+
+    gds = readSimXMLFile(fileName);
+    gds->powerflow();
+    requireState(GridDynSimulation::GridState::POWERFLOW_COMPLETE);
+
+    gds->getVoltage(state);
+    EXPECT_GE(state[2], 0.99);
+    EXPECT_LE(state[2], 1.011);
+}
+
+// now test the stepped MW control
+TEST_F(AdjustableTransformerTests, AdjTestMw)
+{
+    std::string fileName = std::string(TADJ_TEST_DIRECTORY "adj_test6.xml");
+
+    gds = readSimXMLFile(fileName);
+    gds->powerflow();
+    requireState(GridDynSimulation::GridState::POWERFLOW_COMPLETE);
+
+    std::vector<double> state;
+    gds->getLinkRealPower(state);
+
+    EXPECT_LE(state[0], 1.05);
+    EXPECT_GE(state[0], 0.95);
+}
+
+// now test the stepped MVar control
+TEST_F(AdjustableTransformerTests, AdjTestMvar)
+{
+    std::string fileName = std::string(TADJ_TEST_DIRECTORY "adj_test7.xml");
+
+    gds = readSimXMLFile(fileName);
+    gds->pFlowInitialize();
+    int mmatch = runJacobianCheck(gds, cPflowSolverMode);
+
+    ASSERT_EQ(mmatch, 0);
+    gds->powerflow();
+    requireState(GridDynSimulation::GridState::POWERFLOW_COMPLETE);
+
+    std::vector<double> state;
+    gds->getLinkReactivePower(state, 0, 2);
+
+    EXPECT_LE(-state[0], 0.55);
+    EXPECT_GE(-state[0], 0.50);
+
+    fileName = std::string(TADJ_TEST_DIRECTORY "adj_test8.xml");
+
+    gds2 = readSimXMLFile(fileName);
+    gds2->powerflow();
+    requireStates(gds2->currentProcessState(), GridDynSimulation::GridState::POWERFLOW_COMPLETE);
+
+    gds2->getLinkReactivePower(state, 0, 2);
+
+    EXPECT_LE(-state[0], 1.1);
+    EXPECT_GE(-state[0], 1.0);
+}
+
+TEST_F(AdjustableTransformerTests, AdjTestContMvar)
+{
+    std::string fileName = std::string(TADJ_TEST_DIRECTORY "adj_test7c.xml");
+
+    gds = readSimXMLFile(fileName);
+    gds->pFlowInitialize();
+    int mmatch = runJacobianCheck(gds, cPflowSolverMode);
+
+    ASSERT_EQ(mmatch, 0);
+    gds->powerflow();
+    requireState(GridDynSimulation::GridState::POWERFLOW_COMPLETE);
+
+    std::vector<double> state;
+    gds->getLinkReactivePower(state, 0, 2);
+
+    EXPECT_NEAR(state[0], -0.50, (std::abs(-0.50) * 1e-4) + 1e-12);
+
+    fileName = std::string(TADJ_TEST_DIRECTORY "adj_test8c.xml");
+
+    gds2 = readSimXMLFile(fileName);
+    gds2->powerflow();
+    requireStates(gds2->currentProcessState(), GridDynSimulation::GridState::POWERFLOW_COMPLETE);
+
+    gds2->getLinkReactivePower(state, 0, 2);
+
+    EXPECT_NEAR(state[0], -1.05, (std::abs(-1.05) * 1e-4) + 1e-12);
+}
+
+// now test the continuous Voltage control
+TEST_F(AdjustableTransformerTests, AdjTestContV)
+{
+    std::string fileName = std::string(TADJ_TEST_DIRECTORY "adj_test9.xml");
+
+    gds = readSimXMLFile(fileName);
+    gds->pFlowInitialize();
+    int mmatch = runJacobianCheck(gds, cPflowSolverMode);
+
+    ASSERT_EQ(mmatch, 0);
+    gds->powerflow();
+    requireState(GridDynSimulation::GridState::POWERFLOW_COMPLETE);
+
+    std::vector<double> state;
+    gds->getVoltage(state);
+
+    EXPECT_NEAR(state[2], 1.0, 1e-7);
+    // test multiple continuous controllers
+    fileName = std::string(TADJ_TEST_DIRECTORY "adj_test10.xml");
+
+    gds2 = readSimXMLFile(fileName);
+    gds2->powerflow();
+    requireStates(gds2->currentProcessState(), GridDynSimulation::GridState::POWERFLOW_COMPLETE);
+
+    gds2->getVoltage(state);
+    EXPECT_NEAR(state[1], 1.0, 1e-7);
+    EXPECT_NEAR(state[2], 1.0, 1e-7);
+}
+
+TEST_F(AdjustableTransformerTests, NtpControlsTapModeAndPositionCount)
+{
+    links::AdjustableTransformer transformer;
+    transformer.set("mintap", 0.9);
+    transformer.set("maxtap", 1.1);
+
+    transformer.set("nsteps", 0.0);
+    EXPECT_TRUE(transformer.checkFlag(links::AdjustableTransformer::CONTINUOUS_FLAG));
+    EXPECT_FALSE(transformer.checkFlag(links::AdjustableTransformer::NO_PFLOW_ADJUSTMENTS));
+    EXPECT_DOUBLE_EQ(transformer.get("nsteps"), 0.0);
+
+    transformer.set("nsteps", 1.0);
+    EXPECT_FALSE(transformer.checkFlag(links::AdjustableTransformer::CONTINUOUS_FLAG));
+    EXPECT_TRUE(transformer.checkFlag(links::AdjustableTransformer::NO_PFLOW_ADJUSTMENTS));
+    EXPECT_DOUBLE_EQ(transformer.get("nsteps"), 1.0);
+
+    transformer.set("nsteps", 11.0);
+    EXPECT_FALSE(transformer.checkFlag(links::AdjustableTransformer::CONTINUOUS_FLAG));
+    EXPECT_FALSE(transformer.checkFlag(links::AdjustableTransformer::NO_PFLOW_ADJUSTMENTS));
+    EXPECT_NEAR(transformer.get("stepsize"), 0.02, 1.0e-12);
+    EXPECT_NEAR(transformer.get("nsteps"), 11.0, 1.0e-12);
+}

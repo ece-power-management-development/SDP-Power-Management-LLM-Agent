@@ -1,0 +1,148 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+// headers
+#include "../gridOptObjects.h"
+#include <string>
+#include <vector>
+// forward classes
+namespace griddyn {
+class GridLinkOpt;
+class GridLoadOpt;
+class GridGenOpt;
+class GridBus;
+
+class GridBusOpt: public GridOptObject {
+  public:
+    enum BusFlags {
+
+    };
+
+  protected:
+    /** Add this bus''s active-power equation.  AC-derived adapters may override it. */
+    virtual void addActivePowerBalance(const OptimizationData& optimizationData,
+                                       double constraintValues[],
+                                       const OptimizationMode& oMode) const;
+    std::vector<GridLoadOpt*> loadList;
+    std::vector<GridLinkOpt*> linkList;
+    std::vector<GridGenOpt*> genList;
+
+    GridBus* bus = nullptr;
+
+  public:
+    GridBusOpt(const std::string& objName = "");
+    GridBusOpt(CoreObject* obj, const std::string& objName = "");
+    ~GridBusOpt();
+
+    CoreObject* clone(CoreObject* obj = nullptr) const override;
+    CoreObject* sourceObject() const override;
+    // add components
+    void add(CoreObject* obj) override;
+    void add(GridLoadOpt* loadObject);
+    void add(GridGenOpt* gen);
+    void add(GridLinkOpt* lnk);
+
+    // remove components
+    void remove(CoreObject* obj) override;
+    void remove(GridLoadOpt* loadObject);
+    void remove(GridGenOpt* gen);
+    void remove(GridLinkOpt* lnk);
+
+    virtual void dynObjectInitializeA(std::uint32_t flags) override;
+    virtual void loadSizes(const OptimizationMode& oMode) override;
+
+    virtual void setValues(const OptimizationData& optimizationData,
+                           const OptimizationMode& oMode) override;
+    // for saving the state
+    virtual void guessState(double time, double val[], const OptimizationMode& oMode) override;
+    virtual void getTols(double tols[], const OptimizationMode& oMode) override;
+    virtual void getVariableType(double sdata[], const OptimizationMode& oMode) override;
+
+    virtual void valueBounds(double time,
+                             double upperLimit[],
+                             double lowerLimit[],
+                             const OptimizationMode& oMode) override;
+
+    virtual void linearObj(const OptimizationData& optimizationData,
+                           vectData<double>& linObj,
+                           const OptimizationMode& oMode) override;
+    virtual void quadraticObj(const OptimizationData& optimizationData,
+                              vectData<double>& linObj,
+                              vectData<double>& quadObj,
+                              const OptimizationMode& oMode) override;
+
+    virtual double objValue(const OptimizationData& optimizationData,
+                            const OptimizationMode& oMode) override;
+    virtual void gradient(const OptimizationData& optimizationData,
+                          double deriv[],
+                          const OptimizationMode& oMode) override;
+    virtual void jacobianElements(const OptimizationData& optimizationData,
+                                  MatrixData<double>& matrixDataRef,
+                                  const OptimizationMode& oMode) override;
+    virtual void getConstraints(const OptimizationData& optimizationData,
+                                MatrixData<double>& cons,
+                                double upperLimit[],
+                                double lowerLimit[],
+                                const OptimizationMode& oMode) override;
+    virtual void constraintValue(const OptimizationData& optimizationData,
+                                 double cVals[],
+                                 const OptimizationMode& oMode) override;
+    virtual void constraintJacobianElements(const OptimizationData& optimizationData,
+                                            MatrixData<double>& matrixDataRef,
+                                            const OptimizationMode& oMode) override;
+    virtual void getObjectiveNames(stringVec& objectiveNames,
+                                   const OptimizationMode& oMode,
+                                   const std::string& prefix = "") override;
+
+    void disable() override;
+    // parameter set functions
+    virtual void setOffsets(const OptimizationOffsets& newOffsets,
+                            const OptimizationMode& oMode) override;
+    virtual void
+        setOffset(index_t offset, index_t constraintOffset, const OptimizationMode& oMode) override;
+
+    void setAll(const std::string& type,
+                const std::string& param,
+                double val,
+                units::unit unitType = units::defunit);
+    void set(std::string_view param, std::string_view val) override;
+    void set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+    // parameter get functions
+    virtual double get(std::string_view param,
+                       units::unit unitType = units::defunit) const override;
+
+    // void alert (CoreObject *object, int code);
+
+    // find components
+    GridLinkOpt* findLink(GridBus* bs) const;
+    CoreObject* find(std::string_view objName) const override;
+    CoreObject* getSubObject(std::string_view typeName, index_t num) const override;
+    CoreObject* findByUserID(std::string_view typeName, index_t searchID) const override;
+
+    GridOptObject* getLink(index_t index) const override;
+    GridOptObject* getLoad(index_t index = 0) const;
+    GridOptObject* getGen(index_t index = 0) const;
+
+    /** The attached physical bus; used to bind network adapters without copying data. */
+    GridBus* sourceBus() const { return bus; }
+
+    GridOptObject* getBus(index_t /*index*/) const override
+    {
+        return const_cast<GridBusOpt*>(this);
+    }
+    GridOptObject* getArea(index_t /*index*/) const override
+    {
+        return static_cast<GridOptObject*>(getParent());
+    }
+};
+
+// bool compareBus (GridBus *bus1, GridBus *bus2, bool cmpLink = false,bool printDiff = false);
+
+GridBusOpt* getMatchingBusOpt(GridBusOpt* bus, const GridOptObject* src, GridOptObject* sec);
+
+}  // namespace griddyn

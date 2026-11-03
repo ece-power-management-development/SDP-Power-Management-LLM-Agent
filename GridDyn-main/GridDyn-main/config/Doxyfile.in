@@ -1,0 +1,70 @@
+#
+# Copyright (c) 2014-2026, Lawrence Livermore National Security
+# See the top-level NOTICE for additional details.
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# Minimal project configuration for the C++ API reference.
+# CMake configures this file as build/Doxyfile.
+
+DOXYFILE_ENCODING = UTF-8
+PROJECT_NAME = GridDyn
+PROJECT_NUMBER = @GRIDDYN_MAJOR@.@GRIDDYN_MINOR@.@GRIDDYN_PATCH@
+PROJECT_LOGO = "@CMAKE_CURRENT_SOURCE_DIR@/docgen/images/griddyn.ico"
+OUTPUT_DIRECTORY = "@DOXYGEN_OUTPUT_DIR@"
+OUTPUT_LANGUAGE = English
+
+# Keep undocumented declarations visible and report all diagnostics to a file.
+QUIET = YES
+WARNINGS = YES
+WARN_IF_UNDOCUMENTED = YES
+WARN_IF_DOC_ERROR = YES
+WARN_NO_PARAMDOC = NO
+WARN_FORMAT = "$file:$line: $text"
+WARN_LOGFILE = "@CMAKE_CURRENT_BINARY_DIR@/doxygen_warnings.log"
+
+# Scan maintained source and documentation; tests and old presentations are not
+# part of the generated API reference.
+INPUT = "@CMAKE_CURRENT_SOURCE_DIR@/src" "@CMAKE_CURRENT_SOURCE_DIR@/docs"
+INPUT_ENCODING = UTF-8
+RECURSIVE = YES
+EXCLUDE = "@CMAKE_CURRENT_SOURCE_DIR@/src/test" "@CMAKE_CURRENT_SOURCE_DIR@/docs/presentations"
+EXCLUDE_PATTERNS = */test/* */presentations/*
+EXCLUDE_SYMBOLS = zmq, json_gd
+IMAGE_PATH = "@CMAKE_CURRENT_SOURCE_DIR@/docgen/images"
+
+# Preserve inherited documentation while exposing undocumented declarations.
+INHERIT_DOCS = YES
+EXTRACT_ALL = NO
+EXTRACT_PRIVATE = NO
+EXTRACT_LOCAL_CLASSES = NO
+HIDE_UNDOC_MEMBERS = NO
+HIDE_UNDOC_CLASSES = NO
+BUILTIN_STL_SUPPORT = YES
+STRIP_CODE_COMMENTS = YES
+CASE_SENSE_NAMES = YES
+
+# Generate the HTML reference only. MathJax renders the formulas in the pages.
+GENERATE_HTML = YES
+HTML_OUTPUT = html
+HTML_FILE_EXTENSION = .html
+HTML_EXTRA_STYLESHEET = "@CMAKE_CURRENT_SOURCE_DIR@/docs/extra_doxygen_style.css"
+HTML_DYNAMIC_SECTIONS = YES
+USE_MATHJAX = YES
+ALPHABETICAL_INDEX = NO
+DISABLE_INDEX = NO
+GENERATE_TREEVIEW = NO
+SEARCHENGINE = YES
+GENERATE_LATEX = NO
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION = YES
+REFERENCES_LINK_SOURCE = YES
+SOURCE_BROWSER = NO
+
+# Graphviz is optional and is not required for the normal documentation build.
+HAVE_DOT = NO
+
+# Parse conditional compilation without expanding project macros.
+ENABLE_PREPROCESSING = YES
+MACRO_EXPANSION = NO
+SEARCH_INCLUDES = YES
+SKIP_FUNCTION_MACROS = YES

@@ -1,0 +1,46 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "GenModel6.h"
+#include <string>
+
+namespace griddyn::genmodels {
+
+class GenModel8: public GenModel6 {
+  protected:
+  public:
+    explicit GenModel8(const std::string& objName = "genModel8_#");
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+    virtual void dynObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+    virtual void dynObjectInitializeB(const IOdata& inputs,
+                                      const IOdata& desiredOutput,
+                                      IOdata& fieldSet) override;
+
+    virtual stringVec localStateNames() const override;
+    // dynamics
+    virtual void algebraicUpdate(const IOdata& inputs,
+                                 const StateData& stateData,
+                                 double update[],
+                                 const SolverMode& sMode,
+                                 double alpha) override;
+    virtual void residual(const IOdata& inputs,
+                          const StateData& stateData,
+                          double resid[],
+                          const SolverMode& sMode) override;
+    virtual void derivative(const IOdata& inputs,
+                            const StateData& stateData,
+                            double deriv[],
+                            const SolverMode& sMode) override;
+    virtual void jacobianElements(const IOdata& inputs,
+                                  const StateData& stateData,
+                                  MatrixData<double>& matrixData,
+                                  const IOlocs& inputLocs,
+                                  const SolverMode& sMode) override;
+};
+
+}  // namespace griddyn::genmodels

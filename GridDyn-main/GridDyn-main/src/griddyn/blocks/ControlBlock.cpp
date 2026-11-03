@@ -1,0 +1,238 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "ControlBlock.h"
+
+#include "core/CoreObjectTemplates.hpp"
+#include "gmlc/utilities/vectorOps.hpp"
+#include "utilities/MatrixData.hpp"
+#include <string>
+
+namespace griddyn::blocks {
+ControlBlock::ControlBlock(const std::string& objName): GridBlock(objName)
+{
+    opFlags.set(USE_STATE);
+}
+ControlBlock::ControlBlock(double timeConstant, const std::string& objName):
+    GridBlock(objName), mT1(timeConstant)
+{
+    opFlags.set(USE_STATE);
+}
+ControlBlock::ControlBlock(double timeConstant,
+                           double upperTimeConstant,
+                           const std::string& objName):
+    GridBlock(objName), mT1(timeConstant), mT2(upperTimeConstant)
+{
+    opFlags.set(USE_STATE);
+}
+
+CoreObject* ControlBlock::clone(CoreObject* obj) const
+{
+    auto* nobj = cloneBase<ControlBlock, GridBlock>(this, obj);
+    if (nobj == nullptr) {
+        return obj;
+    }
+    nobj->mT2 = mT2;
+    nobj->mT1 = mT1;
+    return nobj;
+}
+// set up the number of states
+void ControlBlock::dynObjectInitializeA(CoreTime time0, std::uint32_t flags)
+{
+    if (opFlags[DIFFERENTIAL_INPUT]) {
+        opFlags.set(DIFFERENTIAL_OUTPUT);
+    }
+    GridBlock::dynObjectInitializeA(time0, flags);
+
+    offsets.local().local.diffSize += 1;
+    offsets.local().local.jacSize += 6;
+}
+// initial conditions
+void ControlBlock::dynObjectInitializeB(const IOdata& inputs,
+                                        const IOdata& desiredOutput,
+                                        IOdata& fieldSet)
+{
+    fieldSet.resize(1);
+    if (opFlags[HAS_LIMITS]) {
+        GridBlock::dynObjectInitializeB(inputs, desiredOutput, fieldSet);
+    }
+    if (desiredOutput.empty()) {
+        m_state[limiter_alg + 1] = K * (1.0 - (mT2 / mT1)) * (inputs[0] + bias);
+        m_state[limiter_alg] = K * (inputs[0] + bias);
+
+        fieldSet[0] = m_state[0];
+        prevInput = inputs[0] + bias;
+    } else {
+        m_state[limiter_alg] = desiredOutput[0];
+        m_state[limiter_alg + 1] = (1.0 - (mT2 / mT1)) * desiredOutput[0] / K;
+        fieldSet[0] = (desiredOutput[0] / K) - bias;
+        prevInput = desiredOutput[0] / K;
+    }
+}
+
+void ControlBlock::blockAlgebraicUpdate(double input,
+                                        const StateData& stateDataRef,
+                                        double update[],
+                                        const SolverMode& sMode)
+{
+    if (!opFlags[DIFFERENTIAL_INPUT]) {
+        auto locationData = offsets.getLocations(stateDataRef, update, sMode, this);
+
+        locationData.destLoc[limiter_alg] =
+            locationData.diffStateLoc[0] + ((mT2 / mT1) * (input + bias) * K);
+        if (limiter_alg > 0) {
+            GridBlock::blockAlgebraicUpdate(input, stateDataRef, update, sMode);
+        }
+    }
+}
+
+void ControlBlock::blockDerivative(double input,
+                                   double didt,
+                                   const StateData& stateDataRef,
+                                   double deriv[],
+                                   const SolverMode& sMode)
+{
+    auto locationData = offsets.getLocations(stateDataRef, deriv, sMode, this);
+    if (opFlags[DIFFERENTIAL_INPUT]) {
+        locationData.destDiffLoc[limiter_diff] =
+            locationData.dstateLoc[limiter_diff + 1] + ((mT2 / mT1) * didt * K);
+        locationData.destDiffLoc[limiter_diff + 1] =
+            ((K * (input + bias)) - locationData.diffStateLoc[limiter_diff]) / mT1;
+        if (limiter_diff > 0) {
+            GridBlock::blockDerivative(input, didt, stateDataRef, deriv, sMode);
+        }
+    } else {
+        locationData.destDiffLoc[0] =
+            ((K * (input + bias)) - locationData.algStateLoc[limiter_alg]) / mT1;
+    }
+}
+
+void ControlBlock::blockJacobianElements(double input,
+                                         double didt,
+                                         const StateData& stateDataRef,
+                                         MatrixData<double>& jacobian,
+                                         index_t argLoc,
+                                         const SolverMode& sMode)
+{
+    auto locationData = offsets.getLocations(stateDataRef, sMode, this);
+    if (opFlags[DIFFERENTIAL_INPUT]) {
+    } else {
+        if (hasAlgebraic(sMode)) {
+            jacobian.assign(locationData.algOffset + limiter_alg,
+                            locationData.algOffset + limiter_alg,
+                            -1);
+
+            jacobian.assignCheckCol(locationData.algOffset + limiter_alg, argLoc, K * mT2 / mT1);
+            if (limiter_alg > 0) {
+                GridBlock::blockJacobianElements(
+                    input, didt, stateDataRef, jacobian, argLoc, sMode);
+            }
+            if (hasDifferential(sMode)) {
+                jacobian.assign(locationData.algOffset + limiter_alg, locationData.diffOffset, 1);
+            }
+        }
+
+        if (hasDifferential(sMode)) {
+            jacobian.assignCheckCol(locationData.diffOffset, argLoc, K / mT1);
+            if (hasAlgebraic(sMode)) {
+                jacobian.assign(locationData.diffOffset,
+                                locationData.algOffset + limiter_alg,
+                                -1 / mT1);
+            }
+            jacobian.assign(locationData.diffOffset, locationData.diffOffset, -stateDataRef.cj);
+        }
+    }
+}
+
+double ControlBlock::step(CoreTime time, double input)
+{
+    const double timeDelta = time - prevTime;
+    double out;
+    const double inputWithBias = input + bias;
+    double intermediateValue;
+    double outputValue;
+    if (timeDelta >= fabs(5.0 * mT1)) {
+        m_state[limiter_alg + limiter_diff + 1] = K * (1.0 - (mT2 / mT1)) * inputWithBias;
+    } else {
+        const double timeStep = 0.05 * mT1;
+        double currentTime = prevTime + timeStep;
+        double currentInput = prevInput;
+        double previousIntermediateInput = prevInput;
+        intermediateValue = m_state[limiter_alg + limiter_diff + 1];
+        outputValue = m_state[limiter_alg + limiter_diff];
+        while (currentTime < time) {
+            currentInput = currentInput + (((inputWithBias - prevInput) / timeDelta) * timeStep);
+            intermediateValue = intermediateValue +
+                ((1.0 / mT1) *
+                 (((K * (previousIntermediateInput + currentInput)) / 2.0) - outputValue) *
+                 timeStep);
+            outputValue = intermediateValue + ((K * mT2 / mT1) * inputWithBias);
+            currentTime += timeStep;
+            previousIntermediateInput = currentInput;
+        }
+        m_state[limiter_alg + limiter_diff + 1] = intermediateValue +
+            ((1.0 / mT1) *
+             (((K * (previousIntermediateInput + inputWithBias)) / 2.0) - outputValue) *
+             (time - currentTime + timeStep));
+    }
+    m_state[limiter_alg + limiter_diff] =
+        m_state[limiter_alg + limiter_diff + 1] + ((K * mT2 / mT1) * inputWithBias);
+
+    prevInput = inputWithBias;
+    if (opFlags[HAS_LIMITS]) {
+        out = GridBlock::step(time, inputWithBias);
+    } else {
+        out = m_state[0];
+        prevTime = time;
+        m_output = out;
+    }
+    return out;
+}
+
+index_t ControlBlock::findIndex(std::string_view field, const SolverMode& sMode) const
+{
+    index_t ret = kInvalidLocation;
+    if (field == "m1") {
+        ret = offsets.getDiffOffset(sMode);
+    } else {
+        ret = GridBlock::findIndex(field, sMode);
+    }
+    return ret;
+}
+
+// set parameters
+void ControlBlock::set(std::string_view param, std::string_view val)
+{
+    GridBlock::set(param, val);
+}
+void ControlBlock::set(std::string_view param, double val, units::unit unitType)
+{
+    // param   = GridDynSimulation::toLower(param);
+
+    if ((param == "t1") || (param == "t")) {
+        mT1 = val;
+    } else if (param == "t2") {
+        mT2 = val;
+    } else {
+        GridBlock::set(param, val, unitType);
+    }
+}
+
+stringVec ControlBlock::localStateNames() const
+{
+    stringVec out(stateSize(cLocalSolverMode));
+    int loc = 0;
+    if (opFlags[USE_BLOCK_LIMITS]) {
+        out[loc++] = "limiter_out";
+    }
+    if (opFlags[USE_RAMP_LIMITS]) {
+        out[loc++] = "ramp_limiter_out";
+    }
+    out[loc++] = "output";
+    out[loc] = "intermediate";
+    return out;
+}
+}  // namespace griddyn::blocks

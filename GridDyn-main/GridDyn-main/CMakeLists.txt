@@ -1,0 +1,914 @@
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+# Copyright (c) 2014-2026, Lawrence Livermore National Security
+# See the top-level NOTICE for additional details. All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# cmake >= 3.28 required. The upper bound keeps policies for newer supported CMake releases enabled,
+# including CMP0167 for Boost's config-package discovery.
+cmake_minimum_required(VERSION 3.28...4.2)
+
+project(GRIDDYN VERSION 0.13.0)
+
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "GridDyn requires a 64-bit target platform")
+endif()
+
+# Require C++23 (or newer) across the project.
+if(NOT DEFINED CMAKE_CXX_STANDARD)
+    set(CMAKE_CXX_STANDARD 23)
+endif()
+if(CMAKE_CXX_STANDARD LESS 23)
+    message(FATAL_ERROR "GridDyn requires CMAKE_CXX_STANDARD to be at least 23")
+endif()
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Minimum supported compiler versions for C++23-era GridDyn.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 14)
+    message(FATAL_ERROR "GridDyn requires GCC 14 or newer")
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 18)
+    message(FATAL_ERROR "GridDyn requires Clang 18 or newer")
+endif()
+
+# version number
+set(GRIDDYN_VERSION_BUILD)
+set(GRIDDYN_DATE "2026-10-10")
+
+set(GRIDDYN_VERSION_UNDERSCORE
+    "${GRIDDYN_VERSION_MAJOR}_${GRIDDYN_VERSION_MINOR}_${GRIDDYN_VERSION_PATCH}"
+)
+if(GRIDDYN_VERSION_BUILD)
+    set(GRIDDYN_VERSION ${GRIDDYN_VERSION}-${GRIDDYN_VERSION_BUILD})
+    set(GRIDDYN_VERSION_UNDERSCORE "${GRIDDYN_VERSION_UNDERSCORE}-${GRIDDYN_VERSION_BUILD}")
+endif()
+
+set(GRIDDYN_COMPILER_VERSION
+    "${CMAKE_GENERATOR} ${CMAKE_GENERATOR_PLATFORM} ${CMAKE_SYSTEM}:${CMAKE_CXX_COMPILER_ID}-${CMAKE_CXX_COMPILER_VERSION}"
+)
+message(STATUS "SYSTEM INFO -> ${GRIDDYN_COMPILER_VERSION}")
+# ------------------------------------------------------------
+# set the module path and include some common macros
+# ------------------------------------------------------------
+
+if(PROJECT_IS_TOP_LEVEL)
+    set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+    set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${PROJECT_SOURCE_DIR}/config/cmake/"
+                          "${PROJECT_SOURCE_DIR}/ThirdParty/cmake/"
+    )
+else()
+    set(ORIGINAL_MODULE_PATH ${CMAKE_MODULE_PATH})
+    set(CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/config/cmake/"
+                          "${PROJECT_SOURCE_DIR}/ThirdParty/cmake/" ${CMAKE_MODULE_PATH}
+    )
+    get_property(griddyn-use-folders GLOBAL PROPERTY USE_FOLDERS)
+endif()
+
+if(NOT GRIDDYN_DISABLE_GIT_OPERATIONS)
+    include(version_describe)
+    git_version_describe(${PROJECT_SOURCE_DIR} GRIDDYN_VERSION_DESCRIPTION)
+endif()
+
+if(GRIDDYN_VERSION_DESCRIPTION)
+    message(STATUS "griddyn version tag description is ${GRIDDYN_VERSION_DESCRIPTION}")
+    set(GRIDDYN_VERSION_STRING
+        "${GRIDDYN_VERSION}-${GRIDDYN_VERSION_DESCRIPTION} (${GRIDDYN_DATE})"
+    )
+else()
+    set(GRIDDYN_VERSION_STRING "${GRIDDYN_VERSION} (${GRIDDYN_DATE})")
+endif()
+
+include(extraMacros)
+include(CMakeDependentOption)
+include(CTest)
+include(ucm)
+include(GNUInstallDirs)
+
+# Set the build output paths
+if(PROJECT_IS_TOP_LEVEL)
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib" CACHE PATH "Archive output dir.")
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib" CACHE PATH "Library output dir.")
+    set(CMAKE_PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+        CACHE PATH "PDB (MSVC debug symbol)output dir."
+    )
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin" CACHE PATH
+                                                                       "Executable/dll output dir."
+    )
+endif()
+# ------------------------------------------------------------
+# set the install path to a local directory
+# ------------------------------------------------------------
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT AND PROJECT_IS_TOP_LEVEL)
+    if(WIN32)
+        if(MSVC)
+            set(CMAKE_INSTALL_PREFIX "C:/local/griddyn_${GRIDDYN_VERSION_UNDERSCORE}/"
+                CACHE PATH "default install path" FORCE
+            )
+        elseif(MINGW AND NOT MSYS)
+            set(CMAKE_INSTALL_PREFIX "C:/local/griddyn_${GRIDDYN_VERSION_UNDERSCORE}/"
+                CACHE PATH "default install path" FORCE
+            )
+        elseif(MSYS)
+            # use CMAKE_OBJCOPY here since it is somewhat less likely to be overridden by users
+            # rather than the compiler
+            get_filename_component(path_bin ${CMAKE_OBJCOPY} DIRECTORY)
+            get_filename_component(path_install ${path_bin} DIRECTORY)
+            set(CMAKE_INSTALL_PREFIX ${path_install} CACHE PATH "default install path" FORCE)
+        endif(MSVC)
+    endif(WIN32)
+endif()
+
+if(MSYS
+   OR CYGWIN
+   OR UNIX
+   OR APPLE
+)
+    set(UNIX_LIKE TRUE)
+endif()
+
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+file(MAKE_DIRECTORY ${PROJECT_BINARY_DIR}/logs)
+
+# Prohibit in-source build
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
+    message(
+        FATAL_ERROR
+            "In-source build is not supported. Please, use an empty directory for building the project."
+    )
+endif()
+
+# -------
+# options
+# -------
+
+cmake_dependent_option(
+    GRIDDYN_BUILD_TESTS "Enable the test executables to be built" ON "PROJECT_IS_TOP_LEVEL" OFF
+)
+
+cmake_dependent_option(
+    GRIDDYN_BUILD_BENCHMARKS "Build GridDyn benchmarks" OFF "PROJECT_IS_TOP_LEVEL" OFF
+)
+
+cmake_dependent_advanced_option(
+    GRIDDYN_WITH_CMAKE_PACKAGE "Generate and install cmake package files" ON "PROJECT_IS_TOP_LEVEL"
+    OFF
+)
+
+# Install instructions for this target
+if(GRIDDYN_WITH_CMAKE_PACKAGE)
+    set(GRIDDYN_EXPORT_COMMAND EXPORT griddyn-targets)
+else(GRIDDYN_WITH_CMAKE_PACKAGE)
+    set(GRIDDYN_EXPORT_COMMAND)
+endif(GRIDDYN_WITH_CMAKE_PACKAGE)
+
+option(GRIDDYN_ENABLE_FMI_EXPORT "Enable construction of a binary fmi shared library for GridDyn"
+       OFF
+)
+
+option(GRIDDYN_BUILD_PYTHON_LIBRARY "Build nanobind Python library" OFF)
+
+option(GRIDDYN_ENABLE_CODE_COVERAGE_TEST "Build a target for testing code coverage" OFF)
+
+set(GRIDDYN_ENABLE_OPENMP AUTO CACHE STRING "Enable OpenMP support")
+set_property(CACHE GRIDDYN_ENABLE_OPENMP PROPERTY STRINGS AUTO ON OFF)
+
+option(# TODO this needs to be accounted for in the source code
+       GRIDDYN_ENABLE_MULTITHREADING "enable multithreading in GridDyn libraries" ON
+)
+
+option(GRIDDYN_ENABLE_MPI "Enable MPI networking library" OFF)
+
+option(
+    GRIDDYN_ENABLE_KLU
+    "Option to disable KLU (not recommended [slow]; prefer to turn on GRIDDYN_SUITESPARSE_FORCE_SUBPROJECT)"
+    ON
+)
+
+option(GRIDDYN_ENABLE_PLUGINS "Enable support for plugin modules" OFF)
+mark_as_advanced(GRIDDYN_ENABLE_PLUGINS)
+
+option(GRIDDYN_ENABLE_EXTRA_MODELS "Compile and load extraModels" ON)
+
+option(GRIDDYN_ENABLE_EXTRA_SOLVERS "Compile and load extraSolvers" OFF)
+
+option(GRIDDYN_ENABLE_FMI "Enable FMI support" ON)
+
+option(GRIDDYN_ENABLE_LOGGING "enable all normal, debug, and trace logging in GridDyn" ON)
+
+option(GRIDDYN_ENABLE_DOXYGEN "Generate Doxygen doc target" OFF)
+
+option(GRIDDYN_ENABLE_HELICS_EXECUTABLE "Enable the HELICS executable to be built" OFF)
+
+option(GRIDDYN_ENABLE_NETWORKING_LIBRARY "Enable network based communication components" OFF)
+
+option(GRIDDYN_ENABLE_OPTIMIZATION_LIBRARY "Enable Optimization libraries" OFF)
+
+cmake_dependent_option(
+    GRIDDYN_ENABLE_HIGHS "Build the HiGHS optimization solver for use by the optimization library"
+    ${GRIDDYN_ENABLE_OPTIMIZATION_LIBRARY} "GRIDDYN_ENABLE_OPTIMIZATION_LIBRARY" OFF
+)
+
+option(GRIDDYN_ENABLE_CLANG_TOOLS
+       "if clang is found enable some custom targets for clang formatting and tidy" OFF
+)
+
+option(GRIDDYN_ENABLE_PACKAGE_BUILD "Add projects for making packages and installers for GridDyn"
+       OFF
+)
+
+# -----------------
+# dependent options
+# -----------------
+set(EXTENDED_INDEXING_ALLOWED "${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
+# TODO make sure this is adequately tested and consistently used
+cmake_dependent_advanced_option(
+    GRIDDYN_ENABLE_64_BIT_INDEXING
+    "set all indexing and count variables to 64 bit unsigned (Usually not required)" OFF
+    "EXTENDED_INDEXING_ALLOWED" OFF
+)
+
+cmake_dependent_advanced_option(
+    GRIDDYN_ENABLE_TRACE_LOGGING "enable trace logging" ON "GRIDDYN_ENABLE_LOGGING" OFF
+)
+
+cmake_dependent_advanced_option(
+    GRIDDYN_ENABLE_DEBUG_LOGGING "enable debug logging" ON "GRIDDYN_ENABLE_LOGGING" OFF
+)
+
+# add a baseline library for underlying dependencies and flags
+add_library(griddyn_base INTERFACE)
+add_library(griddyn_optional INTERFACE)
+
+# -----------------------------------------------------------------------------
+# General project wide configuration for debug postfix
+# -----------------------------------------------------------------------------
+if(NOT NO_DEBUG_POSFIX)
+    if(NOT CMAKE_DEBUG_POSTFIX)
+        set(CMAKE_DEBUG_POSTFIX d)
+    endif()
+endif()
+
+# we want to acknowledge this flag since it is standard C++ but it can cause issues in submodules so
+# we need to set other variables
+if(NOT DEFINED BUILD_SHARED_LIBS)
+    set(BUILD_SHARED_LIBS OFF CACHE INTERNAL "")
+endif()
+
+if(BUILD_SHARED_LIBS)
+    set(GRIDDYN_BUILD_CXX_SHARED_LIBRARY ON)
+    set(old_build_shared ON)
+    # we need this to prevent submodules from building shared libs
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+else()
+    option(GRIDDYN_BUILD_CXX_SHARED_LIBRARY OFF "Build the GridDyn C++ shared library")
+endif()
+
+if(GRIDDYN_BUILD_CXX_SHARED_LIBRARY OR GRIDDYN_ENABLE_FMI_EXPORT OR GRIDDYN_BUILD_PYTHON_LIBRARY)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
+if(NOT CMAKE_POSITION_INDEPENDENT_CODE)
+    show_variable(
+        CMAKE_POSITION_INDEPENDENT_CODE BOOL
+        "Compile the static libraries so that they're relocatable" OFF
+    )
+endif()
+
+if(NOT TARGET compile_flags_target)
+    add_library(compile_flags_target INTERFACE)
+endif()
+
+if(NOT TARGET build_flags_target)
+    add_library(build_flags_target INTERFACE)
+endif()
+
+if(PROJECT_IS_TOP_LEVEL)
+    mark_as_advanced(BUILD_TESTING)
+    include(compiler_flags)
+
+endif()
+
+add_library(GRIDDYN::compile_flags_target ALIAS compile_flags_target)
+add_library(GRIDDYN::build_flags_target ALIAS build_flags_target)
+
+get_target_property(EXTRA_BUILD_FLAGS build_flags_target INTERFACE_COMPILE_OPTIONS)
+set(GRIDDYN_BUILD_FLAGS_OUTPUT
+    "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_RELEASE} ${CMAKE_STATIC_LINKER_FLAGS} ${EXTRA_BUILD_FLAGS} "
+)
+
+if(PROJECT_IS_TOP_LEVEL)
+    if(NOT USE_LIBCXX)
+        show_variable(STATIC_STANDARD_LIB STRING "Link against a static standard lib" default)
+        set_property(CACHE STATIC_STANDARD_LIB PROPERTY STRINGS default static dynamic)
+    else()
+        hide_variable(STATIC_STANDARD_LIB)
+    endif()
+    if(MSVC)
+        show_variable(GRIDDYN_EMBEDDED_DEBUG_INFO STRING "embed debug info into lib files" default)
+        set_property(CACHE GRIDDYN_EMBEDDED_DEBUG_INFO PROPERTY STRINGS default embedded external)
+    else()
+        hide_variable(GRIDDYN_EMBEDDED_DEBUG_INFO)
+    endif()
+endif()
+
+if(STATIC_STANDARD_LIB STREQUAL "default")
+
+elseif(STATIC_STANDARD_LIB STREQUAL "static")
+    ucm_set_runtime(STATIC)
+else()
+    ucm_set_runtime(DYNAMIC)
+endif()
+
+if(GRIDDYN_EMBEDDED_DEBUG_INFO STREQUAL "default")
+
+elseif(GRIDDYN_EMBEDDED_DEBUG_INFO STREQUAL "external")
+    ucm_set_embedded_debug(EXTERNAL)
+else()
+    ucm_set_embedded_debug(EMBEDDED)
+endif()
+
+griddyn_hide_cache_variables_by_prefix(UCM_)
+
+# ------------------------------------------------------------
+# BOOST  find the boost libraries
+# ------------------------------------------------------------
+# TODO check if boost works (e.g. libstdc++ vs libc++)
+set(BOOST_REQUIRED_LIBRARIES)
+
+include(addBoost)
+
+target_link_libraries(griddyn_base INTERFACE Boost::boost)
+target_link_libraries(griddyn_base INTERFACE compile_flags_target)
+target_compile_options(griddyn_base INTERFACE $<$<COMPILE_LANG_AND_ID:CXX,GNU>:-Wstrict-overflow=2>)
+target_compile_definitions(griddyn_base INTERFACE BOOST_SYSTEM_NO_LIB BOOST_ERROR_CODE_HEADER_ONLY)
+
+set(GRIDDYN_BOOST_VERSION_LEVEL ${BOOST_VERSION_LEVEL})
+
+# ------------------------------------------------------------
+# add coverage target
+# ------------------------------------------------------------
+if(CMAKE_BUILD_TYPE STREQUAL "Coverage")
+    include(CodeCoverage)
+endif()
+
+if(GRIDDYN_ENABLE_CODE_COVERAGE_TEST)
+    if(NOT CMAKE_BUILD_TYPE STREQUAL "Coverage")
+        message(FATAL_ERROR "CMAKE_BUILD_TYPE must be set to Coverage for testing code coverage")
+    endif()
+
+    set(COVERAGE_EXCLUDES 'usr/*' 'ThirdParty/*' 'test/*' 'interfaces/*' 'examples/*')
+    setup_target_for_coverage(
+        NAME
+        griddyn_coverage # New target name
+        EXECUTABLE
+        ctest
+        -L
+        Continuous
+    )
+endif(GRIDDYN_ENABLE_CODE_COVERAGE_TEST)
+
+set(CONFIGURE_TARGET_LOCATION ${GRIDDYN_BINARY_DIR}/griddyn_generated_includes/griddyn/)
+target_include_directories(
+    griddyn_base INTERFACE $<BUILD_INTERFACE:${GRIDDYN_BINARY_DIR}/griddyn_generated_includes/>
+)
+
+# ------------------------------------------------------------
+# Enable OpenMP support?
+# ------------------------------------------------------------
+if(GRIDDYN_ENABLE_OPENMP)
+    find_package(OpenMP QUIET COMPONENTS C CXX)
+    if(OpenMP_C_FOUND AND OpenMP_CXX_FOUND)
+        set(GRIDDYN_HAVE_OPENMP TRUE)
+        target_link_libraries(griddyn_base INTERFACE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
+    else()
+        set(GRIDDYN_HAVE_OPENMP FALSE)
+        if(NOT GRIDDYN_ENABLE_OPENMP STREQUAL "AUTO")
+            message(FATAL_ERROR "Disabling OpenMP support, could not determine compiler flags")
+        endif()
+    endif()
+else()
+    set(GRIDDYN_HAVE_OPENMP FALSE)
+endif()
+
+cmake_dependent_advanced_option(
+    GRIDDYN_ENABLE_OPENMP_SUNDIALS "Enable the SUNDIALS OpenMP NVector implementation" ON
+    "GRIDDYN_ENABLE_OPENMP;OpenMP_C_FOUND;OpenMP_CXX_FOUND" OFF
+)
+
+cmake_dependent_advanced_option(
+    GRIDDYN_ENABLE_OPENMP_INTERNAL "Enable OpenMP for GridDyn component evaluation" ON
+    "GRIDDYN_ENABLE_OPENMP;OpenMP_C_FOUND;OpenMP_CXX_FOUND" OFF
+)
+
+# ------------------------------------------------------------
+# Find multithreading headers and includes
+# ------------------------------------------------------------
+if(GRIDDYN_ENABLE_MULTITHREADING)
+    if(NOT WIN32 OR MSYS)
+        set(THREADS_PREFER_PTHREAD_FLAG ON)
+    endif()
+    find_package(Threads REQUIRED)
+    target_link_libraries(griddyn_base INTERFACE Threads::Threads)
+endif(GRIDDYN_ENABLE_MULTITHREADING)
+
+# -------------------------------------------------------------
+# Update git submodules
+# -------------------------------------------------------------
+include(updateGitSubmodules)
+
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/ThirdParty/containers/gmlc/containers/BlockingQueue.hpp")
+    submod_update(ThirdParty/containers)
+endif()
+
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/ThirdParty/concurrency/gmlc/concurrency/TriggerVariable.hpp")
+    submod_update(ThirdParty/concurrency)
+endif()
+
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/ThirdParty/utilities/gmlc/utilities/demangle.hpp")
+    submod_update(ThirdParty/utilities)
+endif()
+
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/ThirdParty/spdlog/CMakeLists.txt")
+    submod_update(ThirdParty/spdlog)
+endif()
+
+if(GRIDDYN_BUILD_TESTS AND BUILD_TESTING)
+    if(NOT EXISTS "${PROJECT_SOURCE_DIR}/ThirdParty/googletest/CMakeLists.txt")
+        submod_update(ThirdParty/googletest)
+    endif()
+endif()
+
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/ThirdParty/units/units/units.hpp")
+    submod_update(ThirdParty/units)
+endif()
+
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/ThirdParty/sundials/CMakeLists.txt")
+    submod_update(ThirdParty/sundials)
+endif()
+
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/ThirdParty/pugixml/CMakeLists.txt")
+    submod_update(ThirdParty/pugixml)
+endif()
+
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/ThirdParty/toml/include/toml11/types.hpp")
+    submod_update(ThirdParty/toml)
+endif()
+
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/ThirdParty/yaml-cpp/CMakeLists.txt")
+    submod_update(ThirdParty/yaml-cpp)
+endif()
+
+if(GRIDDYN_ENABLE_OPTIMIZATION_LIBRARY AND GRIDDYN_ENABLE_HIGHS)
+    if(NOT EXISTS "${PROJECT_SOURCE_DIR}/ThirdParty/highs/CMakeLists.txt")
+        submod_update(ThirdParty/highs)
+    endif()
+endif()
+
+set(concurrency_clang_tidy "${PROJECT_SOURCE_DIR}/ThirdParty/concurrency/.clang-tidy")
+set(concurrency_clang_tidy_backup
+    "${PROJECT_SOURCE_DIR}/ThirdParty/concurrency/.clang-tidy.griddyn-orig"
+)
+if(EXISTS "${concurrency_clang_tidy}")
+    if(NOT EXISTS "${concurrency_clang_tidy_backup}")
+        file(RENAME "${concurrency_clang_tidy}" "${concurrency_clang_tidy_backup}")
+    endif()
+endif()
+
+if(GRIDDYN_ENABLE_KLU)
+    if(NOT DEFINED GRIDDYN_USE_SYSTEM_SUITESPARSE_ONLY OR NOT GRIDDYN_USE_SYSTEM_SUITESPARSE_ONLY)
+        if(NOT EXISTS "${PROJECT_SOURCE_DIR}/ThirdParty/suitesparse-cmake/CMakeLists.txt")
+            submod_update(ThirdParty/suitesparse-cmake)
+        endif()
+    endif()
+endif()
+
+# ------------------------------------------------------------
+# finding MPI
+# ------------------------------------------------------------
+set(GRIDDYN_HAVE_MPI_CXX FALSE)
+if(GRIDDYN_ENABLE_MPI)
+    include(addMPI)
+    if(TARGET MPI::MPI_C)
+        target_link_libraries(griddyn_base INTERFACE MPI::MPI_C)
+        if(MPI_CXX_FOUND)
+            set(GRIDDYN_HAVE_MPI_CXX TRUE)
+            target_link_libraries(griddyn_base INTERFACE MPI::MPI_CXX)
+        endif()
+    else()
+        message(FATAL_ERROR "unable to include MPI")
+    endif()
+endif(GRIDDYN_ENABLE_MPI)
+
+# ------------------------------------------------------------
+# Find (and test) the KLU libraries
+# ------------------------------------------------------------
+
+if(GRIDDYN_ENABLE_KLU)
+    include(addKLU)
+endif()
+
+# ------------------------------------------------------------
+# Sundials
+# ------------------------------------------------------------
+include(addSundials)
+
+# ------------------------------------------------------------
+# HiGHS
+# ------------------------------------------------------------
+if(GRIDDYN_ENABLE_OPTIMIZATION_LIBRARY AND GRIDDYN_ENABLE_HIGHS)
+    include(addHiGHS)
+endif()
+
+# ------------------------------------------------------------
+# Enable HELICS executable
+# ------------------------------------------------------------
+# The order needs to be this -> ZMQ -> addHELICS due to knowledge dependencies
+if(GRIDDYN_ENABLE_HELICS_EXECUTABLE)
+    show_variable(
+        HELICS_INSTALL_PATH PATH "path to the helics installation" "${PROJECT_BINARY_DIR}/libs"
+    )
+else(GRIDDYN_ENABLE_HELICS_EXECUTABLE)
+    hide_variable(HELICS_INSTALL_PATH)
+endif(GRIDDYN_ENABLE_HELICS_EXECUTABLE)
+
+# ------------------------------------------------------------
+# setting the RPATH
+# ------------------------------------------------------------
+# use, i.e. don't skip the full RPATH for the build tree
+set(CMAKE_SKIP_BUILD_RPATH FALSE)
+
+# when building, don't use the install RPATH already (but later on when installing)
+set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
+
+set(CMAKE_MACOSX_RPATH 1)
+
+set(CMAKE_BUILD_RPATH
+    "${AUTOBUILD_INSTALL_PATH}/bin;${AUTOBUILD_INSTALL_PATH}/lib;${AUTOBUILD_INSTALL_PATH}/lib64"
+)
+
+# add the automatically determined parts of the RPATH which point to directories outside the build
+# tree to the install RPATH
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+if(NOT APPLE)
+    set(CMAKE_INSTALL_RPATH $ORIGIN)
+endif()
+
+# the RPATH to be used when installing, but only if it's not a system directory
+list(FIND CMAKE_PLATFORM_IMPLICIT_LINK_DIRECTORIES
+     "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}" isSystemDir
+)
+
+if("${isSystemDir}" STREQUAL "-1")
+    set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}")
+endif("${isSystemDir}" STREQUAL "-1")
+
+list(FIND CMAKE_PLATFORM_IMPLICIT_LINK_DIRECTORIES
+     "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}" isSystemDir
+)
+if("${isSystemDir}" STREQUAL "-1")
+    list(APPEND CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}")
+endif("${isSystemDir}" STREQUAL "-1")
+
+if(APPLE)
+    list(APPEND CMAKE_INSTALL_RPATH "@loader_path/.")
+    list(APPEND CMAKE_INSTALL_RPATH "@executable_path/.")
+else()
+    list(APPEND CMAKE_INSTALL_RPATH "./")
+endif()
+
+if(NOT Boost_USE_STATIC_LIBS)
+    list(APPEND CMAKE_INSTALL_RPATH ${Boost_LIBRARY_DIRS})
+    list(APPEND CMAKE_BUILD_RPATH ${Boost_LIBRARY_DIRS})
+endif()
+
+# ------------------------------------------------------------
+# global include directories
+# ------------------------------------------------------------
+target_include_directories(
+    griddyn_base
+    INTERFACE $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src>
+              $<INSTALL_INTERFACE:$<INSTALL_PREFIX>/${CMAKE_INSTALL_INCLUDEDIR}>
+              $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/ThirdParty/containers>
+              $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/ThirdParty/concurrency>
+)
+
+target_include_directories(
+    griddyn_base SYSTEM INTERFACE $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/ThirdParty>
+                                  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/ThirdParty/utilities>
+)
+
+# --------------------------------------------------------------
+# Create the target for unitslib
+# -----------------------------------------------------------
+include(addUnits)
+add_library(GRIDDYN::units ALIAS units-static)
+
+# --------------------------------------------------------------
+# Create the target for spdlog
+# -----------------------------------------------------------
+include(addSpdlog)
+
+# -----------------------------------------------------------------------------
+# create utilities target
+# -----------------------------------------------------------------------------
+set(GMLC_UTILITIES_INSTALL OFF CACHE INTERNAL "")
+add_subdirectory(ThirdParty/utilities)
+
+griddyn_hide_cache_variables_by_prefix(GMLC_UTILITIES_)
+
+hide_variable(GMLC_UTILITIES_GENERATE_DOXYGEN_DOC)
+hide_variable(GMLC_UTILITIES_INCLUDE_BOOST)
+hide_variable(GMLC_UTILITIES_USE_BOOST_SPIRIT)
+hide_variable(GMLC_UTILITIES_WITH_CMAKE_PACKAGE)
+
+hide_variable(GMLC_UTILITIES_OBJECT_LIB)
+hide_variable(GMLC_UTILITIES_STATIC_LIB)
+
+add_library(GridDyn::utilities ALIAS gmlc_utilities)
+set_target_properties(gmlc_utilities PROPERTIES FOLDER Extern)
+target_include_directories(gmlc_utilities SYSTEM PRIVATE $<BUILD_INTERFACE:${Boost_INCLUDE_DIRS}>)
+
+# ------------------------------------------------------------
+# create pugixml target
+# ------------------------------------------------------------
+set(PUGIXML_INSTALL OFF CACHE BOOL "" FORCE)
+set(PUGIXML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory(ThirdParty/pugixml EXCLUDE_FROM_ALL)
+griddyn_hide_cache_variables_by_prefix(PUGIXML_)
+
+if(TARGET pugixml-static)
+    set_target_properties(pugixml-static PROPERTIES FOLDER Extern)
+endif()
+if(TARGET pugixml-shared)
+    set_target_properties(pugixml-shared PROPERTIES FOLDER Extern)
+endif()
+if(TARGET pugixml)
+    set_target_properties(pugixml PROPERTIES FOLDER Extern)
+endif()
+
+# ------------------------------------------------------------
+# create yaml-cpp target
+# ------------------------------------------------------------
+set(YAML_CPP_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
+set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(YAML_CPP_INSTALL ON CACHE BOOL "" FORCE)
+add_subdirectory(ThirdParty/yaml-cpp EXCLUDE_FROM_ALL)
+griddyn_hide_cache_variables_by_prefix(YAML_)
+
+if(TARGET yaml-cpp)
+    set_target_properties(yaml-cpp PROPERTIES FOLDER Extern)
+    target_compile_options(
+        yaml-cpp PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-Wno-documentation>
+    )
+    set_target_properties(
+        yaml-cpp PROPERTIES INTERFACE_SYSTEM_INCLUDE_DIRECTORIES
+                            $<TARGET_PROPERTY:yaml-cpp,INTERFACE_INCLUDE_DIRECTORIES>
+    )
+endif()
+
+# ------------------------------------------------------------
+# create bundled SQLite target
+# ------------------------------------------------------------
+add_subdirectory(ThirdParty/sqlite EXCLUDE_FROM_ALL)
+
+# ------------------------------------------------------------
+# load the required subdirectories
+# ------------------------------------------------------------
+add_subdirectory(src)
+
+# The command-line program links to SuiteSparse shared libraries when KLU is built as a local shared
+# dependency. Keep those DLLs/shared objects alongside the installed executable in the applications
+# component.
+if(GRIDDYN_SUITESPARSE_LOCAL_BUILD AND GRIDDYN_ENABLE_KLU)
+    foreach(_griddyn_suite_target IN ITEMS klu amd colamd btf)
+        if(TARGET ${_griddyn_suite_target})
+            get_target_property(_griddyn_suite_type ${_griddyn_suite_target} TYPE)
+            if(_griddyn_suite_type STREQUAL "SHARED_LIBRARY")
+                install(
+                    TARGETS ${_griddyn_suite_target}
+                    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT applications
+                    LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT applications
+                    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT libs
+                )
+            endif()
+        endif()
+    endforeach()
+endif()
+
+# ------------------------------------------------------------
+# Enable Doxygen
+# ------------------------------------------------------------
+if(GRIDDYN_ENABLE_DOXYGEN)
+    find_package(Doxygen)
+    if(DOXYGEN_FOUND)
+
+        show_variable(
+            DOXYGEN_OUTPUT_DIR PATH "location to put Doxygen docs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/docs"
+        )
+        configure_file(
+            ${CMAKE_CURRENT_SOURCE_DIR}/config/Doxyfile.in ${CMAKE_CURRENT_BINARY_DIR}/Doxyfile
+            @ONLY
+        )
+        add_custom_target(
+            doc
+            ${DOXYGEN_EXECUTABLE} ${CMAKE_CURRENT_BINARY_DIR}/Doxyfile
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/docs
+            COMMENT "Generating API documentation with Doxygen"
+            VERBATIM
+        )
+    endif(DOXYGEN_FOUND)
+endif(GRIDDYN_ENABLE_DOXYGEN)
+
+# TODO this should probably be in a different file
+# ------------------------------------------------------------
+# Enable clang analysis and formatting tools
+# ------------------------------------------------------------
+if(GRIDDYN_ENABLE_CLANG_TOOLS)
+    include(clang-cxx-dev-tools)
+endif(GRIDDYN_ENABLE_CLANG_TOOLS)
+
+# TODO this should be under tests/
+# ------------------------------------------------------------
+# Enable testCore construction?
+# ------------------------------------------------------------
+if(GRIDDYN_BUILD_TESTS AND BUILD_TESTING)
+    # message(STATUS "otcf:${optional_component_test_files}")
+    add_subdirectory(test)
+    enable_testing()
+    # add_test(NAME gridDynTest COMMAND testCore)
+endif()
+
+set(GRIDDYN_CMAKECONFIG_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}"
+    CACHE STRING "install path for GriddynConfig.cmake"
+)
+
+if(GRIDDYN_WITH_CMAKE_PACKAGE)
+    include(CMakePackageConfigHelpers)
+
+    configure_package_config_file(
+        "${PROJECT_SOURCE_DIR}/config/GRIDDYNConfig.cmake.in"
+        "${PROJECT_BINARY_DIR}/GRIDDYNConfig.cmake"
+        INSTALL_DESTINATION "${GRIDDYN_CMAKECONFIG_INSTALL_DIR}"
+    )
+    write_basic_package_version_file(
+        "${PROJECT_BINARY_DIR}/GRIDDYNConfigVersion.cmake" VERSION "${PROJECT_VERSION}"
+        COMPATIBILITY SameMajorVersion
+    )
+    install(FILES "${PROJECT_BINARY_DIR}/GRIDDYNConfig.cmake"
+                  "${PROJECT_BINARY_DIR}/GRIDDYNConfigVersion.cmake"
+            DESTINATION "${GRIDDYN_CMAKECONFIG_INSTALL_DIR}" COMPONENT applications
+    )
+endif()
+
+# TODO group the installs better
+install(DIRECTORY examples/ DESTINATION examples COMPONENT examples)
+# file(GLOB ebraidfiles "examples/braid_examples/*.*") install(FILES ${ebraidfiles} DESTINATION
+# examples/braid_examples COMPONENT examples)
+
+set(binfiles bin/configure.griddyn bin/pgriddyn bin/pgriddyn_debug)
+install(PROGRAMS ${binfiles} DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT binaries)
+
+install(DIRECTORY ThirdParty/nlohmann DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT headers)
+
+if(GRIDDYN_WITH_CMAKE_PACKAGE)
+    install(
+        EXPORT griddyn-targets
+        NAMESPACE Griddyn::
+        DESTINATION ${GRIDDYN_CMAKECONFIG_INSTALL_DIR}
+        COMPONENT applications
+    )
+endif()
+
+# ------------------------------------------------------------
+# Future Additions
+# ------------------------------------------------------------
+# adding dlls install(FILES ${LOCATION_OF_FILES} DESTINATION bin) file(GLOB docs "docs/manuals/*")
+# install(FILES ${docs} DESTINATION docs)
+
+# TODO this should be under tests/ too
+# ------------------------------------------------------------
+# CTest
+# ------------------------------------------------------------
+if(GRIDDYN_BUILD_TESTS AND BUILD_TESTING)
+
+    find_program(CTEST_MEMORYCHECK_COMMAND valgrind)
+
+    add_test(NAME Example179BusDynamicTest
+             COMMAND gridDynMain ${PROJECT_SOURCE_DIR}/test/test_files/IEEE_test_cases/ieee300.cdf
+    )
+    set_property(TEST Example179BusDynamicTest PROPERTY LABELS Quick Continuous Nightly)
+
+endif()
+
+if(GRIDDYN_BUILD_PYTHON_LIBRARY)
+    add_subdirectory(python)
+endif()
+
+if(CMAKE_GENERATOR MATCHES "Visual Studio")
+    function(griddyn_demote_msb8028 directory_path)
+        get_property(_dir_targets DIRECTORY "${directory_path}" PROPERTY BUILDSYSTEM_TARGETS)
+        foreach(_dir_target IN LISTS _dir_targets)
+            get_target_property(
+                _msbuild_warnings_as_messages "${_dir_target}" VS_GLOBAL_MSBuildWarningsAsMessages
+            )
+            if(NOT _msbuild_warnings_as_messages OR _msbuild_warnings_as_messages STREQUAL
+                                                    "_msbuild_warnings_as_messages-NOTFOUND"
+            )
+                set_target_properties(
+                    "${_dir_target}" PROPERTIES VS_GLOBAL_MSBuildWarningsAsMessages "MSB8028"
+                )
+            elseif(NOT _msbuild_warnings_as_messages MATCHES "(^|;)MSB8028($|;)")
+                set_target_properties(
+                    "${_dir_target}" PROPERTIES VS_GLOBAL_MSBuildWarningsAsMessages
+                                                "${_msbuild_warnings_as_messages};MSB8028"
+                )
+            endif()
+        endforeach()
+
+        get_property(_subdirectories DIRECTORY "${directory_path}" PROPERTY SUBDIRECTORIES)
+        foreach(_subdirectory IN LISTS _subdirectories)
+            griddyn_demote_msb8028("${_subdirectory}")
+        endforeach()
+    endfunction()
+
+    griddyn_demote_msb8028("${CMAKE_BINARY_DIR}")
+endif()
+
+# TODO make a cpack file, put this there
+# ------------------------------------------------------------
+# CPack
+# ------------------------------------------------------------
+if(GRIDDYN_ENABLE_PACKAGE_BUILD)
+    set(CPACK_PACKAGE_NAME "GridDyn")
+    set(CPACK_PACKAGE_VENDOR "Lawrence Livermore National Security LLC")
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "GridDyn Installer")
+    set(CPACK_PACKAGE_VERSION "${GRIDDYN_VERSION}")
+    set(CPACK_PACKAGE_VERSION_MAJOR ${GRIDDYN_VERSION_MAJOR})
+    set(CPACK_PACKAGE_VERSION_MINOR ${GRIDDYN_VERSION_MINOR})
+    set(CPACK_PACKAGE_VERSION_PATCH ${GRIDDYN_VERSION_PATCH})
+
+    set(CPACK_COMPONENTS_ALL
+        applications
+        headers
+        libs
+        binaries
+        python
+        examples
+    )
+
+    if(WIN32)
+        set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}\\\\LICENSE")
+    else(WIN32)
+        set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/LICENSE")
+    endif(WIN32)
+
+    set(CPACK_COMPONENT_APPLICATIONS_DISPLAY_NAME "Application")
+    set(CPACK_COMPONENT_LIBS_DISPLAY_NAME "Libraries")
+    set(CPACK_COMPONENT_HEADERS_DISPLAY_NAME "Headers")
+    set(CPACK_COMPONENT_RUNTIME_DISPLAY_NAME "Runtime Libraries")
+    set(CPACK_COMPONENT_EXAMPLES_DISPLAY_NAME "Examples")
+
+    set(CPACK_COMPONENT_PYTHON_GROUP interfaces)
+
+    set(CPACK_COMPONENT_APPLICATION_DESCRIPTION "Executables and helper applications for GridDyn")
+    set(CPACK_COMPONENT_LIBS_DESCRIPTION "Libraries for compiling and linking with GridDyn")
+    set(CPACK_COMPONENT_HEADERS_DESCRIPTION "Headers for linking and compiling with GridDyn")
+    set(CPACK_COMPONENT_RUNTIME_DESCRIPTION "Runtime libraries for GrdDyn")
+    set(CPACK_COMPONENT_EXAMPLES_DESCRIPTION "Example files for GridDyn")
+
+    set(CPACK_COMPONENT_LIBS_DEPENDS headers)
+    set(CPACK_COMPONENT_RUNTIME_REQUIRED ON)
+    if(WIN32)
+        set(CPACK_PACKAGE_ICON "${CMAKE_SOURCE_DIR}\\\\docgen\\\\images\\\\griddyn.ico")
+        set(CPACK_NSIS_MUI_ICON "${CMAKE_SOURCE_DIR}/docgen/images/griddyn.ico")
+
+        set(CPACK_NSIS_INSTALL_ROOT "C:\\\\local\\\\")
+        set(CPACK_NSIS_URL_INFO_ABOUT "https://www.github.com/LLNL/GridDyn")
+        set(CPACK_NSIS_MENU_LINKS "https://www.github.com/LLNL/GridDyn" "GridDyn source code"
+                                  "https://www.griddyn.org" "GridDyn Web Page"
+        )
+
+        set(CPACK_NSIS_INSTALL_ROOT "C:\\\\local\\\\")
+    else(WIN32)
+        set(CPACK_PACKAGE_ICON "${CMAKE_SOURCE_DIR}/docgen/images/griddyn.ico")
+    endif(WIN32)
+    set(CPACK_SOURCE_IGNORE_FILES "/Build*/;/build*/;/.git/")
+
+    # THIS LINE MUST BE LAST
+    include(CPack)
+endif(GRIDDYN_ENABLE_PACKAGE_BUILD)
+
+if(NOT PROJECT_IS_TOP_LEVEL)
+    # restore the original module path
+    set(CMAKE_MODULE_PATH ${ORIGINAL_MODULE_PATH})
+    if(old_build_shared)
+        set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+    endif()
+endif()

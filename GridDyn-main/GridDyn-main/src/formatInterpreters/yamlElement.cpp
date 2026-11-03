@@ -1,0 +1,40 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "yamlElement.h"
+
+#include <string>
+#include <utility>
+
+static constexpr char nullStr[] = "";
+
+YamlElement::YamlElement(const YAML::Node& vElement, std::string newName):
+    mName(std::move(newName)), mElement(vElement)
+{
+    mElementIndex = 0;
+
+    if (mElement.IsSequence()) {
+        mArrayType = true;
+        mArrayIndex = 0;
+        while ((mArrayIndex < mElement.size()) && (mElement[mArrayIndex].IsNull())) {
+            ++mArrayIndex;
+        }
+    }
+}
+
+void YamlElement::clear()
+{
+    mElement.reset();
+    mElementIndex = 0;
+    mArrayIndex = 0;
+    mArrayType = false;
+    mName = nullStr;
+}
+
+YAML::Node YamlElement::getElement() const
+{
+    return (mArrayType) ? (mElement[mArrayIndex]) : mElement;
+}

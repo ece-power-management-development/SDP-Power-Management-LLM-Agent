@@ -1,0 +1,49 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "GenModel3.h"
+#include <string>
+
+namespace griddyn::genmodels {
+
+class GenModel5type3: public GenModel3 {
+  protected:
+  public:
+    explicit GenModel5type3(const std::string& objName = "genModel5type3_#");
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+    virtual void dynObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+    virtual void dynObjectInitializeB(const IOdata& inputs,
+                                      const IOdata& desiredOutput,
+                                      IOdata& fieldSet) override;
+
+    virtual stringVec localStateNames() const override;
+    // dynamics
+    virtual void residual(const IOdata& inputs,
+                          const StateData& sD,
+                          double resid[],
+                          const SolverMode& sMode) override;
+    virtual void derivative(const IOdata& inputs,
+                            const StateData& sD,
+                            double deriv[],
+                            const SolverMode& sMode) override;
+    virtual void jacobianElements(const IOdata& inputs,
+                                  const StateData& sD,
+                                  MatrixData<double>& md,
+                                  const IOlocs& inputLocs,
+                                  const SolverMode& sMode) override;
+    IOdata getMachineControllerSignals(const IOdata& inputs,
+                                       const StateData& stateDataValue,
+                                       const SolverMode& sMode) const override;
+    MachineSignalDerivativeData
+        getMachineControllerSignalDerivatives(const IOdata& inputs,
+                                              const StateData& stateDataValue,
+                                              const IOlocs& inputLocs,
+                                              const SolverMode& sMode) const override;
+};
+
+}  // namespace griddyn::genmodels

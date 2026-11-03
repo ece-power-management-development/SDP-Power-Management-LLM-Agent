@@ -1,0 +1,67 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "ExciterDC1A.h"
+#include <string>
+namespace griddyn::exciters {
+/** PSS/E ESDC2A / EXDC2 DC excitation system.
+ *
+ * Both DYR names use this implementation and their common PSS/E schema. It
+ * uses the DC1A states \f[E_{fd},V_R,x,R_F,(V_m)\f] and equations, with the
+ * DC2A-specific voltage-dependent regulator bounds
+ * \f[
+ * V_{RMIN}V_T \le V_R \le V_{RMAX}V_T.
+ * \f]
+ * The field equation uses the voltage-dependent bound while the limiter is
+ * active; the antiwindup regulator state remains held until release. The
+ * regulator uses the inherited sensed-voltage lead-lag and washout feedback.
+ * The PSS/E `Switch`
+ * field is not implemented by PSS/E; the reader rejects a nonzero value.
+ */
+class ExciterDC2A: public ExciterDC1A {
+  protected:
+  public:
+    explicit ExciterDC2A(const std::string& objName = "exciterDC2A_#");
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+
+    virtual void residual(const IOdata& inputs,
+                          const StateData& stateDataValue,
+                          double resid[],
+                          const SolverMode& sMode) override;
+    virtual void derivative(const IOdata& inputs,
+                            const StateData& stateDataValue,
+                            double deriv[],
+                            const SolverMode& sMode) override;
+    virtual void rootTest(const IOdata& inputs,
+                          const StateData& stateDataValue,
+                          double roots[],
+                          const SolverMode& sMode) override;
+    virtual ChangeCode rootCheck(const IOdata& inputs,
+                                 const StateData& sD,
+                                 const SolverMode& sMode,
+                                 CheckLevel level) override;
+
+  protected:
+    bool adjustInitialRegulatorLimit(double initialValue, double terminalVoltage) override;
+    double initialRegulatorUpperBound(double terminalVoltage) const override;
+    double initialRegulatorLowerBound(double terminalVoltage) const override;
+    double initialRegulatorOverdrive(double originalUpperLimit,
+                                     double terminalVoltage) const override;
+    void fieldRegulatorJacobian(MatrixData<double>& matrixDataValue,
+                                index_t fieldRow,
+                                index_t regulatorCol,
+                                index_t voltageCol) const override;
+
+    virtual void limitJacobian(double V,
+                               int voltageLoc,
+                               int refLoc,
+                               double cj,
+                               MatrixData<double>& matrixDataValue) override;
+};
+
+}  // namespace griddyn::exciters

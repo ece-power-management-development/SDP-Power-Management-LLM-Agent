@@ -1,0 +1,228 @@
+name: Wheels
+
+on:
+  workflow_dispatch:
+
+  pull_request:
+  push:
+    branches:
+     - main
+    tags:
+     - v*.*.*
+
+permissions:
+  contents: read
+
+jobs:
+  check_version:
+    name: Check Python version
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.version.outputs.should_build }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - name: Check whether the Python package version changed
+      id: version
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        REF: ${{ github.ref }}
+        BEFORE_SHA: ${{ github.event.before }}
+      run: |
+        python - <<'PY'
+        import os
+        import subprocess
+        import tomllib
+
+        with open("pyproject.toml", "rb") as config:
+            current_version = tomllib.load(config)["project"]["version"]
+
+        should_build = False
+        previous_version = None
+        before_sha = os.environ.get("BEFORE_SHA", "")
+
+        if os.environ["EVENT_NAME"] in {"workflow_dispatch", "pull_request"}:
+            should_build = True
+        elif os.environ["REF"].startswith("refs/tags/"):
+            tag_version = os.environ["REF"].removeprefix("refs/tags/").removeprefix("v")
+            if tag_version != current_version:
+                raise SystemExit(
+                    f"release tag version {tag_version!r} does not match "
+                    f"pyproject.toml version {current_version!r}"
+                )
+            should_build = True
+        elif os.environ["EVENT_NAME"] == "push" and os.environ["REF"] == "refs/heads/main":
+            if before_sha and set(before_sha) != {"0"}:
+                try:
+                    previous_pyproject = subprocess.check_output(
+                        ["git", "show", f"{before_sha}:pyproject.toml"],
+                        text=True,
+                    )
+                    previous_version = tomllib.loads(previous_pyproject)["project"]["version"]
+                    should_build = current_version != previous_version
+                except subprocess.CalledProcessError:
+                    should_build = True
+            else:
+                should_build = True
+
+        print(f"current version: {current_version}")
+        if previous_version is not None:
+            print(f"previous version: {previous_version}")
+        print(f"should build: {should_build}")
+
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            output.write(f"version={current_version}\n")
+            output.write(f"should_build={str(should_build).lower()}\n")
+        PY
+
+  build_sdist:
+    name: Build SDist
+    needs: check_version
+    if: needs.check_version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+
+    - name: Build SDist
+      run: pipx run build --sdist
+
+    - name: Check metadata
+      run: pipx run twine check dist/*
+
+    - uses: actions/upload-artifact@v7
+      with:
+        name: dist-sdist
+        path: dist/*.tar.gz
+
+
+  build_wheels:
+    name: Wheels on ${{ matrix.os }}
+    needs: check_version
+    if: needs.check_version.outputs.should_build == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+
+    - uses: actions/setup-python@v6
+      with:
+        python-version: "3.13"
+
+    - name: Install Boost headers
+      shell: bash
+      env:
+        BOOST_VERSION: "1.88.0"
+      run: |
+        python - <<'PY'
+        import os
+        import tarfile
+        import urllib.request
+        from pathlib import Path
+
+        version = os.environ["BOOST_VERSION"]
+        archive_name = f"boost_{version.replace('.', '_')}.tar.gz"
+        boost_dir_name = archive_name.removesuffix(".tar.gz")
+        boost_root = Path(".boost") / boost_dir_name
+
+        if not boost_root.exists():
+            url = f"https://archives.boost.io/release/{version}/source/{archive_name}"
+            archive_path = Path(".boost") / archive_name
+            archive_path.parent.mkdir(exist_ok=True)
+            urllib.request.urlretrieve(url, archive_path)
+            with tarfile.open(archive_path, "r:gz") as archive:
+                archive.extractall(archive_path.parent)
+
+        host_boost_root = boost_root.resolve().as_posix()
+        if os.environ["RUNNER_OS"] == "Linux":
+            cibw_boost_root = f"/project/.boost/{boost_dir_name}"
+        else:
+            cibw_boost_root = host_boost_root
+
+        cibw_environment = (
+            f"BOOST_ROOT={cibw_boost_root} "
+            f"BOOST_INSTALL_PATH={cibw_boost_root}"
+        )
+        if os.environ["RUNNER_OS"] == "macOS":
+            cibw_environment += " MACOSX_DEPLOYMENT_TARGET=14.0"
+
+        with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+            env.write(f"BOOST_ROOT={host_boost_root}\n")
+            env.write(f"BOOST_INSTALL_PATH={host_boost_root}\n")
+            env.write(f"CIBW_ENVIRONMENT={cibw_environment}\n")
+        PY
+    - uses: pypa/cibuildwheel@v3.4
+
+    - name: Verify clean tracked files
+      run: git diff --exit-code --ignore-submodules=dirty
+      shell: bash
+
+    - name: Upload wheels
+      uses: actions/upload-artifact@v7
+      with:
+        path: wheelhouse/*.whl
+        name: dist-${{ matrix.os }}
+
+  publish-to-testpypi:
+    name: Publish new version to TestPyPI
+    needs: [check_version, build_wheels, build_sdist]
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.check_version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    #if: github.event_name == 'release' && github.event.action == 'published'
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/griddyn
+    permissions:
+      id-token: write  # IMPORTANT: mandatory for trusted publishing
+    steps:
+    - uses: actions/setup-python@v6
+      with:
+        python-version: "3.13"
+    - uses: actions/download-artifact@v8
+      with:
+        pattern: dist-*
+        merge-multiple: true
+        path: dist/
+
+    - uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        verbose: true
+        repository-url: https://test.pypi.org/legacy/
+  publish-to-pypi:
+    name: >-
+      Publish Python distribution to PyPI
+    if: >-
+      startsWith(github.ref, 'refs/tags/') &&
+      needs.check_version.outputs.should_build == 'true'
+    needs: [check_version, build_wheels, build_sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/griddyn
+    permissions:
+      id-token: write  # IMPORTANT: mandatory for trusted publishing
+
+    steps:
+    - name: Download all the dists
+      uses: actions/download-artifact@v8
+      with:
+        pattern: dist-*
+        merge-multiple: true
+        path: dist/
+    - name: Publish distribution to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+

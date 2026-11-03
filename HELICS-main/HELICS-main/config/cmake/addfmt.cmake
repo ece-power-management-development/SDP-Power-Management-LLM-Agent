@@ -1,0 +1,63 @@
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Copyright (c) 2017-2026, Battelle Memorial Institute; Lawrence Livermore
+# National Security, LLC; Alliance for Energy Innovation LLC.
+# See the top-level NOTICE for additional details.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# -----------------------------------------------------------------------------
+# create the fmt header only targets
+# -----------------------------------------------------------------------------
+
+option(${PROJECT_NAME}_USE_EXTERNAL_FMT "Use external copy of {fmt}" OFF)
+mark_as_advanced(${PROJECT_NAME}_USE_EXTERNAL_FMT)
+if(NOT TARGET fmt::fmt)
+    if(${PROJECT_NAME}_USE_EXTERNAL_FMT)
+        # Note: static fmt should be built with CMAKE_POSITION_INDEPENDENT_CODE
+        find_package(fmt REQUIRED)
+    else()
+        set(FMT_SILENT ON)
+
+        if(NOT CMAKE_CXX_STANDARD)
+            set(CMAKE_CXX_STANDARD 17) # Supported values are ``17``, and ``20``.
+        endif()
+
+        set(SUPPORTS_VARIADIC_TEMPLATES ON)
+        set(SUPPORTS_USER_DEFINED_LITERALS ON)
+        set(FMT_HAS_VARIANT ON)
+        set(type STRING CACHE INTERNAL "")
+
+        if(CYGWIN)
+            set(FMT_OS OFF CACHE INTERNAL "")
+        else()
+            set(FMT_OS ON CACHE INTERNAL "")
+        endif()
+        # add the vendored FMT header only library
+
+        if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.25)
+            add_subdirectory(ThirdParty/fmtlib EXCLUDE_FROM_ALL SYSTEM)
+        else()
+            add_subdirectory(ThirdParty/fmtlib EXCLUDE_FROM_ALL)
+        endif()
+
+        set_target_properties(fmt PROPERTIES FOLDER Extern)
+
+        hide_variable(FMT_DOC)
+        hide_variable(FMT_INSTALL)
+        hide_variable(FMT_PEDANTIC)
+        hide_variable(FMT_TEST)
+        hide_variable(FMT_WERROR)
+        hide_variable(FMT_FUZZ)
+        hide_variable(FMT_CUDA_TEST)
+        hide_variable(FMT_DEBUG_POSTFIX)
+        hide_variable(FMT_INC_DIR)
+        hide_variable(FMT_MODULE)
+        hide_variable(FMT_SYSTEM_HEADERS)
+        hide_variable(FMT_PKGCONFIG_DIR)
+        hide_variable(FMT_CMAKE_DIR)
+        hide_variable(FMT_LIB_DIR)
+        hide_variable(FMT_UNICODE)
+    endif()
+endif()

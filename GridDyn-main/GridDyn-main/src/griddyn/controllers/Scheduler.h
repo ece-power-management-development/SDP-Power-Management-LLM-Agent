@@ -1,0 +1,243 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#pragma once
+
+#include "../Source.h"
+#include "../comms/CommManager.h"
+#include "SchedulerInfo.h"
+#include <list>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace griddyn {
+class AGControl;
+class Generator;
+class Communicator;
+class CommMessage;
+class ReserveDispatcher;
+/** object to manage scheduling for devices
+ */
+class Scheduler: public Source {
+  public:
+  protected:
+    double pMax = kBigNum;  //!< [puMW] maximum set power
+    double pMin = -kBigNum;  //!< [puMW] minimum set power
+    double m_Base = 100;  //!< [MW] generator base power
+    double pCurr = 0;  //!<[puMW] current power output
+    std::list<Tsched> pTarget;  //!< target list
+    std::shared_ptr<Communicator> commLink;  //!< communicator link
+    comms::CommManager cManager;
+    std::uint64_t dispatcherId = 0;  //!< communication id of the dispatcher
+  public:
+    Scheduler(const std::string& objName = "scheduler_#", double initialValue = 0.0);
+    Scheduler(double initialValue, const std::string& objName = "scheduler_#");
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+    virtual ~Scheduler();
+
+    virtual void updateA(CoreTime time) override;
+    virtual double predict(CoreTime time);
+
+    virtual void setTarget(CoreTime time, double target);
+    virtual void setTarget(double target);
+    virtual void setTarget(const std::string& fileName);
+    virtual void setTarget(std::vector<double>& time, std::vector<double>& target);
+    virtual double getTarget() const;
+    double getScheduledPower() const { return pCurr; }
+
+  protected:
+    virtual void dynObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+    virtual void dynObjectInitializeB(const IOdata& inputs,
+                                      const IOdata& desiredOutput,
+                                      IOdata& fieldSet) override;
+
+  public:
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+    virtual void setFlag(std::string_view flag, bool val = true) override;
+    virtual double get(std::string_view param,
+                       units::unit unitType = units::defunit) const override;
+    /** tie the scheduler to a dispatcher */
+    virtual void dispatcherLink();
+    /** get the maximum available power within a specified time window
+    @param[in] time the time window to make the power
+    */
+    virtual double getMax(CoreTime time = maxTime) const;
+    /** get the low power level available within a specified time window
+    @param[in] time the time window to make the power level
+    */
+    virtual double getMin(CoreTime time = maxTime) const;
+
+  protected:
+    virtual void insertTarget(Tsched targetSchedule);
+    void clearSchedule();
+    virtual void receiveMessage(std::uint64_t sourceID,
+                                const std::shared_ptr<CommMessage>& message);
+};
+
+/** @brief scheduler that can deal with ramping of the power on a continuous basis
+as well as handling spinning reserve like capacity in an object
+*/
+class SchedulerRamp: public Scheduler {
+  public:
+    enum RampMode {
+        MID_POINT,  //!< Start the configured ramp window centered on the target time.
+        JUST_IN_TIME,  //!< Start at the latest feasible time to reach the target.
+        ON_TARGET_RAMP,  //!< Begin the ramp at the target time and finish afterward.
+        DELAYED,  //!< Delay the ramp according to the configured ramp window.
+        INTERP,  //!< Ramp toward the target over the interval from the previous target.
+    };
+
+  protected:
+    double rampUp = kBigNum;  //!< maximum ramp rate in the up direction
+    double rampDown = kBigNum;  //!< maximum ramp rate in the down direction
+    CoreTime rampTime = 20.0 * 60.0;  //!< the ramp window
+    double dpdt = 0.0;  //!< the actual ramp rate
+    double pRampCurr = 0.0;  //!< the current scheduled ramp rate
+    CoreTime lastTargetTime = negTime;  //!< the time of the last scheduled target power level
+
+    double ramp10Up = kBigNum;  //!< [puMW] Maximum upward change over 10 minutes
+    double ramp30Up = kBigNum;  //!< [puMW] Maximum upward change over 30 minutes
+    double ramp10Down = kBigNum;  //!< [puMW] Maximum downward change over 10 minutes
+    double ramp30Down = kBigNum;  //!< [puMW] Maximum downward change over 30 minutes
+    RampMode mode = INTERP;  //!< the interpolation mode
+    bool rampCompletionPending = false;
+    CoreTime rampCompletionTime = maxTime;
+
+    // spinning reserve capacity
+    double reserveAvail = 0.0;  //!< the amount of reserve power in the generator
+    double reserveUse = 0.0;  //!< the amount of reserve power to use
+    CoreTime reserveRampTime = 15.0 * 60.0;  //!< the time window the object has to meet the reserve
+    double reserveAct = 0.0;  //!< the actual current reserve
+    double reservePriority = 0.0;  //!< the priority level of the reserve
+
+  private:
+    friend class ReserveDispatcher;
+    ReserveDispatcher* reserveDispatcher = nullptr;
+    void reserveDispatcherLink();
+
+  public:
+    explicit SchedulerRamp(const std::string& objName = "schedulerRamp_#");
+    SchedulerRamp(double initialValue, const std::string& objName = "schedulerRamp_#");
+    ~SchedulerRamp() override;
+
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+    using Scheduler::setTarget;
+    void setTarget(CoreTime time, double target) override;
+    void setTarget(double target) override;
+    void setTarget(const std::string& fileName) override;
+
+    virtual void updateA(CoreTime time) override;
+    virtual double predict(CoreTime time) override;
+
+    virtual void dynObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+    virtual void dynObjectInitializeB(const IOdata& inputs,
+                                      const IOdata& desiredOutput,
+                                      IOdata& fieldSet) override;
+
+    virtual double getRampTime() const;
+    virtual double getRamp() const;
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+
+    virtual double get(std::string_view param,
+                       units::unit unitType = units::defunit) const override;
+
+    virtual void setReserveTarget(double target);
+    double getReserveTarget() { return reserveUse; }
+    double getReserveUse() { return reserveAct; }
+    double getReserveAvailable() { return reserveAvail; }
+    virtual void dispatcherLink() override;
+    virtual double getMax(CoreTime time = maxTime) const override;
+    virtual double getMin(CoreTime time = maxTime) const override;
+
+  protected:
+    double getRampLimitUp() const;
+    double getRampLimitDown() const;
+    virtual void updatePTarget();
+    virtual void insertTarget(Tsched targetSchedule) override;
+
+    virtual void receiveMessage(std::uint64_t sourceID,
+                                const std::shared_ptr<CommMessage>& message) override;
+};
+
+/** @brief scheduler targeted at handling regulation management
+ */
+class SchedulerReg: public SchedulerRamp {
+  protected:
+    double regMax;  //!< the maximum regulation an object has
+    double regMin;  //!< the minimum regulation level
+
+    double regRampUp;  //!< the rate at which the regulation must ramp
+    double regRampDown;  //!< the maximum rate at which regulation can ramp down
+    double regCurrent = 0;  //!< the current regulation output
+    double regTarget = 0.0;  //!< the current regulation target
+    double regUpFrac = 0.0;  //!< the capacity of the object to keep for regulation up purposes
+    double regDownFrac = 0.0;  //!< the capacity of the object to keep for regulation down purposes
+    double regPriority = 0.0;  // a priority queue for the AGC controller if used.
+    bool regEnabled = false;  //!< flag indicating that the regulation system is active
+    double participationRating = 0.0;  //!< regulation participation rating base
+    bool baseUpdateInProgress = false;  //!< separate schedule and regulation ramps
+  private:
+    friend class AGControl;
+    AGControl* agcController = nullptr;
+    void updateRegulationLimits();
+    void validateRegulationBounds(double baseMW,
+                                  double minValue,
+                                  double maxValue,
+                                  double upFraction,
+                                  double downFraction,
+                                  bool regulationEnabled) const;
+
+  public:
+    explicit SchedulerReg(const std::string& objName = "schedulerReg_#");
+    SchedulerReg(double initialValue, const std::string& objName = "schedulerReg_#");
+    SchedulerReg(double initialValue,
+                 double initialReg,
+                 const std::string& objName = "schedulerReg_#");
+    virtual CoreObject* clone(CoreObject* obj = nullptr) const override;
+    ~SchedulerReg();
+    void setReg(double regLevel);
+
+    double getRegTarget() const { return regTarget; }
+    double getReg() const { return regCurrent; }
+    double getRegUpAvailable() const { return regUpFrac * participationRating; }
+    double getRegDownAvailable() const { return regDownFrac * participationRating; }
+    bool getRegEnabled() const { return regEnabled; }
+
+    void updateA(CoreTime time) override;
+    double predict(CoreTime time) override;
+
+    virtual void dynObjectInitializeA(CoreTime time0, std::uint32_t flags) override;
+    virtual void dynObjectInitializeB(const IOdata& inputs,
+                                      const IOdata& desiredOutput,
+                                      IOdata& fieldSet) override;
+
+    double getRamp() const override;
+    double getRampTime() const override;
+
+    void regSettings(bool active, double upFrac = -1.0, double downFrac = -1.0);
+
+    virtual void set(std::string_view param, std::string_view val) override;
+    virtual void
+        set(std::string_view param, double val, units::unit unitType = units::defunit) override;
+
+    virtual double get(std::string_view param,
+                       units::unit unitType = units::defunit) const override;
+    virtual void dispatcherLink() override;
+    virtual double getMax(CoreTime time = maxTime) const override;
+    virtual double getMin(CoreTime time = maxTime) const override;
+
+  protected:
+    virtual void receiveMessage(std::uint64_t sourceID,
+                                const std::shared_ptr<CommMessage>& message) override;
+};
+
+}  // namespace griddyn

@@ -1,0 +1,2351 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "core/CoreExceptions.h"
+#include "fileInput/fileInput.h"
+#include "griddyn/Generator.h"
+#include "griddyn/GridArea.h"
+#include "griddyn/GridBus.h"
+#include "griddyn/GridDynSimulation.h"
+#include "griddyn/Link.h"
+#include "griddyn/Load.h"
+#include "griddyn/Relay.h"
+#include "griddyn/gridDynVersion.hpp"
+#include "griddyn/griddyn-config.h"
+#include "griddyn/measurement/Recorder.h"
+#include "griddyn/relays/Sensor.h"
+#include "griddyn/simulation/GridDynSimulationFileOps.h"
+#include "griddyn/simulation/GridSimulation.h"
+#include "runner/gridDynRunner.h"
+#include "units/units.hpp"
+#ifdef GRIDDYN_ENABLE_OPTIMIZATION_LIBRARY
+#    include "optimization/gridDynOpt.h"
+#    include "optimization/optHelperClasses.h"
+#    include "optimization/optimizerInterface.h"
+#endif
+#include <cctype>
+#include <cmath>
+#include <filesystem>
+#include <limits>
+#include <memory>
+
+// Keep diagnostics enabled for GridDyn code while quieting warnings from the
+// nanobind and CPython headers included below.
+#if defined(__clang__)
+#    pragma clang diagnostic push
+#    pragma clang diagnostic ignored "-Wshadow"
+#elif defined(__GNUC__)
+#    pragma GCC diagnostic push
+#    pragma GCC diagnostic ignored "-Wstrict-aliasing"
+#    pragma GCC diagnostic ignored "-Wshadow"
+#endif
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
+#if defined(__clang__)
+#    pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#    pragma GCC diagnostic pop
+#endif
+
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+namespace nb = nanobind;
+using namespace nb::literals;
+
+namespace {
+
+PyObject* pyInvalidObjectError = nullptr;
+PyObject* pyInvalidParameterError = nullptr;
+PyObject* pyFileLoadError = nullptr;
+PyObject* pySolveError = nullptr;
+PyObject* pyExecutionError = nullptr;
+PyObject* pyGridDynError = nullptr;
+
+class GridDynError: public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
+
+class InvalidObjectError: public GridDynError {
+  public:
+    using GridDynError::GridDynError;
+};
+
+class InvalidParameterError: public GridDynError {
+  public:
+    using GridDynError::GridDynError;
+};
+
+class FileLoadError: public GridDynError {
+  public:
+    using GridDynError::GridDynError;
+};
+
+class SolveError: public GridDynError {
+  public:
+    using GridDynError::GridDynError;
+};
+
+class ExecutionError: public GridDynError {
+  public:
+    using GridDynError::GridDynError;
+};
+
+std::shared_ptr<griddyn::GridDynSimulation>
+    simulationFromRunner(const std::shared_ptr<griddyn::GriddynRunner>& runner)
+{
+    auto sim = runner->getSim();
+    if (!sim) {
+        throw InvalidObjectError("simulation is not available");
+    }
+    return sim;
+}
+
+template<class T>
+class PyObjectReference {
+  public:
+    PyObjectReference(const std::shared_ptr<griddyn::GriddynRunner>& runner, T* object):
+        runner_(runner), simulation_(simulationFromRunner(runner)), object_(object)
+    {
+    }
+
+    T* get() const
+    {
+        if (simulationFromRunner(runner_).get() != simulation_.get()) {
+            throw InvalidObjectError("model belongs to a previous simulation; reacquire it");
+        }
+        return object_;
+    }
+
+    T* operator->() const
+    {
+        auto* object = get();
+        if (object == nullptr) {
+            throw InvalidObjectError("model is not available");
+        }
+        return object;
+    }
+
+    operator T*() const { return get(); }
+
+  private:
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+    std::shared_ptr<griddyn::GridDynSimulation> simulation_;
+    T* object_ = nullptr;
+};
+
+std::size_t normalizeIndex(std::ptrdiff_t index, std::size_t size, const char* typeName)
+{
+    if (index < 0) {
+        index += static_cast<std::ptrdiff_t>(size);
+    }
+    if (index < 0 || static_cast<std::size_t>(index) >= size) {
+        throw nb::index_error((std::string(typeName) + " index out of range").c_str());
+    }
+    return static_cast<std::size_t>(index);
+}
+
+std::string objectName(const griddyn::CoreObject* object)
+{
+    return object != nullptr ? object->getName() : std::string();
+}
+
+std::vector<griddyn::GridBus*>
+    busVectorFromRunner(const std::shared_ptr<griddyn::GriddynRunner>& runner)
+{
+    std::vector<griddyn::GridBus*> buses;
+    simulationFromRunner(runner)->getBusVector(buses);
+    return buses;
+}
+
+std::vector<griddyn::Link*>
+    linkVectorFromRunner(const std::shared_ptr<griddyn::GriddynRunner>& runner)
+{
+    std::vector<griddyn::Link*> links;
+    simulationFromRunner(runner)->getLinkVector(links);
+    return links;
+}
+
+void appendAreaVector(griddyn::GridArea* area, std::vector<griddyn::GridArea*>& areas)
+{
+    if (area == nullptr) {
+        return;
+    }
+    const auto count = static_cast<std::size_t>(area->getInt("areacount"));
+    for (std::size_t index = 0; index < count; ++index) {
+        auto* subArea = area->getArea(static_cast<index_t>(index));
+        if (subArea != nullptr) {
+            areas.push_back(subArea);
+            appendAreaVector(subArea, areas);
+        }
+    }
+}
+
+std::vector<griddyn::GridArea*>
+    areaVectorFromRunner(const std::shared_ptr<griddyn::GriddynRunner>& runner)
+{
+    std::vector<griddyn::GridArea*> areas;
+    appendAreaVector(simulationFromRunner(runner).get(), areas);
+    return areas;
+}
+
+void appendRelayVector(griddyn::GridArea* area, std::vector<griddyn::Relay*>& relays)
+{
+    if (area == nullptr) {
+        return;
+    }
+    const auto relayCount = static_cast<std::size_t>(area->getInt("relaycount"));
+    for (std::size_t index = 0; index < relayCount; ++index) {
+        auto* relay = area->getRelay(static_cast<index_t>(index));
+        if (relay != nullptr) {
+            relays.push_back(relay);
+        }
+    }
+    const auto areaCount = static_cast<std::size_t>(area->getInt("areacount"));
+    for (std::size_t index = 0; index < areaCount; ++index) {
+        appendRelayVector(area->getArea(static_cast<index_t>(index)), relays);
+    }
+}
+
+std::vector<griddyn::Relay*>
+    relayVectorFromRunner(const std::shared_ptr<griddyn::GriddynRunner>& runner)
+{
+    std::vector<griddyn::Relay*> relays;
+    appendRelayVector(simulationFromRunner(runner).get(), relays);
+    return relays;
+}
+
+std::vector<griddyn::Sensor*>
+    sensorVectorFromRunner(const std::shared_ptr<griddyn::GriddynRunner>& runner)
+{
+    std::vector<griddyn::Sensor*> sensors;
+    for (auto* relay : relayVectorFromRunner(runner)) {
+        if (auto* sensor = dynamic_cast<griddyn::Sensor*>(relay); sensor != nullptr) {
+            sensors.push_back(sensor);
+        }
+    }
+    return sensors;
+}
+
+std::vector<std::shared_ptr<griddyn::Recorder>>
+    recorderVectorFromRunner(const std::shared_ptr<griddyn::GriddynRunner>& runner)
+{
+    std::vector<std::shared_ptr<griddyn::Recorder>> recorders;
+    for (const auto& collector : simulationFromRunner(runner)->getCollectors()) {
+        if (auto recorder = std::dynamic_pointer_cast<griddyn::Recorder>(collector)) {
+            recorders.push_back(std::move(recorder));
+        }
+    }
+    return recorders;
+}
+
+struct SecondaryWithBus {
+    griddyn::GridBus* bus = nullptr;
+    griddyn::GridSecondary* object = nullptr;
+};
+
+std::vector<SecondaryWithBus>
+    generatorVectorFromRunner(const std::shared_ptr<griddyn::GriddynRunner>& runner)
+{
+    std::vector<SecondaryWithBus> generators;
+    for (auto* bus : busVectorFromRunner(runner)) {
+        if (bus == nullptr) {
+            continue;
+        }
+        const auto count = static_cast<std::size_t>(bus->getInt("gencount"));
+        for (std::size_t index = 0; index < count; ++index) {
+            auto* gen = bus->getGen(static_cast<index_t>(index));
+            if (gen != nullptr) {
+                generators.push_back({bus, gen});
+            }
+        }
+    }
+    return generators;
+}
+
+std::vector<SecondaryWithBus>
+    loadVectorFromRunner(const std::shared_ptr<griddyn::GriddynRunner>& runner)
+{
+    std::vector<SecondaryWithBus> loads;
+    for (auto* bus : busVectorFromRunner(runner)) {
+        if (bus == nullptr) {
+            continue;
+        }
+        const auto count = static_cast<std::size_t>(bus->getInt("loadcount"));
+        for (std::size_t index = 0; index < count; ++index) {
+            auto* load = bus->getLoad(static_cast<index_t>(index));
+            if (load != nullptr) {
+                loads.push_back({bus, load});
+            }
+        }
+    }
+    return loads;
+}
+
+nb::object dataframeFromDicts(const nb::list& rows)
+{
+    auto pandas = nb::module_::import_("pandas");
+    return pandas.attr("DataFrame")(rows);
+}
+
+void setObjectParameter(griddyn::CoreObject* object,
+                        const std::string& field,
+                        const nb::object& value,
+                        const std::optional<std::string>& unit)
+{
+    if (object == nullptr) {
+        throw InvalidObjectError("object is not available");
+    }
+    if (PyUnicode_Check(value.ptr())) {
+        if (unit) {
+            throw nb::type_error("unit can only be specified when setting a numeric value");
+        }
+        object->set(field, nb::cast<std::string>(value));
+        return;
+    }
+    if (PyBool_Check(value.ptr())) {
+        if (unit) {
+            throw nb::type_error("unit can only be specified when setting a numeric value");
+        }
+        object->set(field, PyObject_IsTrue(value.ptr()) ? 1.0 : 0.0);
+        return;
+    }
+    if (PyFloat_Check(value.ptr()) || PyLong_Check(value.ptr())) {
+        if (unit) {
+            const auto unitType = units::unit_cast_from_string(*unit);
+            if (units::is_error(unitType)) {
+                throw InvalidParameterError("unknown unit '" + *unit + "'");
+            }
+            object->set(field, nb::cast<double>(value), unitType);
+        } else {
+            object->set(field, nb::cast<double>(value));
+        }
+        return;
+    }
+    throw nb::type_error("set value must be a string, bool, int, or float");
+}
+
+nb::object modelFromObject(const std::shared_ptr<griddyn::GriddynRunner>& runner,
+                           griddyn::CoreObject* object);
+
+class PyModel {
+  public:
+    PyModel(std::shared_ptr<griddyn::GriddynRunner> runner,
+            griddyn::CoreObject* object,
+            std::string type):
+        runner_(std::move(runner)), object_(runner_, object), type_(std::move(type))
+    {
+    }
+
+    std::string name() const { return objectName(object_); }
+    std::string type() const { return type_; }
+    int userId() const { return object_->getUserID(); }
+    bool enabled() const { return object_->isEnabled(); }
+    std::string description() const { return object_->getDescription(); }
+    double get(const std::string& field) const { return object_->get(field); }
+    PyModel& set(const std::string& field,
+                 const nb::object& value,
+                 const std::optional<std::string>& unit)
+    {
+        setObjectParameter(object_, field, value, unit);
+        return *this;
+    }
+    std::string getString(const std::string& field) const { return object_->getString(field); }
+    nb::object find(const std::string& name) const
+    {
+        return modelFromObject(runner_, object_->find(name));
+    }
+
+    nb::dict asDict() const
+    {
+        nb::dict row;
+        row["name"] = name();
+        row["type"] = type();
+        row["uid"] = userId();
+        row["enabled"] = enabled();
+        return row;
+    }
+
+  private:
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+    PyObjectReference<griddyn::CoreObject> object_;
+    std::string type_;
+};
+
+class PyBus {
+  public:
+    PyBus(std::shared_ptr<griddyn::GriddynRunner> runner, griddyn::GridBus* bus):
+        runner_(std::move(runner)), bus_(runner_, bus)
+    {
+    }
+
+    std::string name() const { return objectName(bus_); }
+    std::string type() const { return "bus"; }
+    int userId() const { return bus_->getUserID(); }
+    double voltage() const { return bus_->getVoltage(); }
+    double angle() const { return bus_->getAngle(); }
+    double frequency() const { return bus_->getFreq(); }
+    double generationP() const { return bus_->getGenerationReal(); }
+    double generationQ() const { return bus_->getGenerationReactive(); }
+    double loadP() const { return bus_->getLoadReal(); }
+    double loadQ() const { return bus_->getLoadReactive(); }
+    double linkP() const { return bus_->getLinkReal(); }
+    double linkQ() const { return bus_->getLinkReactive(); }
+    double get(const std::string& field) const { return bus_->get(field); }
+    PyBus& set(const std::string& field,
+               const nb::object& value,
+               const std::optional<std::string>& unit)
+    {
+        setObjectParameter(bus_, field, value, unit);
+        return *this;
+    }
+    std::string getString(const std::string& field) const { return bus_->getString(field); }
+    nb::object find(const std::string& name) const
+    {
+        return modelFromObject(runner_, bus_->find(name));
+    }
+
+    nb::dict asDict() const
+    {
+        nb::dict row;
+        row["name"] = name();
+        row["type"] = type();
+        row["uid"] = userId();
+        row["voltage"] = voltage();
+        row["angle"] = angle();
+        row["frequency"] = frequency();
+        row["p_gen"] = generationP();
+        row["q_gen"] = generationQ();
+        row["p_load"] = loadP();
+        row["q_load"] = loadQ();
+        row["p_link"] = linkP();
+        row["q_link"] = linkQ();
+        return row;
+    }
+
+  private:
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+    PyObjectReference<griddyn::GridBus> bus_;
+};
+
+class PyGenerator {
+  public:
+    PyGenerator(std::shared_ptr<griddyn::GriddynRunner> runner,
+                griddyn::GridBus* bus,
+                griddyn::Generator* generator):
+        runner_(std::move(runner)), bus_(runner_, bus), generator_(runner_, generator)
+    {
+    }
+
+    std::string name() const { return objectName(generator_); }
+    std::string type() const { return "generator"; }
+    std::string bus() const { return objectName(bus_); }
+    int userId() const { return generator_->getUserID(); }
+    double p() const { return generator_->getRealPower(); }
+    double q() const { return generator_->getReactivePower(); }
+    double pset() const { return generator_->getPset(); }
+    double pmax() const { return generator_->getPmax(); }
+    double pmin() const { return generator_->getPmin(); }
+    double qmax() const { return generator_->getQmax(); }
+    double qmin() const { return generator_->getQmin(); }
+    double get(const std::string& field) const { return generator_->get(field); }
+    PyGenerator& set(const std::string& field,
+                     const nb::object& value,
+                     const std::optional<std::string>& unit)
+    {
+        setObjectParameter(generator_, field, value, unit);
+        return *this;
+    }
+    std::string getString(const std::string& field) const { return generator_->getString(field); }
+
+    nb::dict asDict() const
+    {
+        nb::dict row;
+        row["name"] = name();
+        row["type"] = type();
+        row["uid"] = userId();
+        row["bus"] = bus();
+        row["p"] = p();
+        row["q"] = q();
+        row["pset"] = pset();
+        row["pmax"] = pmax();
+        row["pmin"] = pmin();
+        row["qmax"] = qmax();
+        row["qmin"] = qmin();
+        return row;
+    }
+
+  private:
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+    PyObjectReference<griddyn::GridBus> bus_;
+    PyObjectReference<griddyn::Generator> generator_;
+};
+
+class PyLoad {
+  public:
+    PyLoad(std::shared_ptr<griddyn::GriddynRunner> runner,
+           griddyn::GridBus* bus,
+           griddyn::GridLoad* load):
+        runner_(std::move(runner)), bus_(runner_, bus), load_(runner_, load)
+    {
+    }
+
+    std::string name() const { return objectName(load_); }
+    std::string type() const { return "load"; }
+    std::string bus() const { return objectName(bus_); }
+    int userId() const { return load_->getUserID(); }
+    double p() const { return load_->getRealPower(); }
+    double q() const { return load_->getReactivePower(); }
+    double get(const std::string& field) const { return load_->get(field); }
+    PyLoad& set(const std::string& field,
+                const nb::object& value,
+                const std::optional<std::string>& unit)
+    {
+        setObjectParameter(load_, field, value, unit);
+        return *this;
+    }
+    std::string getString(const std::string& field) const { return load_->getString(field); }
+
+    nb::dict asDict() const
+    {
+        nb::dict row;
+        row["name"] = name();
+        row["type"] = type();
+        row["uid"] = userId();
+        row["bus"] = bus();
+        row["p"] = p();
+        row["q"] = q();
+        return row;
+    }
+
+  private:
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+    PyObjectReference<griddyn::GridBus> bus_;
+    PyObjectReference<griddyn::GridLoad> load_;
+};
+
+class PyLink {
+  public:
+    PyLink(std::shared_ptr<griddyn::GriddynRunner> runner, griddyn::Link* link):
+        runner_(std::move(runner)), link_(runner_, link)
+    {
+    }
+
+    std::string name() const { return objectName(link_); }
+    std::string type() const { return "link"; }
+    int userId() const { return link_->getUserID(); }
+    std::string bus1() const { return objectName(link_->getBus(1)); }
+    std::string bus2() const { return objectName(link_->getBus(2)); }
+    double p1() const { return link_->getRealPower(1); }
+    double q1() const { return link_->getReactivePower(1); }
+    double p2() const { return link_->getRealPower(2); }
+    double q2() const { return link_->getReactivePower(2); }
+    double loss() const { return link_->getLoss(); }
+    double reactiveLoss() const { return link_->getReactiveLoss(); }
+    double get(const std::string& field) const { return link_->get(field); }
+    PyLink& set(const std::string& field,
+                const nb::object& value,
+                const std::optional<std::string>& unit)
+    {
+        setObjectParameter(link_, field, value, unit);
+        return *this;
+    }
+    std::string getString(const std::string& field) const { return link_->getString(field); }
+
+    nb::dict asDict() const
+    {
+        nb::dict row;
+        row["name"] = name();
+        row["type"] = type();
+        row["uid"] = userId();
+        row["bus1"] = bus1();
+        row["bus2"] = bus2();
+        row["p1"] = p1();
+        row["q1"] = q1();
+        row["p2"] = p2();
+        row["q2"] = q2();
+        row["loss"] = loss();
+        row["q_loss"] = reactiveLoss();
+        return row;
+    }
+
+  private:
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+    PyObjectReference<griddyn::Link> link_;
+};
+
+class PyArea {
+  public:
+    PyArea(std::shared_ptr<griddyn::GriddynRunner> runner, griddyn::GridArea* area):
+        runner_(std::move(runner)), area_(runner_, area)
+    {
+    }
+
+    std::string name() const { return objectName(area_); }
+    std::string type() const { return "area"; }
+    int userId() const { return area_->getUserID(); }
+    bool enabled() const { return area_->isEnabled(); }
+    int busCount() const { return area_->getInt("buscount"); }
+    int linkCount() const { return area_->getInt("linkcount"); }
+    int areaCount() const { return area_->getInt("areacount"); }
+    int relayCount() const { return area_->getInt("relaycount"); }
+    int generatorCount() const { return area_->getInt("gencount"); }
+    int loadCount() const { return area_->getInt("loadcount"); }
+    double generationP() const { return area_->getGenerationReal(); }
+    double generationQ() const { return area_->getGenerationReactive(); }
+    double loadP() const { return area_->getLoadReal(); }
+    double loadQ() const { return area_->getLoadReactive(); }
+    double loss() const { return area_->getLoss(); }
+    double averageFrequency() const { return area_->getAvgFreq(); }
+    double averageAngle() const { return area_->getAvgAngle(); }
+    double tieP() const { return area_->getTieFlowReal(); }
+    double get(const std::string& field) const { return area_->get(field); }
+    PyArea& set(const std::string& field,
+                const nb::object& value,
+                const std::optional<std::string>& unit)
+    {
+        setObjectParameter(area_, field, value, unit);
+        return *this;
+    }
+    std::string getString(const std::string& field) const { return area_->getString(field); }
+    nb::object find(const std::string& name) const
+    {
+        return modelFromObject(runner_, area_->find(name));
+    }
+
+    nb::dict asDict() const
+    {
+        nb::dict row;
+        row["name"] = name();
+        row["type"] = type();
+        row["uid"] = userId();
+        row["enabled"] = enabled();
+        row["bus_count"] = busCount();
+        row["link_count"] = linkCount();
+        row["area_count"] = areaCount();
+        row["relay_count"] = relayCount();
+        row["generator_count"] = generatorCount();
+        row["load_count"] = loadCount();
+        row["p_gen"] = generationP();
+        row["q_gen"] = generationQ();
+        row["p_load"] = loadP();
+        row["q_load"] = loadQ();
+        row["loss"] = loss();
+        row["average_frequency"] = averageFrequency();
+        row["average_angle"] = averageAngle();
+        row["tie_p"] = tieP();
+        return row;
+    }
+
+  private:
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+    PyObjectReference<griddyn::GridArea> area_;
+};
+
+class PyRelay {
+  public:
+    PyRelay(std::shared_ptr<griddyn::GriddynRunner> runner, griddyn::Relay* relay):
+        runner_(std::move(runner)), relay_(runner_, relay)
+    {
+    }
+
+    std::string name() const { return objectName(relay_); }
+    std::string type() const { return "relay"; }
+    int userId() const { return relay_->getUserID(); }
+    bool enabled() const { return relay_->isEnabled(); }
+    double get(const std::string& field) const { return relay_->get(field); }
+    PyRelay& set(const std::string& field,
+                 const nb::object& value,
+                 const std::optional<std::string>& unit)
+    {
+        setObjectParameter(relay_, field, value, unit);
+        return *this;
+    }
+    std::string getString(const std::string& field) const { return relay_->getString(field); }
+
+    nb::dict asDict() const
+    {
+        nb::dict row;
+        row["name"] = name();
+        row["type"] = type();
+        row["uid"] = userId();
+        row["enabled"] = enabled();
+        return row;
+    }
+
+  protected:
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+    PyObjectReference<griddyn::Relay> relay_;
+};
+
+class PySensor {
+  public:
+    PySensor(std::shared_ptr<griddyn::GriddynRunner> runner, griddyn::Sensor* sensor):
+        runner_(std::move(runner)), sensor_(runner_, sensor)
+    {
+    }
+
+    std::string name() const { return objectName(sensor_); }
+    std::string type() const { return "sensor"; }
+    int userId() const { return sensor_->getUserID(); }
+    bool enabled() const { return sensor_->isEnabled(); }
+    double output(std::ptrdiff_t index = 0) const
+    {
+        if (index < 0) {
+            throw nb::index_error("sensor output index out of range");
+        }
+        return sensor_->getOutput(static_cast<index_t>(index));
+    }
+    double get(const std::string& field) const { return sensor_->get(field); }
+    PySensor& set(const std::string& field,
+                  const nb::object& value,
+                  const std::optional<std::string>& unit)
+    {
+        setObjectParameter(sensor_, field, value, unit);
+        return *this;
+    }
+    std::string getString(const std::string& field) const { return sensor_->getString(field); }
+
+    nb::dict asDict() const
+    {
+        nb::dict row;
+        row["name"] = name();
+        row["type"] = type();
+        row["uid"] = userId();
+        row["enabled"] = enabled();
+        return row;
+    }
+
+  private:
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+    PyObjectReference<griddyn::Sensor> sensor_;
+};
+
+nb::object modelFromObject(const std::shared_ptr<griddyn::GriddynRunner>& runner,
+                           griddyn::CoreObject* object)
+{
+    if (object == nullptr) {
+        return nb::none();
+    }
+    if (auto* sensor = dynamic_cast<griddyn::Sensor*>(object); sensor != nullptr) {
+        return nb::cast(PySensor(runner, sensor));
+    }
+    if (auto* relay = dynamic_cast<griddyn::Relay*>(object); relay != nullptr) {
+        return nb::cast(PyRelay(runner, relay));
+    }
+    if (auto* bus = dynamic_cast<griddyn::GridBus*>(object); bus != nullptr) {
+        return nb::cast(PyBus(runner, bus));
+    }
+    if (auto* generator = dynamic_cast<griddyn::Generator*>(object); generator != nullptr) {
+        const auto* secondary = static_cast<griddyn::GridSecondary*>(generator);
+        return nb::cast(
+            PyGenerator(runner, const_cast<griddyn::GridBus*>(secondary->getBus()), generator));
+    }
+    if (auto* load = dynamic_cast<griddyn::GridLoad*>(object); load != nullptr) {
+        const auto* secondary = static_cast<griddyn::GridSecondary*>(load);
+        return nb::cast(PyLoad(runner, const_cast<griddyn::GridBus*>(secondary->getBus()), load));
+    }
+    if (auto* link = dynamic_cast<griddyn::Link*>(object); link != nullptr) {
+        return nb::cast(PyLink(runner, link));
+    }
+    if (auto* area = dynamic_cast<griddyn::GridArea*>(object); area != nullptr) {
+        return nb::cast(PyArea(runner, area));
+    }
+    return nb::cast(PyModel(runner, object, "object"));
+}
+
+template<class Item>
+nb::list namesFromItems(const std::vector<Item>& items)
+{
+    nb::list names;
+    for (const auto& item : items) {
+        names.append(objectName(item));
+    }
+    return names;
+}
+
+template<class Item>
+std::size_t
+    findItemByName(const std::vector<Item>& items, const std::string& name, const char* typeName)
+{
+    for (std::size_t index = 0; index < items.size(); ++index) {
+        if (objectName(items[index]) == name) {
+            return index;
+        }
+    }
+    throw nb::key_error((std::string(typeName) + " not found: " + name).c_str());
+}
+
+std::size_t findSecondaryByName(const std::vector<SecondaryWithBus>& items,
+                                const std::string& name,
+                                const char* typeName)
+{
+    for (std::size_t index = 0; index < items.size(); ++index) {
+        if (objectName(items[index].object) == name) {
+            return index;
+        }
+    }
+    throw nb::key_error((std::string(typeName) + " not found: " + name).c_str());
+}
+
+class PyBusCollection {
+  public:
+    explicit PyBusCollection(std::shared_ptr<griddyn::GriddynRunner> runner):
+        runner_(std::move(runner))
+    {
+    }
+
+    std::size_t size() const { return busVectorFromRunner(runner_).size(); }
+    nb::list names() const { return namesFromItems(busVectorFromRunner(runner_)); }
+
+    PyBus getByIndex(std::ptrdiff_t index) const
+    {
+        auto buses = busVectorFromRunner(runner_);
+        return PyBus(runner_, buses[normalizeIndex(index, buses.size(), "bus")]);
+    }
+
+    PyBus getByName(const std::string& name) const
+    {
+        auto buses = busVectorFromRunner(runner_);
+        return PyBus(runner_, buses[findItemByName(buses, name, "bus")]);
+    }
+
+    PyBus getItem(const nb::object& key) const
+    {
+        if (nb::isinstance<nb::int_>(key)) {
+            return getByIndex(nb::cast<std::ptrdiff_t>(key));
+        }
+        if (nb::isinstance<nb::str>(key)) {
+            return getByName(nb::cast<std::string>(key));
+        }
+        throw nb::type_error("bus indices must be integers or names");
+    }
+
+    nb::list asDicts() const
+    {
+        nb::list rows;
+        for (auto* bus : busVectorFromRunner(runner_)) {
+            rows.append(PyBus(runner_, bus).asDict());
+        }
+        return rows;
+    }
+
+    nb::object asDataFrame() const { return dataframeFromDicts(asDicts()); }
+
+  private:
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+};
+
+class PyGeneratorCollection {
+  public:
+    explicit PyGeneratorCollection(std::shared_ptr<griddyn::GriddynRunner> runner):
+        runner_(std::move(runner))
+    {
+    }
+
+    std::size_t size() const { return generatorVectorFromRunner(runner_).size(); }
+
+    nb::list names() const
+    {
+        nb::list names;
+        for (const auto& item : generatorVectorFromRunner(runner_)) {
+            names.append(objectName(item.object));
+        }
+        return names;
+    }
+
+    PyGenerator getByIndex(std::ptrdiff_t index) const
+    {
+        auto generators = generatorVectorFromRunner(runner_);
+        const auto normalized = normalizeIndex(index, generators.size(), "generator");
+        auto item = generators[normalized];
+        return PyGenerator(runner_, item.bus, static_cast<griddyn::Generator*>(item.object));
+    }
+
+    PyGenerator getByName(const std::string& name) const
+    {
+        auto generators = generatorVectorFromRunner(runner_);
+        auto item = generators[findSecondaryByName(generators, name, "generator")];
+        return PyGenerator(runner_, item.bus, static_cast<griddyn::Generator*>(item.object));
+    }
+
+    PyGenerator getItem(const nb::object& key) const
+    {
+        if (nb::isinstance<nb::int_>(key)) {
+            return getByIndex(nb::cast<std::ptrdiff_t>(key));
+        }
+        if (nb::isinstance<nb::str>(key)) {
+            return getByName(nb::cast<std::string>(key));
+        }
+        throw nb::type_error("generator indices must be integers or names");
+    }
+
+    nb::list asDicts() const
+    {
+        nb::list rows;
+        for (const auto& item : generatorVectorFromRunner(runner_)) {
+            rows.append(
+                PyGenerator(runner_, item.bus, static_cast<griddyn::Generator*>(item.object))
+                    .asDict());
+        }
+        return rows;
+    }
+
+    nb::object asDataFrame() const { return dataframeFromDicts(asDicts()); }
+
+  private:
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+};
+
+class PyLoadCollection {
+  public:
+    explicit PyLoadCollection(std::shared_ptr<griddyn::GriddynRunner> runner):
+        runner_(std::move(runner))
+    {
+    }
+
+    std::size_t size() const { return loadVectorFromRunner(runner_).size(); }
+
+    nb::list names() const
+    {
+        nb::list names;
+        for (const auto& item : loadVectorFromRunner(runner_)) {
+            names.append(objectName(item.object));
+        }
+        return names;
+    }
+
+    PyLoad getByIndex(std::ptrdiff_t index) const
+    {
+        auto loads = loadVectorFromRunner(runner_);
+        const auto normalized = normalizeIndex(index, loads.size(), "load");
+        auto item = loads[normalized];
+        return PyLoad(runner_, item.bus, static_cast<griddyn::GridLoad*>(item.object));
+    }
+
+    PyLoad getByName(const std::string& name) const
+    {
+        auto loads = loadVectorFromRunner(runner_);
+        auto item = loads[findSecondaryByName(loads, name, "load")];
+        return PyLoad(runner_, item.bus, static_cast<griddyn::GridLoad*>(item.object));
+    }
+
+    PyLoad getItem(const nb::object& key) const
+    {
+        if (nb::isinstance<nb::int_>(key)) {
+            return getByIndex(nb::cast<std::ptrdiff_t>(key));
+        }
+        if (nb::isinstance<nb::str>(key)) {
+            return getByName(nb::cast<std::string>(key));
+        }
+        throw nb::type_error("load indices must be integers or names");
+    }
+
+    nb::list asDicts() const
+    {
+        nb::list rows;
+        for (const auto& item : loadVectorFromRunner(runner_)) {
+            rows.append(
+                PyLoad(runner_, item.bus, static_cast<griddyn::GridLoad*>(item.object)).asDict());
+        }
+        return rows;
+    }
+
+    nb::object asDataFrame() const { return dataframeFromDicts(asDicts()); }
+
+  private:
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+};
+
+class PyLinkCollection {
+  public:
+    explicit PyLinkCollection(std::shared_ptr<griddyn::GriddynRunner> runner):
+        runner_(std::move(runner))
+    {
+    }
+
+    std::size_t size() const { return linkVectorFromRunner(runner_).size(); }
+    nb::list names() const { return namesFromItems(linkVectorFromRunner(runner_)); }
+
+    PyLink getByIndex(std::ptrdiff_t index) const
+    {
+        auto links = linkVectorFromRunner(runner_);
+        return PyLink(runner_, links[normalizeIndex(index, links.size(), "link")]);
+    }
+
+    PyLink getByName(const std::string& name) const
+    {
+        auto links = linkVectorFromRunner(runner_);
+        return PyLink(runner_, links[findItemByName(links, name, "link")]);
+    }
+
+    PyLink getItem(const nb::object& key) const
+    {
+        if (nb::isinstance<nb::int_>(key)) {
+            return getByIndex(nb::cast<std::ptrdiff_t>(key));
+        }
+        if (nb::isinstance<nb::str>(key)) {
+            return getByName(nb::cast<std::string>(key));
+        }
+        throw nb::type_error("link indices must be integers or names");
+    }
+
+    nb::list asDicts() const
+    {
+        nb::list rows;
+        for (auto* link : linkVectorFromRunner(runner_)) {
+            rows.append(PyLink(runner_, link).asDict());
+        }
+        return rows;
+    }
+
+    nb::object asDataFrame() const { return dataframeFromDicts(asDicts()); }
+
+  private:
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+};
+
+class PyAreaCollection {
+  public:
+    explicit PyAreaCollection(std::shared_ptr<griddyn::GriddynRunner> runner):
+        runner_(std::move(runner))
+    {
+    }
+
+    std::size_t size() const { return areaVectorFromRunner(runner_).size(); }
+    nb::list names() const { return namesFromItems(areaVectorFromRunner(runner_)); }
+
+    PyArea getByIndex(std::ptrdiff_t index) const
+    {
+        auto areas = areaVectorFromRunner(runner_);
+        return PyArea(runner_, areas[normalizeIndex(index, areas.size(), "area")]);
+    }
+
+    PyArea getByName(const std::string& name) const
+    {
+        auto areas = areaVectorFromRunner(runner_);
+        return PyArea(runner_, areas[findItemByName(areas, name, "area")]);
+    }
+
+    PyArea getItem(const nb::object& key) const
+    {
+        if (nb::isinstance<nb::int_>(key)) {
+            return getByIndex(nb::cast<std::ptrdiff_t>(key));
+        }
+        if (nb::isinstance<nb::str>(key)) {
+            return getByName(nb::cast<std::string>(key));
+        }
+        throw nb::type_error("area indices must be integers or names");
+    }
+
+    nb::list asDicts() const
+    {
+        nb::list rows;
+        for (auto* area : areaVectorFromRunner(runner_)) {
+            rows.append(PyArea(runner_, area).asDict());
+        }
+        return rows;
+    }
+
+    nb::object asDataFrame() const { return dataframeFromDicts(asDicts()); }
+
+  private:
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+};
+
+class PyRelayCollection {
+  public:
+    explicit PyRelayCollection(std::shared_ptr<griddyn::GriddynRunner> runner):
+        runner_(std::move(runner))
+    {
+    }
+
+    std::size_t size() const { return relayVectorFromRunner(runner_).size(); }
+    nb::list names() const { return namesFromItems(relayVectorFromRunner(runner_)); }
+
+    PyRelay getByIndex(std::ptrdiff_t index) const
+    {
+        auto relays = relayVectorFromRunner(runner_);
+        return PyRelay(runner_, relays[normalizeIndex(index, relays.size(), "relay")]);
+    }
+
+    PyRelay getByName(const std::string& name) const
+    {
+        auto relays = relayVectorFromRunner(runner_);
+        return PyRelay(runner_, relays[findItemByName(relays, name, "relay")]);
+    }
+
+    PyRelay getItem(const nb::object& key) const
+    {
+        if (nb::isinstance<nb::int_>(key)) {
+            return getByIndex(nb::cast<std::ptrdiff_t>(key));
+        }
+        if (nb::isinstance<nb::str>(key)) {
+            return getByName(nb::cast<std::string>(key));
+        }
+        throw nb::type_error("relay indices must be integers or names");
+    }
+
+    nb::list asDicts() const
+    {
+        nb::list rows;
+        for (auto* relay : relayVectorFromRunner(runner_)) {
+            rows.append(PyRelay(runner_, relay).asDict());
+        }
+        return rows;
+    }
+
+    nb::object asDataFrame() const { return dataframeFromDicts(asDicts()); }
+
+  private:
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+};
+
+class PySensorCollection {
+  public:
+    explicit PySensorCollection(std::shared_ptr<griddyn::GriddynRunner> runner):
+        runner_(std::move(runner))
+    {
+    }
+
+    std::size_t size() const { return sensorVectorFromRunner(runner_).size(); }
+    nb::list names() const { return namesFromItems(sensorVectorFromRunner(runner_)); }
+
+    PySensor getByIndex(std::ptrdiff_t index) const
+    {
+        auto sensors = sensorVectorFromRunner(runner_);
+        return PySensor(runner_, sensors[normalizeIndex(index, sensors.size(), "sensor")]);
+    }
+
+    PySensor getByName(const std::string& name) const
+    {
+        auto sensors = sensorVectorFromRunner(runner_);
+        return PySensor(runner_, sensors[findItemByName(sensors, name, "sensor")]);
+    }
+
+    PySensor getItem(const nb::object& key) const
+    {
+        if (nb::isinstance<nb::int_>(key)) {
+            return getByIndex(nb::cast<std::ptrdiff_t>(key));
+        }
+        if (nb::isinstance<nb::str>(key)) {
+            return getByName(nb::cast<std::string>(key));
+        }
+        throw nb::type_error("sensor indices must be integers or names");
+    }
+
+    nb::list asDicts() const
+    {
+        nb::list rows;
+        for (auto* sensor : sensorVectorFromRunner(runner_)) {
+            rows.append(PySensor(runner_, sensor).asDict());
+        }
+        return rows;
+    }
+
+    nb::object asDataFrame() const { return dataframeFromDicts(asDicts()); }
+
+  private:
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+};
+
+class PyRecorder {
+  public:
+    PyRecorder(std::shared_ptr<griddyn::GriddynRunner> runner,
+               std::shared_ptr<griddyn::Recorder> recorder):
+        runner_(std::move(runner)), recorder_(std::move(recorder)),
+        simulation_(simulationFromRunner(runner_))
+    {
+    }
+
+    std::string name() const
+    {
+        validate();
+        return recorder_->getName();
+    }
+
+    std::size_t size() const
+    {
+        validate();
+        return recorder_->getTimeSeries().size();
+    }
+
+    nb::list asDicts() const
+    {
+        validate();
+        const auto& dataset = recorder_->getTimeSeries();
+        const auto& times = dataset.time();
+        const auto& fields = dataset.getFields();
+        std::vector<std::string> columnNames;
+        columnNames.reserve(dataset.columns());
+        std::unordered_set<std::string> usedNames{"time"};
+        for (gmlc::utilities::fsize_t column = 0; column < dataset.columns(); ++column) {
+            const std::string baseName = (column < fields.size() && !fields[column].empty()) ?
+                fields[column] :
+                "column_" + std::to_string(column);
+            std::string columnName = baseName;
+            for (std::size_t suffix = 2; !usedNames.insert(columnName).second; ++suffix) {
+                columnName = baseName + "_" + std::to_string(suffix);
+            }
+            columnNames.push_back(std::move(columnName));
+        }
+        nb::list rows;
+        for (gmlc::utilities::fsize_t rowIndex = 0; rowIndex < dataset.size(); ++rowIndex) {
+            nb::dict row;
+            row["time"] = static_cast<double>(times[rowIndex]);
+            for (gmlc::utilities::fsize_t column = 0; column < dataset.columns(); ++column) {
+                row[nb::str(columnNames[column].c_str())] = dataset.data(column, rowIndex);
+            }
+            rows.append(row);
+        }
+        return rows;
+    }
+
+    nb::object asDataFrame() const { return dataframeFromDicts(asDicts()); }
+
+  private:
+    void validate() const
+    {
+        if (!runner_ || !recorder_) {
+            throw InvalidObjectError("recorder is not available");
+        }
+        if (simulationFromRunner(runner_).get() != simulation_.get()) {
+            throw InvalidObjectError("recorder belongs to a previous simulation; reacquire it");
+        }
+    }
+
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+    std::shared_ptr<griddyn::Recorder> recorder_;
+    std::shared_ptr<griddyn::GridDynSimulation> simulation_;
+};
+
+class PyRecorderCollection {
+  public:
+    explicit PyRecorderCollection(std::shared_ptr<griddyn::GriddynRunner> runner):
+        runner_(std::move(runner))
+    {
+    }
+
+    std::size_t size() const { return recorderVectorFromRunner(runner_).size(); }
+
+    nb::list names() const
+    {
+        nb::list result;
+        for (const auto& recorder : recorderVectorFromRunner(runner_)) {
+            result.append(recorder->getName());
+        }
+        return result;
+    }
+
+    PyRecorder getByIndex(std::ptrdiff_t index) const
+    {
+        auto recorders = recorderVectorFromRunner(runner_);
+        const auto normalized = normalizeIndex(index, recorders.size(), "recorder");
+        return PyRecorder(runner_, recorders[normalized]);
+    }
+
+    PyRecorder getByName(const std::string& name) const
+    {
+        auto recorders = recorderVectorFromRunner(runner_);
+        for (const auto& recorder : recorders) {
+            if (recorder->getName() == name) {
+                return PyRecorder(runner_, recorder);
+            }
+        }
+        throw nb::key_error(("recorder not found: " + name).c_str());
+    }
+
+    PyRecorder getItem(const nb::object& key) const
+    {
+        if (nb::isinstance<nb::int_>(key)) {
+            return getByIndex(nb::cast<std::ptrdiff_t>(key));
+        }
+        if (nb::isinstance<nb::str>(key)) {
+            return getByName(nb::cast<std::string>(key));
+        }
+        throw nb::type_error("recorder indices must be integers or names");
+    }
+
+  private:
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+};
+
+class PyPowerFlowRoutine {
+  public:
+    explicit PyPowerFlowRoutine(std::shared_ptr<griddyn::GriddynRunner> runner):
+        runner_(std::move(runner))
+    {
+    }
+
+    void run()
+    {
+        auto sim = simulationFromRunner(runner_);
+        nb::gil_scoped_release release;
+        const auto result = sim->powerflow();
+        if (result < 0) {
+            throw SolveError("powerflow failed");
+        }
+    }
+
+  private:
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+};
+
+class PyTimeDomainRoutine {
+  public:
+    explicit PyTimeDomainRoutine(std::shared_ptr<griddyn::GriddynRunner> runner):
+        runner_(std::move(runner))
+    {
+    }
+
+    void initialize()
+    {
+        nb::gil_scoped_release release;
+        runner_->simInitialize();
+    }
+
+    double run()
+    {
+        nb::gil_scoped_release release;
+        return static_cast<double>(runner_->Run());
+    }
+
+    double runUntil(double time)
+    {
+        auto sim = simulationFromRunner(runner_);
+        nb::gil_scoped_release release;
+        const auto result = sim->run(griddyn::CoreTime(time));
+        if (result < 0) {
+            throw SolveError("simulation run failed");
+        }
+        return static_cast<double>(sim->getSimulationTime());
+    }
+
+    double step(double time)
+    {
+        nb::gil_scoped_release release;
+        return static_cast<double>(runner_->Step(griddyn::CoreTime(time)));
+    }
+
+  private:
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+};
+
+std::string withObjectContext(const griddyn::CoreObjectException& exc)
+{
+    auto who = exc.who();
+    if (who.empty()) {
+        return exc.what();
+    }
+    return std::string(exc.what()) + " [" + who + "]";
+}
+
+struct PyOptimizationState {
+    bool modelInitialized = false;
+    std::string optimizer;
+};
+
+class PyOptimization {
+  public:
+    PyOptimization(std::shared_ptr<griddyn::GriddynRunner> runner,
+                   std::shared_ptr<PyOptimizationState> state):
+        runner_(std::move(runner)), state_(std::move(state))
+    {
+    }
+
+    nb::dict solveOpf(std::string optimizerType = "native", bool apply = true)
+    {
+#ifdef GRIDDYN_ENABLE_OPTIMIZATION_LIBRARY
+        auto sim = simulation();
+        auto* optimization = dynamic_cast<griddyn::GridDynOptimization*>(sim.get());
+        if (optimization == nullptr) {
+            throw ExecutionError("this simulation was not created with optimization support");
+        }
+        if (optimizerType.empty()) {
+            optimizerType = "native";
+        }
+        auto candidate = griddyn::makeOptimizer(optimizerType);
+        if (!candidate) {
+            throw InvalidParameterError("unknown OPF optimizer: " + optimizerType);
+        }
+        if (dynamic_cast<griddyn::NativeOptimizer*>(candidate.get()) == nullptr) {
+            throw InvalidParameterError(
+                "OPF Python results require a native or HiGHS optimizer backend");
+        }
+        if (state_->modelInitialized && optimizerType != state_->optimizer) {
+            throw InvalidParameterError(
+                "the OPF optimizer cannot be changed after the model has been initialized");
+        }
+
+        const griddyn::OptimizationMode mode{.flowMode = griddyn::FlowModel::DC,
+                                             .linMode = griddyn::LinearityMode::QUADRATIC,
+                                             .offsetIndex = 0,
+                                             .numPeriods = 1,
+                                             .period = 1.0};
+        int solveStatus = -1;
+        int writeBackStatus = -1;
+        bool successful = false;
+        std::string status;
+        std::string message;
+        double objectiveValue = std::numeric_limits<double>::quiet_NaN();
+        double maximumConstraintViolation = std::numeric_limits<double>::quiet_NaN();
+        double maximumBoundViolation = std::numeric_limits<double>::quiet_NaN();
+        double maximumStationarity = std::numeric_limits<double>::quiet_NaN();
+        double maximumComplementarity = std::numeric_limits<double>::quiet_NaN();
+        std::size_t iterationCount = 0;
+
+        {
+            nb::gil_scoped_release release;
+            if (!state_->modelInitialized) {
+                optimization->set("optimizer", optimizerType);
+                optimization->initializeOptimizationModel(mode);
+                state_->modelInitialized = true;
+                state_->optimizer = optimizerType;
+            }
+            auto optimizer = optimization->getOptimizerInterface(mode);
+            if (!optimizer) {
+                throw ExecutionError("unable to create the OPF optimizer");
+            }
+            auto* native = dynamic_cast<griddyn::NativeOptimizer*>(optimizer.get());
+            if (native == nullptr) {
+                throw ExecutionError("the selected OPF optimizer does not expose native results");
+            }
+            if (!optimizer->isInitialized()) {
+                optimizer->initialize(0.0);
+            }
+            double returnTime = 0.0;
+            solveStatus = optimizer->solve(0.0, returnTime);
+            const auto& solveResult = native->lastSolveResult();
+            successful = (solveStatus >= 0) && solveResult.successful();
+            switch (solveResult.status) {
+                case griddyn::NativeSolveStatus::OPTIMAL:
+                    status = "optimal";
+                    break;
+                case griddyn::NativeSolveStatus::INFEASIBLE:
+                    status = "infeasible";
+                    break;
+                case griddyn::NativeSolveStatus::UNBOUNDED:
+                    status = "unbounded";
+                    break;
+                case griddyn::NativeSolveStatus::SINGULAR:
+                    status = "singular";
+                    break;
+                case griddyn::NativeSolveStatus::NUMERICAL_FAILURE:
+                    status = "numerical_failure";
+                    break;
+                case griddyn::NativeSolveStatus::UNSUPPORTED:
+                    status = "unsupported";
+                    break;
+                case griddyn::NativeSolveStatus::NONCONVEX:
+                    status = "nonconvex";
+                    break;
+                case griddyn::NativeSolveStatus::ITERATION_LIMIT:
+                    status = "iteration_limit";
+                    break;
+            }
+            message = solveResult.message;
+            objectiveValue = solveResult.objectiveValue;
+            maximumConstraintViolation = solveResult.maximumConstraintViolation;
+            maximumBoundViolation = solveResult.maximumBoundViolation;
+            maximumStationarity = solveResult.maximumStationarity;
+            maximumComplementarity = solveResult.maximumComplementarity;
+            iterationCount = solveResult.iterationCount;
+            if (successful && apply) {
+                writeBackStatus = optimizer->writeBack(returnTime);
+                if (writeBackStatus < 0) {
+                    throw SolveError("OPF succeeded but applying the dispatch failed");
+                }
+            }
+        }
+
+        nb::dict result;
+        result["success"] = successful;
+        result["status"] = status;
+        result["message"] = message;
+        result["solver"] = optimizerType;
+        result["objective_value"] = nb::none();
+        if (std::isfinite(objectiveValue)) {
+            result["objective_value"] = objectiveValue;
+        }
+        result["iterations"] = iterationCount;
+        result["maximum_constraint_violation"] = nb::none();
+        result["maximum_bound_violation"] = nb::none();
+        result["maximum_stationarity"] = nb::none();
+        result["maximum_complementarity"] = nb::none();
+        if (std::isfinite(maximumConstraintViolation)) {
+            result["maximum_constraint_violation"] = maximumConstraintViolation;
+        }
+        if (std::isfinite(maximumBoundViolation)) {
+            result["maximum_bound_violation"] = maximumBoundViolation;
+        }
+        if (std::isfinite(maximumStationarity)) {
+            result["maximum_stationarity"] = maximumStationarity;
+        }
+        if (std::isfinite(maximumComplementarity)) {
+            result["maximum_complementarity"] = maximumComplementarity;
+        }
+        result["applied"] = successful && apply && writeBackStatus >= 0;
+        return result;
+#else
+        (void)optimizerType;
+        (void)apply;
+        throw ExecutionError("this GridDyn build does not include optimization support");
+#endif
+    }
+
+    nb::object getGeneratorCostCurve(int generatorId, bool reactive = false) const
+    {
+#ifdef GRIDDYN_ENABLE_OPTIMIZATION_LIBRARY
+        auto sim = simulation();
+        auto* optimization = dynamic_cast<griddyn::GridDynOptimization*>(sim.get());
+        if (optimization == nullptr) {
+            throw ExecutionError("generator cost curves require an optimization simulation");
+        }
+        auto* generator = dynamic_cast<griddyn::Generator*>(
+            sim->findByUserID("gen", static_cast<index_t>(generatorId)));
+        if (generator == nullptr) {
+            throw InvalidObjectError("generator ID was not found: " + std::to_string(generatorId));
+        }
+        const auto* curve = optimization->matPowerCostCurve(generator, reactive);
+        if (curve == nullptr) {
+            return nb::none();
+        }
+        nb::dict result;
+        result["model"] = curve->model;
+        result["startup_cost"] = curve->startupCost;
+        result["shutdown_cost"] = curve->shutdownCost;
+        result["coefficients"] = curve->coefficients;
+        return result;
+#else
+        (void)generatorId;
+        (void)reactive;
+        throw ExecutionError("this GridDyn build does not include optimization support");
+#endif
+    }
+
+    PyOptimization& setGeneratorCostCurve(int generatorId,
+                                          int model,
+                                          const std::vector<double>& coefficients,
+                                          bool reactive = false,
+                                          double startupCost = 0.0,
+                                          double shutdownCost = 0.0)
+    {
+#ifdef GRIDDYN_ENABLE_OPTIMIZATION_LIBRARY
+        if (state_->modelInitialized) {
+            throw ExecutionError("set generator cost curves before initializing the OPF model");
+        }
+        const bool valid = (model == 2 && !coefficients.empty()) ||
+            (model == 1 && coefficients.size() >= 4 && (coefficients.size() % 2 == 0));
+        if (!valid || !std::isfinite(startupCost) || !std::isfinite(shutdownCost)) {
+            throw InvalidParameterError(
+                "cost curves require model 2 with coefficients or model 1 with at least two "
+                "(power, cost) points, and finite startup/shutdown costs");
+        }
+        for (const auto coefficient : coefficients) {
+            if (!std::isfinite(coefficient)) {
+                throw InvalidParameterError("cost curve coefficients must be finite");
+            }
+        }
+        if (model == 1) {
+            for (std::size_t index = 2; index < coefficients.size(); index += 2) {
+                if (coefficients[index] <= coefficients[index - 2]) {
+                    throw InvalidParameterError(
+                        "piecewise cost curve power breakpoints must be strictly increasing");
+                }
+            }
+        }
+        auto sim = simulation();
+        auto* optimization = dynamic_cast<griddyn::GridDynOptimization*>(sim.get());
+        if (optimization == nullptr) {
+            throw ExecutionError("generator cost curves require an optimization simulation");
+        }
+        auto* generator = dynamic_cast<griddyn::Generator*>(
+            sim->findByUserID("gen", static_cast<index_t>(generatorId)));
+        if (generator == nullptr) {
+            throw InvalidObjectError("generator ID was not found: " + std::to_string(generatorId));
+        }
+        const griddyn::MatPowerCostCurve curve{model, startupCost, shutdownCost, coefficients};
+        optimization->setGeneratorCostCurve(generator, curve, reactive);
+        return *this;
+#else
+        (void)generatorId;
+        (void)model;
+        (void)coefficients;
+        (void)reactive;
+        (void)startupCost;
+        (void)shutdownCost;
+        throw ExecutionError("this GridDyn build does not include optimization support");
+#endif
+    }
+
+  private:
+    std::shared_ptr<griddyn::GridDynSimulation> simulation() const
+    {
+        return simulationFromRunner(runner_);
+    }
+
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+    std::shared_ptr<PyOptimizationState> state_;
+};
+
+struct PyCommandLineArguments {
+    explicit PyCommandLineArguments(const std::vector<std::string>& args)
+    {
+        values.reserve(args.size() + 1);
+        values.emplace_back("griddyn");
+        values.insert(values.end(), args.begin(), args.end());
+        argv.reserve(values.size());
+        for (auto& value : values) {
+            argv.push_back(value.data());
+        }
+    }
+
+    std::vector<std::string> values;
+    std::vector<char*> argv;
+};
+
+class PySimulation {
+  public:
+    explicit PySimulation(std::string name = "", std::string type = "default")
+    {
+        if (!type.empty() && type != "default" && type != "optimization") {
+            throw InvalidParameterError("unsupported simulation type: " + type);
+        }
+        optimizationSimulation_ = type == "optimization";
+        auto simulationName = name.empty() ? std::string("gridDynSim_#") : std::move(name);
+        std::shared_ptr<griddyn::GridDynSimulation> sim;
+#ifdef GRIDDYN_ENABLE_OPTIMIZATION_LIBRARY
+        if (type == "optimization") {
+            sim = std::make_shared<griddyn::GridDynOptimization>(std::move(simulationName));
+        } else {
+            sim = std::make_shared<griddyn::GridDynSimulation>(std::move(simulationName));
+        }
+#else
+        if (optimizationSimulation_) {
+            throw InvalidParameterError(
+                "optimization simulation type is unavailable in this GridDyn build");
+        }
+        sim = std::make_shared<griddyn::GridDynSimulation>(std::move(simulationName));
+#endif
+        runner_ = std::make_shared<griddyn::GriddynRunner>(std::move(sim));
+    }
+
+    static PySimulation fromFile(const nb::object& path,
+                                 std::string format = "",
+                                 std::string name = "",
+                                 std::string type = "default")
+    {
+        PySimulation sim(std::move(name), std::move(type));
+        sim.load(path, std::move(format));
+        return sim;
+    }
+
+    PySimulation& load(const nb::object& path, std::string format = "")
+    {
+#ifdef GRIDDYN_ENABLE_OPTIMIZATION_LIBRARY
+        if (optimizationState_->modelInitialized) {
+            throw ExecutionError("load the network before initializing its OPF model");
+        }
+#endif
+        auto filePath = pathToString(path);
+        if (!std::filesystem::exists(filePath)) {
+            throw FileLoadError("file does not exist: " + filePath);
+        }
+        auto sim = simulation();
+        runnerResetAvailable_ = false;
+        nb::gil_scoped_release release;
+        griddyn::loadFile(sim.get(), filePath, nullptr, std::move(format));
+        hasLoadedSystem_ = true;
+        return *this;
+    }
+
+    void loadFromString(const std::string& args)
+    {
+        const bool canReset = !hasLoadedSystem_;
+        runnerResetAvailable_ = false;
+        nb::gil_scoped_release release;
+        const auto result = runner_->InitializeFromString(args);
+        if (result != 0) {
+            throw ExecutionError("simulation loading failed with status " + std::to_string(result));
+        }
+        runnerResetAvailable_ = canReset && result == 0;
+        hasLoadedSystem_ = hasLoadedSystem_ || result == 0;
+    }
+
+    void loadFromArgs(const std::vector<std::string>& args)
+    {
+        const bool canReset = !hasLoadedSystem_;
+        commandLineArguments_ = std::make_shared<PyCommandLineArguments>(args);
+        runnerResetAvailable_ = false;
+
+        nb::gil_scoped_release release;
+        const auto result =
+            runner_->Initialize(static_cast<int>(commandLineArguments_->argv.size()),
+                                commandLineArguments_->argv.data(),
+                                false);
+        if (result != 0) {
+            throw ExecutionError("simulation loading failed with status " + std::to_string(result));
+        }
+        runnerResetAvailable_ = canReset && result == 0;
+        hasLoadedSystem_ = hasLoadedSystem_ || result == 0;
+    }
+
+    void reset()
+    {
+        if (!runnerResetAvailable_) {
+            throw ExecutionError(
+                "reset is available only for simulations loaded from command-line arguments");
+        }
+        if (optimizationSimulation_) {
+            throw ExecutionError("reset is not available for optimization simulations");
+        }
+
+        nb::gil_scoped_release release;
+        const auto result = runner_->Reset();
+        if (result != 0) {
+            throw ExecutionError("simulation reset failed with status " + std::to_string(result));
+        }
+    }
+
+    int execute(const std::string& action)
+    {
+        auto sim = simulation();
+        nb::gil_scoped_release release;
+        return sim->execute(action);
+    }
+
+    std::vector<std::string> writeFile(const nb::object& path,
+                                       const std::optional<std::string>& type = std::nullopt) const
+    {
+        const auto filePath = pathToString(path);
+        if (filePath.empty()) {
+            throw nb::value_error("output path must not be empty");
+        }
+
+        const auto outputType = type ? normalizeOutputType(*type) : outputTypeFromPath(filePath);
+        if (outputType == "pypower") {
+            return savePowerFlowCase(filePath, griddyn::savePyPowerCase, "PYPOWER");
+        }
+        if (outputType == "matpower") {
+            return savePowerFlowCase(filePath, griddyn::saveMatPowerCase, "MATPOWER");
+        }
+        if (outputType == "csv") {
+            savePowerFlowResults(filePath, griddyn::savePowerFlowCSV);
+            return {};
+        }
+        if (outputType == "xml") {
+            savePowerFlowResults(filePath, griddyn::savePowerFlowXML);
+            return {};
+        }
+        throw std::logic_error("unhandled output type");
+    }
+
+    double time() const { return static_cast<double>(simulation()->getSimulationTime()); }
+
+    std::string name() const { return simulation()->getName(); }
+
+    void setName(const std::string& name) { simulation()->setName(name); }
+
+    double get(const std::string& field) const { return simulation()->get(field); }
+
+    PySimulation& set(const std::string& field,
+                      const nb::object& value,
+                      const std::optional<std::string>& unit)
+    {
+        setObjectParameter(simulation().get(), field, value, unit);
+        return *this;
+    }
+
+    std::string getString(const std::string& field) const { return simulation()->getString(field); }
+
+    nb::object find(const std::string& name) const
+    {
+        auto sim = simulation();
+        return modelFromObject(runner_, sim->find(name));
+    }
+
+    nb::object optimization() const
+    {
+#ifdef GRIDDYN_ENABLE_OPTIMIZATION_LIBRARY
+        auto sim = simulation();
+        if (dynamic_cast<griddyn::GridDynOptimization*>(sim.get()) == nullptr) {
+            return nb::none();
+        }
+        return nb::cast(PyOptimization(runner_, optimizationState_));
+#else
+        return nb::none();
+#endif
+    }
+
+    PyPowerFlowRoutine powerFlowRoutine() const { return PyPowerFlowRoutine(runner_); }
+
+    PyTimeDomainRoutine timeDomainRoutine() const { return PyTimeDomainRoutine(runner_); }
+
+    PyBusCollection busCollection() const { return PyBusCollection(runner_); }
+
+    PyGeneratorCollection generatorCollection() const { return PyGeneratorCollection(runner_); }
+
+    PyLoadCollection loadCollection() const { return PyLoadCollection(runner_); }
+
+    PyLinkCollection linkCollection() const { return PyLinkCollection(runner_); }
+
+    PyAreaCollection areaCollection() const { return PyAreaCollection(runner_); }
+
+    PyRelayCollection relayCollection() const { return PyRelayCollection(runner_); }
+
+    PySensorCollection sensorCollection() const { return PySensorCollection(runner_); }
+
+    PyRecorderCollection recorderCollection() const { return PyRecorderCollection(runner_); }
+
+  private:
+    using PowerFlowCaseWriter = bool (*)(const griddyn::CoreObject*,
+                                         const std::string&,
+                                         griddyn::stringVec*);
+    using PowerFlowResultWriter = void (*)(griddyn::GridDynSimulation*, const std::string&);
+
+    static std::string pathToString(const nb::object& path)
+    {
+        auto fspath = nb::module_::import_("os").attr("fspath");
+        return nb::cast<std::string>(fspath(path));
+    }
+
+    static std::optional<std::string> tryNormalizeOutputType(std::string type)
+    {
+        if (!type.empty() && type.front() == '.') {
+            type.erase(type.begin());
+        }
+        for (auto& ch : type) {
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        }
+
+        if (type == "py" || type == "pypower") {
+            return "pypower";
+        }
+        if (type == "m" || type == "matpower") {
+            return "matpower";
+        }
+        if (type == "csv") {
+            return "csv";
+        }
+        if (type == "xml") {
+            return "xml";
+        }
+        return std::nullopt;
+    }
+
+    static std::string normalizeOutputType(std::string type)
+    {
+        if (auto outputType = tryNormalizeOutputType(std::move(type))) {
+            return *outputType;
+        }
+        throw nb::value_error("type must be one of 'pypower', 'matpower', 'csv', or 'xml' "
+                              "(or a supported extension)");
+    }
+
+    static std::string outputTypeFromPath(const std::string& path)
+    {
+        auto extension = std::filesystem::path(path).extension().string();
+        if (extension.empty()) {
+            throw nb::value_error("cannot infer output type without a supported file extension; "
+                                  "pass type explicitly");
+        }
+        if (auto outputType = tryNormalizeOutputType(extension)) {
+            return *outputType;
+        } else {
+            const auto message = "cannot infer output type from extension '" + extension +
+                "'; pass type='pypower', 'matpower', 'csv', or 'xml'";
+            throw nb::value_error(message.c_str());
+        }
+    }
+
+    std::vector<std::string> savePowerFlowCase(const std::string& filePath,
+                                               PowerFlowCaseWriter writer,
+                                               const char* format) const
+    {
+        auto sim = simulation();
+        griddyn::stringVec warnings;
+        bool success = false;
+        {
+            nb::gil_scoped_release release;
+            success = writer(sim.get(), filePath, &warnings);
+        }
+        if (!success) {
+            std::string message = std::string(format) + " export failed";
+            for (const auto& warning : warnings) {
+                message += ": " + warning;
+            }
+            throw ExecutionError(message);
+        }
+        return warnings;
+    }
+
+    void savePowerFlowResults(const std::string& filePath, PowerFlowResultWriter writer) const
+    {
+        auto sim = simulation();
+        try {
+            nb::gil_scoped_release release;
+            writer(sim.get(), filePath);
+        }
+        catch (const griddyn::FileOperationError& exc) {
+            throw ExecutionError(exc.what());
+        }
+    }
+
+    std::shared_ptr<griddyn::GridDynSimulation> simulation() const
+    {
+        return simulationFromRunner(runner_);
+    }
+
+    std::shared_ptr<griddyn::GriddynRunner> runner_;
+    std::shared_ptr<PyCommandLineArguments> commandLineArguments_;
+    bool runnerResetAvailable_ = false;
+    bool hasLoadedSystem_ = false;
+    bool optimizationSimulation_ = false;
+    std::shared_ptr<PyOptimizationState> optimizationState_ =
+        std::make_shared<PyOptimizationState>();
+};
+
+void setPythonError(PyObject* type, const std::string& message)
+{
+    PyErr_SetString(type != nullptr ? type : PyExc_RuntimeError, message.c_str());
+}
+
+void setPythonError(PyObject* type, const char* message)
+{
+    PyErr_SetString(type != nullptr ? type : PyExc_RuntimeError, message);
+}
+
+void translateGridDynException(const std::exception_ptr& ptr, void* /*payload*/)
+{
+    try {
+        if (ptr) {
+            std::rethrow_exception(ptr);
+        }
+    }
+    catch (const griddyn::UnrecognizedObjectException& exc) {
+        setPythonError(pyInvalidObjectError, withObjectContext(exc));
+    }
+    catch (const griddyn::ObjectAddFailure& exc) {
+        setPythonError(pyExecutionError, withObjectContext(exc));
+    }
+    catch (const griddyn::ObjectRemoveFailure& exc) {
+        setPythonError(pyExecutionError, withObjectContext(exc));
+    }
+    catch (const griddyn::UnrecognizedParameter& exc) {
+        setPythonError(pyInvalidParameterError, exc.what());
+    }
+    catch (const griddyn::InvalidParameterValue& exc) {
+        setPythonError(pyInvalidParameterError, exc.what());
+    }
+    catch (const griddyn::FileOperationError& exc) {
+        setPythonError(pyFileLoadError, exc.what());
+    }
+    catch (const griddyn::ExecutionFailure& exc) {
+        setPythonError(pyExecutionError, withObjectContext(exc));
+    }
+    catch (const griddyn::CoreObjectException& exc) {
+        setPythonError(pyGridDynError, withObjectContext(exc));
+    }
+    catch (const std::invalid_argument& exc) {
+        setPythonError(pyInvalidParameterError, exc.what());
+    }
+}
+
+}  // namespace
+
+NB_MODULE(_core, mod)
+{
+    mod.doc() = "Python bindings for the GridDyn simulation API.";
+    mod.attr("__version__") = std::to_string(griddyn::versionMajor) + "." +
+        std::to_string(griddyn::versionMinor) + "." + std::to_string(griddyn::versionPatch);
+
+    auto gridDynError = nb::exception<GridDynError>(mod, "GridDynError");
+    auto invalidObjectError =
+        nb::exception<InvalidObjectError>(mod, "InvalidObjectError", gridDynError);
+    auto invalidParameterError =
+        nb::exception<InvalidParameterError>(mod, "InvalidParameterError", gridDynError);
+    auto fileLoadError = nb::exception<FileLoadError>(mod, "FileLoadError", gridDynError);
+    auto solveError = nb::exception<SolveError>(mod, "SolveError", gridDynError);
+    auto executionError = nb::exception<ExecutionError>(mod, "ExecutionError", gridDynError);
+
+    pyGridDynError = gridDynError.ptr();
+    pyInvalidObjectError = invalidObjectError.ptr();
+    pyInvalidParameterError = invalidParameterError.ptr();
+    pyFileLoadError = fileLoadError.ptr();
+    pySolveError = solveError.ptr();
+    pyExecutionError = executionError.ptr();
+
+    nb::register_exception_translator(&translateGridDynException);
+
+    nb::class_<PyPowerFlowRoutine>(mod, "PowerFlowRoutine")
+        .def("run", &PyPowerFlowRoutine::run)
+        .def("__repr__", [](const PyPowerFlowRoutine&) { return "<griddyn.PowerFlowRoutine>"; });
+
+    nb::class_<PyTimeDomainRoutine>(mod, "TimeDomainRoutine")
+        .def("initialize", &PyTimeDomainRoutine::initialize)
+        .def("run", &PyTimeDomainRoutine::run)
+        .def("run_until", &PyTimeDomainRoutine::runUntil, "time"_a)
+        .def("step", &PyTimeDomainRoutine::step, "time"_a)
+        .def("__repr__", [](const PyTimeDomainRoutine&) { return "<griddyn.TimeDomainRoutine>"; });
+
+    nb::class_<PyModel>(mod, "Model")
+        .def_prop_ro("name", &PyModel::name)
+        .def_prop_ro("type", &PyModel::type)
+        .def_prop_ro("uid", &PyModel::userId)
+        .def_prop_ro("enabled", &PyModel::enabled)
+        .def_prop_ro("description", &PyModel::description)
+        .def("get", &PyModel::get, "field"_a)
+        .def("set",
+             &PyModel::set,
+             "field"_a,
+             "value"_a,
+             "unit"_a = std::nullopt,
+             nb::rv_policy::reference_internal)
+        .def("get_string", &PyModel::getString, "field"_a)
+        .def("find", &PyModel::find, "name"_a)
+        .def("as_dict", &PyModel::asDict)
+        .def("__repr__", [](const PyModel& model) {
+            return "<griddyn.Model name='" + model.name() + "' type='" + model.type() + "'>";
+        });
+
+    nb::class_<PyBus>(mod, "Bus")
+        .def_prop_ro("name", &PyBus::name)
+        .def_prop_ro("type", &PyBus::type)
+        .def_prop_ro("uid", &PyBus::userId)
+        .def_prop_ro("voltage", &PyBus::voltage)
+        .def_prop_ro("angle", &PyBus::angle)
+        .def_prop_ro("frequency", &PyBus::frequency)
+        .def_prop_ro("p_gen", &PyBus::generationP)
+        .def_prop_ro("q_gen", &PyBus::generationQ)
+        .def_prop_ro("p_load", &PyBus::loadP)
+        .def_prop_ro("q_load", &PyBus::loadQ)
+        .def_prop_ro("p_link", &PyBus::linkP)
+        .def_prop_ro("q_link", &PyBus::linkQ)
+        .def("get", &PyBus::get, "field"_a)
+        .def("set",
+             &PyBus::set,
+             "field"_a,
+             "value"_a,
+             "unit"_a = std::nullopt,
+             nb::rv_policy::reference_internal)
+        .def("get_string", &PyBus::getString, "field"_a)
+        .def("find", &PyBus::find, "name"_a)
+        .def("as_dict", &PyBus::asDict)
+        .def("__repr__", [](const PyBus& bus) {
+            return "<griddyn.Bus name='" + bus.name() + "' v=" + std::to_string(bus.voltage()) +
+                " a=" + std::to_string(bus.angle()) + ">";
+        });
+
+    nb::class_<PyGenerator>(mod, "Generator")
+        .def_prop_ro("name", &PyGenerator::name)
+        .def_prop_ro("type", &PyGenerator::type)
+        .def_prop_ro("uid", &PyGenerator::userId)
+        .def_prop_ro("bus", &PyGenerator::bus)
+        .def_prop_ro("p", &PyGenerator::p)
+        .def_prop_ro("q", &PyGenerator::q)
+        .def_prop_ro("pset", &PyGenerator::pset)
+        .def_prop_ro("pmax", &PyGenerator::pmax)
+        .def_prop_ro("pmin", &PyGenerator::pmin)
+        .def_prop_ro("qmax", &PyGenerator::qmax)
+        .def_prop_ro("qmin", &PyGenerator::qmin)
+        .def("get", &PyGenerator::get, "field"_a)
+        .def("set",
+             &PyGenerator::set,
+             "field"_a,
+             "value"_a,
+             "unit"_a = std::nullopt,
+             nb::rv_policy::reference_internal)
+        .def("get_string", &PyGenerator::getString, "field"_a)
+        .def("as_dict", &PyGenerator::asDict)
+        .def("__repr__", [](const PyGenerator& gen) {
+            return "<griddyn.Generator name='" + gen.name() + "' bus='" + gen.bus() +
+                "' p=" + std::to_string(gen.p()) + " q=" + std::to_string(gen.q()) + ">";
+        });
+
+    nb::class_<PyLoad>(mod, "Load")
+        .def_prop_ro("name", &PyLoad::name)
+        .def_prop_ro("type", &PyLoad::type)
+        .def_prop_ro("uid", &PyLoad::userId)
+        .def_prop_ro("bus", &PyLoad::bus)
+        .def_prop_ro("p", &PyLoad::p)
+        .def_prop_ro("q", &PyLoad::q)
+        .def("get", &PyLoad::get, "field"_a)
+        .def("set",
+             &PyLoad::set,
+             "field"_a,
+             "value"_a,
+             "unit"_a = std::nullopt,
+             nb::rv_policy::reference_internal)
+        .def("get_string", &PyLoad::getString, "field"_a)
+        .def("as_dict", &PyLoad::asDict)
+        .def("__repr__", [](const PyLoad& load) {
+            return "<griddyn.Load name='" + load.name() + "' bus='" + load.bus() +
+                "' p=" + std::to_string(load.p()) + " q=" + std::to_string(load.q()) + ">";
+        });
+
+    nb::class_<PyLink>(mod, "Link")
+        .def_prop_ro("name", &PyLink::name)
+        .def_prop_ro("type", &PyLink::type)
+        .def_prop_ro("uid", &PyLink::userId)
+        .def_prop_ro("bus1", &PyLink::bus1)
+        .def_prop_ro("bus2", &PyLink::bus2)
+        .def_prop_ro("p1", &PyLink::p1)
+        .def_prop_ro("q1", &PyLink::q1)
+        .def_prop_ro("p2", &PyLink::p2)
+        .def_prop_ro("q2", &PyLink::q2)
+        .def_prop_ro("loss", &PyLink::loss)
+        .def_prop_ro("q_loss", &PyLink::reactiveLoss)
+        .def("get", &PyLink::get, "field"_a)
+        .def("set",
+             &PyLink::set,
+             "field"_a,
+             "value"_a,
+             "unit"_a = std::nullopt,
+             nb::rv_policy::reference_internal)
+        .def("get_string", &PyLink::getString, "field"_a)
+        .def("as_dict", &PyLink::asDict)
+        .def("__repr__", [](const PyLink& link) {
+            return "<griddyn.Link name='" + link.name() + "' bus1='" + link.bus1() + "' bus2='" +
+                link.bus2() + "'>";
+        });
+
+    nb::class_<PyArea>(mod, "Area")
+        .def_prop_ro("name", &PyArea::name)
+        .def_prop_ro("type", &PyArea::type)
+        .def_prop_ro("uid", &PyArea::userId)
+        .def_prop_ro("enabled", &PyArea::enabled)
+        .def_prop_ro("bus_count", &PyArea::busCount)
+        .def_prop_ro("link_count", &PyArea::linkCount)
+        .def_prop_ro("area_count", &PyArea::areaCount)
+        .def_prop_ro("relay_count", &PyArea::relayCount)
+        .def_prop_ro("generator_count", &PyArea::generatorCount)
+        .def_prop_ro("load_count", &PyArea::loadCount)
+        .def_prop_ro("p_gen", &PyArea::generationP)
+        .def_prop_ro("q_gen", &PyArea::generationQ)
+        .def_prop_ro("p_load", &PyArea::loadP)
+        .def_prop_ro("q_load", &PyArea::loadQ)
+        .def_prop_ro("loss", &PyArea::loss)
+        .def_prop_ro("average_frequency", &PyArea::averageFrequency)
+        .def_prop_ro("average_angle", &PyArea::averageAngle)
+        .def_prop_ro("tie_p", &PyArea::tieP)
+        .def("get", &PyArea::get, "field"_a)
+        .def("set",
+             &PyArea::set,
+             "field"_a,
+             "value"_a,
+             "unit"_a = std::nullopt,
+             nb::rv_policy::reference_internal)
+        .def("get_string", &PyArea::getString, "field"_a)
+        .def("find", &PyArea::find, "name"_a)
+        .def("as_dict", &PyArea::asDict)
+        .def("__repr__", [](const PyArea& area) {
+            return "<griddyn.Area name='" + area.name() +
+                "' buses=" + std::to_string(area.busCount()) +
+                " links=" + std::to_string(area.linkCount()) + ">";
+        });
+
+    nb::class_<PyRelay>(mod, "Relay")
+        .def_prop_ro("name", &PyRelay::name)
+        .def_prop_ro("type", &PyRelay::type)
+        .def_prop_ro("uid", &PyRelay::userId)
+        .def_prop_ro("enabled", &PyRelay::enabled)
+        .def("get", &PyRelay::get, "field"_a)
+        .def("set",
+             &PyRelay::set,
+             "field"_a,
+             "value"_a,
+             "unit"_a = std::nullopt,
+             nb::rv_policy::reference_internal)
+        .def("get_string", &PyRelay::getString, "field"_a)
+        .def("as_dict", &PyRelay::asDict)
+        .def("__repr__",
+             [](const PyRelay& relay) { return "<griddyn.Relay name='" + relay.name() + "'>"; });
+
+    nb::class_<PySensor>(mod, "Sensor")
+        .def_prop_ro("name", &PySensor::name)
+        .def_prop_ro("type", &PySensor::type)
+        .def_prop_ro("uid", &PySensor::userId)
+        .def_prop_ro("enabled", &PySensor::enabled)
+        .def("output", &PySensor::output, "index"_a = 0)
+        .def("get", &PySensor::get, "field"_a)
+        .def("set",
+             &PySensor::set,
+             "field"_a,
+             "value"_a,
+             "unit"_a = std::nullopt,
+             nb::rv_policy::reference_internal)
+        .def("get_string", &PySensor::getString, "field"_a)
+        .def("as_dict", &PySensor::asDict)
+        .def("__repr__", [](const PySensor& sensor) {
+            return "<griddyn.Sensor name='" + sensor.name() + "'>";
+        });
+
+    nb::class_<PyBusCollection>(mod, "BusCollection")
+        .def("__len__", &PyBusCollection::size)
+        .def("__getitem__", &PyBusCollection::getItem, "key"_a)
+        .def_prop_ro("names", &PyBusCollection::names)
+        .def("as_dicts", &PyBusCollection::asDicts)
+        .def("as_dataframe", &PyBusCollection::asDataFrame)
+        .def("__repr__", [](const PyBusCollection& buses) {
+            return "<griddyn.BusCollection size=" + std::to_string(buses.size()) + ">";
+        });
+
+    nb::class_<PyGeneratorCollection>(mod, "GeneratorCollection")
+        .def("__len__", &PyGeneratorCollection::size)
+        .def("__getitem__", &PyGeneratorCollection::getItem, "key"_a)
+        .def_prop_ro("names", &PyGeneratorCollection::names)
+        .def("as_dicts", &PyGeneratorCollection::asDicts)
+        .def("as_dataframe", &PyGeneratorCollection::asDataFrame)
+        .def("__repr__", [](const PyGeneratorCollection& gens) {
+            return "<griddyn.GeneratorCollection size=" + std::to_string(gens.size()) + ">";
+        });
+
+    nb::class_<PyLoadCollection>(mod, "LoadCollection")
+        .def("__len__", &PyLoadCollection::size)
+        .def("__getitem__", &PyLoadCollection::getItem, "key"_a)
+        .def_prop_ro("names", &PyLoadCollection::names)
+        .def("as_dicts", &PyLoadCollection::asDicts)
+        .def("as_dataframe", &PyLoadCollection::asDataFrame)
+        .def("__repr__", [](const PyLoadCollection& loads) {
+            return "<griddyn.LoadCollection size=" + std::to_string(loads.size()) + ">";
+        });
+
+    nb::class_<PyLinkCollection>(mod, "LinkCollection")
+        .def("__len__", &PyLinkCollection::size)
+        .def("__getitem__", &PyLinkCollection::getItem, "key"_a)
+        .def_prop_ro("names", &PyLinkCollection::names)
+        .def("as_dicts", &PyLinkCollection::asDicts)
+        .def("as_dataframe", &PyLinkCollection::asDataFrame)
+        .def("__repr__", [](const PyLinkCollection& links) {
+            return "<griddyn.LinkCollection size=" + std::to_string(links.size()) + ">";
+        });
+
+    nb::class_<PyAreaCollection>(mod, "AreaCollection")
+        .def("__len__", &PyAreaCollection::size)
+        .def("__getitem__", &PyAreaCollection::getItem, "key"_a)
+        .def_prop_ro("names", &PyAreaCollection::names)
+        .def("as_dicts", &PyAreaCollection::asDicts)
+        .def("as_dataframe", &PyAreaCollection::asDataFrame)
+        .def("__repr__", [](const PyAreaCollection& areas) {
+            return "<griddyn.AreaCollection size=" + std::to_string(areas.size()) + ">";
+        });
+
+    nb::class_<PyRelayCollection>(mod, "RelayCollection")
+        .def("__len__", &PyRelayCollection::size)
+        .def("__getitem__", &PyRelayCollection::getItem, "key"_a)
+        .def_prop_ro("names", &PyRelayCollection::names)
+        .def("as_dicts", &PyRelayCollection::asDicts)
+        .def("as_dataframe", &PyRelayCollection::asDataFrame)
+        .def("__repr__", [](const PyRelayCollection& relays) {
+            return "<griddyn.RelayCollection size=" + std::to_string(relays.size()) + ">";
+        });
+
+    nb::class_<PySensorCollection>(mod, "SensorCollection")
+        .def("__len__", &PySensorCollection::size)
+        .def("__getitem__", &PySensorCollection::getItem, "key"_a)
+        .def_prop_ro("names", &PySensorCollection::names)
+        .def("as_dicts", &PySensorCollection::asDicts)
+        .def("as_dataframe", &PySensorCollection::asDataFrame)
+        .def("__repr__", [](const PySensorCollection& sensors) {
+            return "<griddyn.SensorCollection size=" + std::to_string(sensors.size()) + ">";
+        });
+
+    nb::class_<PyRecorder>(mod, "Recorder")
+        .def_prop_ro("name", &PyRecorder::name)
+        .def("__len__", &PyRecorder::size)
+        .def("as_dicts", &PyRecorder::asDicts)
+        .def("as_dataframe", &PyRecorder::asDataFrame)
+        .def("__repr__", [](const PyRecorder& recorder) {
+            return "<griddyn.Recorder name='" + recorder.name() +
+                "' size=" + std::to_string(recorder.size()) + ">";
+        });
+
+    nb::class_<PyRecorderCollection>(mod, "RecorderCollection")
+        .def("__len__", &PyRecorderCollection::size)
+        .def("__getitem__", &PyRecorderCollection::getItem, "key"_a)
+        .def_prop_ro("names", &PyRecorderCollection::names)
+        .def("__repr__", [](const PyRecorderCollection& recorders) {
+            return "<griddyn.RecorderCollection size=" + std::to_string(recorders.size()) + ">";
+        });
+
+    nb::class_<PyOptimization>(mod, "Optimization")
+        .def("opf",
+             &PyOptimization::solveOpf,
+             "optimizer"_a = "native",
+             "apply"_a = true,
+             "Solve a DC optimal power flow and, by default, apply its generator dispatch.")
+        .def("get_generator_cost_curve",
+             &PyOptimization::getGeneratorCostCurve,
+             "generator_id"_a,
+             "reactive"_a = false)
+        .def("set_generator_cost_curve",
+             &PyOptimization::setGeneratorCostCurve,
+             "generator_id"_a,
+             "model"_a,
+             "coefficients"_a,
+             "reactive"_a = false,
+             "startup_cost"_a = 0.0,
+             "shutdown_cost"_a = 0.0,
+             nb::rv_policy::reference_internal)
+        .def("__repr__", [](const PyOptimization&) { return "<griddyn.Optimization>"; });
+
+    nb::class_<PySimulation>(mod, "Simulation")
+        .def(nb::init<std::string, std::string>(), "name"_a = "", "type"_a = "default")
+        .def_static("from_file",
+                    &PySimulation::fromFile,
+                    "path"_a,
+                    "format"_a = "",
+                    "name"_a = "",
+                    "type"_a = "default")
+        .def("load", &PySimulation::load, "path"_a, "format"_a = "")
+        .def("load_from_string", &PySimulation::loadFromString, "arguments"_a)
+        .def("load_from_args", &PySimulation::loadFromArgs, "arguments"_a)
+        .def("reset", &PySimulation::reset)
+        .def("execute",
+             &PySimulation::execute,
+             "action"_a,
+             "Execute a GridDyn action and return its status code.")
+        .def("write_file",
+             &PySimulation::writeFile,
+             "path"_a,
+             "type"_a = std::nullopt,
+             "Write an output file, selecting its type from the extension or the optional "
+             "type argument. "
+             "Supported types are PYPOWER (.py), MATPOWER (.m), power-flow results CSV (.csv), "
+             "and power-flow results XML (.xml). Return detected warnings, or an empty list.")
+        .def("get", &PySimulation::get, "field"_a)
+        .def("set",
+             &PySimulation::set,
+             "field"_a,
+             "value"_a,
+             "unit"_a = std::nullopt,
+             nb::rv_policy::reference_internal)
+        .def("get_string", &PySimulation::getString, "field"_a)
+        .def("find", &PySimulation::find, "name"_a)
+        .def_prop_rw("name", &PySimulation::name, &PySimulation::setName)
+        .def_prop_ro("time", &PySimulation::time)
+        .def_prop_ro("optimization", &PySimulation::optimization)
+        .def_prop_ro("power_flow", &PySimulation::powerFlowRoutine)
+        .def_prop_ro("time_domain", &PySimulation::timeDomainRoutine)
+        .def_prop_ro("recorders", &PySimulation::recorderCollection)
+        .def_prop_ro("buses", &PySimulation::busCollection)
+        .def_prop_ro("generators", &PySimulation::generatorCollection)
+        .def_prop_ro("loads", &PySimulation::loadCollection)
+        .def_prop_ro("links", &PySimulation::linkCollection)
+        .def_prop_ro("areas", &PySimulation::areaCollection)
+        .def_prop_ro("sensors", &PySimulation::sensorCollection)
+        .def_prop_ro("relays", &PySimulation::relayCollection)
+        .def("__repr__", [](const PySimulation& sim) {
+            return "<griddyn.Simulation name='" + sim.name() +
+                "' time=" + std::to_string(sim.time()) + ">";
+        });
+}

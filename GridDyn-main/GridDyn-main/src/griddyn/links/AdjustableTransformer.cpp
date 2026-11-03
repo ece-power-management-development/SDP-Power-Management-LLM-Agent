@@ -1,0 +1,1402 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+// headers
+#include "AdjustableTransformer.h"
+
+#include "../GridBus.h"
+#include "core/CoreExceptions.h"
+#include "core/CoreObjectTemplates.hpp"
+#include "core/ObjectInterpreter.h"
+#include "gmlc/utilities/stringOps.h"
+#include "gmlc/utilities/vectorOps.hpp"
+#include "griddyn/griddyn-config.h"
+#include "utilities/MatrixData.hpp"
+#include "utilities/MatrixDataTranslate.hpp"
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cmath>
+#include <iostream>
+#include <limits>
+#include <queue>
+#include <string>
+#include <vector>
+
+namespace griddyn::links {
+using gmlc::utilities::convertToLowerCase;
+using gmlc::utilities::signn;
+using units::convert;
+using units::puMW;
+using units::rad;
+using units::unit;
+
+template<class CountType>
+static void boundedIncrement(CountType& counter)
+{
+    if (counter < std::numeric_limits<CountType>::max()) {
+        ++counter;
+    }
+}
+
+AdjustableTransformer::AdjustableTransformer(const std::string& objName): AcLine(objName) {}
+AdjustableTransformer::AdjustableTransformer(double resistance,
+                                             double reactance,
+                                             const std::string& objName):
+    AcLine(resistance, reactance, objName)
+{
+}
+
+CoreObject* AdjustableTransformer::clone(CoreObject* obj) const
+{
+    auto* lnk = cloneBase<AdjustableTransformer, AcLine>(this, obj);
+    if (lnk == nullptr) {
+        return obj;
+    }
+    lnk->cMode = cMode;
+    lnk->stepSize = stepSize;
+    lnk->minTapAngle = minTapAngle;
+    lnk->maxTapAngle = maxTapAngle;
+    lnk->minTap = minTap;
+    lnk->maxTap = maxTap;
+
+    lnk->Vmax = Vmax;
+    lnk->Vmin = Vmin;
+    lnk->Vtarget = Vtarget;
+
+    lnk->Pmin = Pmin;
+    lnk->Pmax = Pmax;
+    lnk->Ptarget = Ptarget;
+
+    lnk->Qmax = Qmax;
+    lnk->Qmin = Qmin;
+    lnk->Qtarget = Qtarget;
+
+    lnk->direction = direction;
+    lnk->directionExplicit = directionExplicit;
+    lnk->controlBus = nullptr;
+    lnk->controlNum = controlNum;
+    lnk->dTapdt = dTapdt;
+    lnk->dTapAdt = dTapAdt;
+    return lnk;
+}
+
+static constexpr auto locNumStrings = std::array<std::string_view, 18>{"vmin",
+                                                                       "vmax",
+                                                                       "vtarget",
+                                                                       "pmin",
+                                                                       "pmax",
+                                                                       "ptarget",
+                                                                       "qmin",
+                                                                       "qmax",
+                                                                       "qtarget",
+                                                                       "direction",
+                                                                       "mintap",
+                                                                       "maxtap",
+                                                                       "mintapangle",
+                                                                       "maxtapangle",
+                                                                       "stepsize",
+                                                                       "nsteps",
+                                                                       "dtapdt",
+                                                                       "dtapadt"};
+static constexpr auto locStrStrings =
+    std::array<std::string_view, 3>{"controlmode", "changemode", "centermode"};
+static constexpr auto flagStrings = std::array<std::string_view, 1>{"no_pflow_adjustments"};
+void AdjustableTransformer::getParameterStrings(stringVec& pstr, ParamStringType pstype) const
+{
+    getParamString<AdjustableTransformer, AcLine>(
+        this, pstr, locNumStrings, locStrStrings, flagStrings, pstype);
+}
+
+// set properties
+void AdjustableTransformer::set(std::string_view param, std::string_view val)
+{
+    if ((param == "controlmode") || (param == "mode") || (param == "control_mode")) {
+        auto cmstr = convertToLowerCase(val);
+
+        if ((cmstr == "mw") || (cmstr == "power")) {
+            cMode = ControlMode::MW_CONTROL;
+            opFlags.set(ADJUSTABLE_P);
+        } else if ((cmstr == "mvar") || (cmstr == "reactive")) {
+            cMode = ControlMode::MVAR_CONTROL;
+        } else if ((cmstr == "v") || (cmstr == "voltage")) {
+            cMode = ControlMode::VOLTAGE_CONTROL;
+        } else if (cmstr == "manual") {
+            cMode = ControlMode::MANUAL_CONTROL;
+        } else {
+            throw(InvalidParameterValue(cmstr));
+        }
+    } else if ((param == "change") || (param == "change_mode") || (param == "changemode") ||
+               (param == "stepmode")) {
+        auto cmstr = convertToLowerCase(val);
+        if (cmstr == "continuous") {
+            opFlags.set(CONTINUOUS_FLAG);
+        } else if ((cmstr == "stepped") || (cmstr == "step")) {
+            opFlags.set(CONTINUOUS_FLAG, false);
+        } else {
+            throw(InvalidParameterValue(cmstr));
+        }
+    } else if ((param == "center") || (param == "center_mode") || (param == "centermode")) {
+        auto cmstr = convertToLowerCase(val);
+        if (cmstr == "bounds") {
+            opFlags.set(USE_TARGET_MODE, false);
+        } else if ((cmstr == "target") || (cmstr == "center")) {
+            opFlags.set(USE_TARGET_MODE);
+        } else {
+            throw(InvalidParameterValue(cmstr));
+        }
+    } else if ((param == "bus") || (param == "controlbus")) {
+        auto* bus = dynamic_cast<GridBus*>(locateObject(std::string{val}, getParent()));
+        if (bus != nullptr) {
+            controlBus = bus;
+        } else {
+            controlName = val;
+        }
+    } else {
+        AcLine::set(param, val);
+    }
+}
+
+void AdjustableTransformer::set(std::string_view param, double val, unit unitType)
+{
+    if (param == "tap") {
+        tap = val;
+        tap0 = val;
+    } else if (param == "tapangle") {
+        tapAngle = convert(val, unitType, rad);
+        tapAngle0 = tapAngle;
+    } else if ((param == "no_pflow_control") || (param == "no_pflow_adjustments")) {
+        opFlags.set(NO_PFLOW_ADJUSTMENTS, (val > 0));
+    } else if ((param == "cbus") || (param == "controlbus")) {
+        if (val > 2.5) {
+            auto cbnum = static_cast<int>(val);
+            if ((B1 != nullptr) && (cbnum == B1->getUserID())) {
+                controlNum = 1;
+                controlBus = B1;
+            } else if ((B2 != nullptr) && (cbnum == B2->getUserID())) {
+                controlNum = 2;
+                controlBus = B2;
+            } else {
+                controlNum = cbnum;
+                controlBus = static_cast<GridBus*>(getParent()->findByUserID("bus", cbnum));
+            }
+        } else if (val > 1.5) {
+            if (B2 == nullptr) {
+                controlNum = 2;
+            } else {
+                controlNum = 2;
+                controlBus = B2;
+            }
+            direction = 1;
+        } else {
+            if (B1 == nullptr) {
+                controlNum = 1;
+            } else {
+                controlNum = 1;
+                controlBus = B1;
+            }
+            direction = -1;
+        }
+    } else if (param == "vmin") {
+        Vmin = val;
+    } else if (param == "vmax") {
+        Vmax = val;
+    } else if (param == "vtarget") {
+        Vtarget = val;
+    } else if (param == "pmin") {
+        Pmin = convert(val, unitType, puMW, systemBasePower);
+    } else if (param == "pmax") {
+        Pmax = convert(val, unitType, puMW, systemBasePower);
+    } else if (param == "ptarget") {
+        Ptarget = convert(val, unitType, puMW, systemBasePower);
+    } else if (param == "qmin") {
+        Qmin = convert(val, unitType, puMW, systemBasePower);
+    } else if (param == "qmax") {
+        Qmax = convert(val, unitType, puMW, systemBasePower);
+    } else if (param == "qtarget") {
+        Qtarget = convert(val, unitType, puMW, systemBasePower);
+    } else if (param == "target") {
+        if (cMode == ControlMode::MVAR_CONTROL) {
+            Qtarget = convert(val, unitType, puMW, systemBasePower);
+        } else if (cMode == ControlMode::MW_CONTROL) {
+            Ptarget = convert(val, unitType, puMW, systemBasePower);
+        } else {
+            Vtarget = val;
+        }
+    } else if (param == "min") {
+        if (cMode == ControlMode::MVAR_CONTROL) {
+            Qmin = convert(val, unitType, puMW, systemBasePower);
+        } else if (cMode == ControlMode::MW_CONTROL) {
+            Pmin = convert(val, unitType, puMW, systemBasePower);
+        } else {
+            Vmin = val;
+        }
+    } else if (param == "max") {
+        if (cMode == ControlMode::MVAR_CONTROL) {
+            Qmax = convert(val, unitType, puMW, systemBasePower);
+        } else if (cMode == ControlMode::MW_CONTROL) {
+            Pmax = convert(val, unitType, puMW, systemBasePower);
+        } else {
+            Vmax = val;
+        }
+    } else if (param == "direction") {
+        if (val < 0) {
+            direction = -1;
+        } else {
+            direction = 1;
+        }
+        directionExplicit = true;
+    } else if (param == "mintap") {
+        minTap = val;
+        tap = std::max(tap, minTap);
+    } else if (param == "maxtap") {
+        maxTap = val;
+        tap = std::min(tap, maxTap);
+    } else if (param == "mintapangle") {
+        minTapAngle = convert(val, unitType, rad);
+        if (tapAngle < minTapAngle) {
+            logging::warning(this, "specified tap angle below minimum");
+            tapAngle = minTapAngle;
+        }
+    } else if (param == "fault") {
+        // not faults not allowed on adjustable transformoers change shunt conductance  or
+        // impedance to simulate a fault
+        logging::error(
+            this,
+            "faults not allowed on adjustable transformers change shunt conductance  or impedance to "
+            "simulate a fault");
+        throw(UnrecognizedParameter(param));
+    } else if (param == "maxtapangle") {
+        maxTapAngle = convert(val, unitType, rad);
+        if (tapAngle > maxTapAngle) {
+            logging::warning(this, "specified tap angle above maximum");
+            tapAngle = maxTapAngle;
+        }
+    } else if ((param == "stepsize") || (param == "tapchange")) {
+        if (cMode == ControlMode::MW_CONTROL) {
+            stepSize = convert(val, unitType, rad);
+        } else {
+            stepSize = val;
+        }
+        if (stepSize == 0)  // if stepsize==0 we are continuous otherwise leave it where it was
+        {
+            opFlags.set(CONTINUOUS_FLAG);
+        }
+    } else if (param == "nsteps") {
+        if (val <= 0.0) {
+            // PSS/E uses NTP=0 for a continuously adjustable winding.
+            opFlags.set(CONTINUOUS_FLAG);
+            opFlags.reset(NO_PFLOW_ADJUSTMENTS);
+            stepSize = 0.0;
+        } else if (val <= 1.0) {
+            // A one-position winding has no usable tap adjustment.
+            opFlags.reset(CONTINUOUS_FLAG);
+            opFlags.set(NO_PFLOW_ADJUSTMENTS);
+            stepSize = 0.0;
+        } else {
+            opFlags.reset(CONTINUOUS_FLAG);
+            opFlags.reset(NO_PFLOW_ADJUSTMENTS);
+            if (cMode == ControlMode::MW_CONTROL) {
+                stepSize = std::abs(maxTapAngle - minTapAngle) / (val - 1);
+            } else {
+                stepSize = std::abs(maxTap - minTap) / (val - 1);
+            }
+        }
+    } else if (param == "dtapdt") {
+        dTapdt = val;
+    } else if (param == "dtapadt") {
+        dTapAdt = val;
+    } else {
+        AcLine::set(param, val, unitType);
+    }
+}
+
+double AdjustableTransformer::get(std::string_view param, units::unit unitType) const
+{
+    double val = kNullVal;
+
+    if (param == "controlbus") {
+        val = controlNum;
+    } else if (param == "controlbusid") {
+        val = (controlBus != nullptr) ? static_cast<double>(controlBus->getUserID()) : kNullVal;
+    } else if (param == "vmin") {
+        val = Vmin;
+    } else if (param == "vmax") {
+        val = Vmax;
+    } else if (param == "vtarget") {
+        val = Vtarget;
+    } else if (param == "pmin") {
+        val = convert(Pmin, puMW, unitType, systemBasePower);
+    } else if (param == "pmax") {
+        val = convert(Pmax, puMW, unitType, systemBasePower);
+    } else if (param == "ptarget") {
+        val = convert(Ptarget, puMW, unitType, systemBasePower);
+    } else if (param == "qmin") {
+        val = convert(Qmin, puMW, unitType, systemBasePower);
+    } else if (param == "qmax") {
+        val = convert(Qmax, puMW, unitType, systemBasePower);
+    } else if (param == "qtarget") {
+        val = convert(Qtarget, puMW, unitType, systemBasePower);
+    } else if (param == "target") {
+        if (cMode == ControlMode::MVAR_CONTROL) {
+            val = convert(Qtarget, puMW, unitType, systemBasePower);
+        } else if (cMode == ControlMode::MW_CONTROL) {
+            val = convert(Ptarget, puMW, unitType, systemBasePower);
+        } else {
+            val = Vtarget;
+        }
+    } else if (param == "min") {
+        if (cMode == ControlMode::MVAR_CONTROL) {
+            val = convert(Qmin, puMW, unitType, systemBasePower);
+        } else if (cMode == ControlMode::MW_CONTROL) {
+            val = convert(Pmin, puMW, unitType, systemBasePower);
+        } else {
+            val = Vmin;
+        }
+    } else if (param == "max") {
+        if (cMode == ControlMode::MVAR_CONTROL) {
+            val = convert(Qmax, puMW, unitType, systemBasePower);
+        } else if (cMode == ControlMode::MW_CONTROL) {
+            val = convert(Pmax, puMW, unitType, systemBasePower);
+        } else {
+            val = Vmax;
+        }
+    } else if (param == "direction") {
+        val = direction;
+    } else if (param == "mintap") {
+        val = minTap;
+    } else if (param == "maxtap") {
+        val = maxTap;
+    } else if (param == "mintapangle") {
+        val = convert(minTapAngle, rad, unitType);
+    } else if (param == "maxtapangle") {
+        val = convert(maxTapAngle, rad, unitType);
+    } else if ((param == "stepsize") || (param == "tapchange")) {
+        val = stepSize;
+    } else if (param == "nsteps") {
+        if (opFlags[CONTINUOUS_FLAG]) {
+            val = 0.0;
+        } else if (opFlags[NO_PFLOW_ADJUSTMENTS]) {
+            val = 1.0;
+        } else if (!std::isfinite(stepSize) || (stepSize <= 0.0)) {
+            val = kNullVal;
+        } else if (cMode == ControlMode::MW_CONTROL) {
+            val = (std::abs(maxTapAngle - minTapAngle) / stepSize) + 1.0;
+        } else {
+            val = (std::abs(maxTap - minTap) / stepSize) + 1.0;
+        }
+    } else if (param == "control_mode") {
+        val = static_cast<double>(cMode);
+    } else if (param == "dtapdt") {
+        val = dTapdt;
+    } else if (param == "dtapadt") {
+        val = dTapAdt;
+    } else {
+        val = AcLine::get(param, unitType);
+    }
+    return val;
+}
+
+void AdjustableTransformer::setControlBus(GridBus* cBus)
+{
+    controlBus = cBus;
+}
+void AdjustableTransformer::setControlBus(index_t busNumber)
+{
+    if ((busNumber == 1) || (busNumber == B1->getID())) {
+        controlBus = B1;
+        controlNum = 1;
+        direction = -1;
+        directionExplicit = false;
+    } else if ((busNumber == 2) || (busNumber == B2->getID())) {
+        controlBus = B2;
+        controlNum = 2;
+        direction = 1;
+        directionExplicit = false;
+    } else {
+        auto* controlBusCandidate = getParent()->findByUserID("bus", busNumber);
+        if (controlBusCandidate != nullptr) {
+            controlBus = static_cast<GridBus*>(controlBusCandidate);
+            controlNum = 0;
+            directionExplicit = false;
+        }
+    }
+}
+
+void AdjustableTransformer::followNetwork(int network, std::queue<GridBus*>& stk)
+{
+    if (isConnected()) {
+        if (cMode == ControlMode::MW_CONTROL) {
+            if (!opFlags[NO_PFLOW_ADJUSTMENTS]) {
+                return;  // no network connection if the MW flow is controlled since the angle
+                         // relationship is
+                // variable
+            }
+        }
+        if (B1->Network != network) {
+            stk.push(B1);
+        }
+        if (B2->Network != network) {
+            stk.push(B2);
+        }
+    }
+}
+
+void AdjustableTransformer::pFlowObjectInitializeA(CoreTime time0, std::uint32_t flags)
+{
+    if (cMode != ControlMode::MANUAL_CONTROL) {
+        if (cMode == ControlMode::VOLTAGE_CONTROL) {
+            if (controlBus == nullptr) {
+                if (controlNum == 1) {
+                    controlBus = B1;
+                    direction = -1;
+                } else if (controlNum == 2) {
+                    controlBus = B2;
+                    direction = 1;
+                } else if (!controlName.empty()) {
+                    CoreObject* obj = locateObject(controlName, getParent());
+                    if (obj != nullptr) {
+                        controlBus = dynamic_cast<GridBus*>(obj);
+                    }
+                }
+            } else if (!directionExplicit) {
+                direction = (controlBus == B1) ? (-1.0) : 1.0;
+            }
+            if (controlBus == nullptr) {
+                controlBus = B2;
+                controlNum = 2;
+                direction = 1;
+            }
+        }
+        if ((opFlags[CONTINUOUS_FLAG]) && (!opFlags[NO_PFLOW_ADJUSTMENTS])) {
+            opFlags.set(HAS_PFLOW_STATES);
+            opFlags.set(HAS_POWERFLOW_ADJUSTMENTS);
+        } else {
+            opFlags[HAS_POWERFLOW_ADJUSTMENTS] = !opFlags[NO_PFLOW_ADJUSTMENTS];
+            opFlags.reset(HAS_PFLOW_STATES);
+        }
+        if (cMode == ControlMode::VOLTAGE_CONTROL) {
+            if (Vtarget < Vmin) {
+                Vtarget = (Vmin + Vmax) / 2.0;
+            }
+        } else if (cMode == ControlMode::MW_CONTROL) {
+            if (Ptarget < Pmin) {
+                Ptarget = (Pmin + Pmax) / 2.0;
+            }
+        } else if (cMode == ControlMode::MVAR_CONTROL) {
+            if (Qtarget < Qmin) {
+                Qtarget = (Qmin + Qmax) / 2.0;
+            }
+        }
+    } else {
+        opFlags.reset(HAS_PFLOW_STATES);
+        opFlags.reset(HAS_POWERFLOW_ADJUSTMENTS);
+    }
+    adjCount = 0;
+    oCount = 0;
+    tap = getValidTapRatio(tap);
+    tap0 = tap;
+    tapAngle0 = tapAngle;
+    AcLine::pFlowObjectInitializeA(time0, flags);
+}
+
+StateSizes AdjustableTransformer::localStateSizes(const SolverMode& sMode) const
+{
+    StateSizes lcStates;
+    if (isDynamic(sMode)) {
+        if (opFlags[CONTINUOUS_FLAG]) {
+            switch (cMode) {
+                case ControlMode::MANUAL_CONTROL:
+                    break;
+                case ControlMode::VOLTAGE_CONTROL:
+                case ControlMode::MVAR_CONTROL:
+                case ControlMode::MW_CONTROL:
+                    lcStates.algSize = 1;
+                    break;
+            }
+        }
+    } else {
+        if ((opFlags[CONTINUOUS_FLAG]) && (!opFlags[NO_PFLOW_ADJUSTMENTS])) {
+            lcStates.algSize = 1;
+        }
+    }
+    return lcStates;
+}
+
+count_t AdjustableTransformer::localJacobianCount(const SolverMode& sMode) const
+{
+    count_t localJacSize = 0;
+    if (isDynamic(sMode)) {
+        if (opFlags[CONTINUOUS_FLAG]) {
+            switch (cMode) {
+                case ControlMode::MANUAL_CONTROL:
+                    break;
+                case ControlMode::VOLTAGE_CONTROL:
+                    localJacSize = 2;
+                    break;
+                case ControlMode::MVAR_CONTROL:
+                case ControlMode::MW_CONTROL:
+                    localJacSize = 5;
+                    break;
+            }
+        }
+    } else {
+        if ((opFlags[CONTINUOUS_FLAG]) && (!opFlags[NO_PFLOW_ADJUSTMENTS])) {
+            switch (cMode) {
+                case ControlMode::MANUAL_CONTROL:
+                    break;
+                case ControlMode::VOLTAGE_CONTROL:
+                    localJacSize = 2;
+                    break;
+                case ControlMode::MVAR_CONTROL:
+                case ControlMode::MW_CONTROL:
+                    localJacSize = 5;
+                    break;
+            }
+        }
+    }
+    return localJacSize;
+}
+
+void AdjustableTransformer::getStateName(stringVec& stNames,
+                                         const SolverMode& sMode,
+                                         const std::string& prefix) const
+{
+    if (stateSize(sMode) > 0) {
+        const std::string prefix2 = prefix + getName() + ':';
+        if (isDynamic(sMode)) {
+        } else {
+            auto offset = offsets.getAlgOffset(sMode);
+            if (cMode == ControlMode::MW_CONTROL) {
+                stNames[offset] = prefix2 + "tapAngle";
+            } else {
+                stNames[offset] = prefix2 + "tap";
+            }
+        }
+    }
+}
+
+void AdjustableTransformer::reset(ResetLevels level)
+{
+    if (level == ResetLevels::FULL) {
+        adjCount = 0;
+        oCount = 0;
+        switch (cMode) {
+            case ControlMode::MANUAL_CONTROL:
+                break;
+            case ControlMode::VOLTAGE_CONTROL:
+                if ((Vmin <= 0.8) && (Vmax >= 1.2))  // check to make sure the actual controls
+                                                     // are not effectively disabled
+                {
+                    break;
+                }
+                [[fallthrough]];
+            case ControlMode::MVAR_CONTROL: {
+                const double midTap = (minTap + maxTap) / 2.0;
+                if (opFlags[CONTINUOUS_FLAG]) {
+                    tap = midTap;
+                    tap0 = tap;
+                } else {
+                    double ttap = tap;
+                    // making sure we stay in the bounds with the quantization from the current
+                    // point
+                    if (ttap >= midTap) {
+                        while (ttap > midTap) {
+                            ttap -= stepSize;
+                        }
+                        tap = ((midTap - ttap) < (ttap + stepSize - midTap)) ? ttap :
+                                                                               (ttap + stepSize);
+                    } else {
+                        while (ttap < midTap) {
+                            ttap += stepSize;
+                        }
+                        tap = ((ttap - midTap) < (midTap - ttap + stepSize)) ? ttap :
+                                                                               (ttap - stepSize);
+                    }
+                    tap0 = tap;
+                }
+            } break;
+            case ControlMode::MW_CONTROL: {
+                const double midTap = (minTapAngle + maxTapAngle) / 2.0;
+                if (opFlags[CONTINUOUS_FLAG]) {
+                    tapAngle = midTap;
+                    tapAngle0 = tapAngle;
+                } else {
+                    double ttap = tapAngle;
+                    // making sure we stay in the bounds with the quantization from the current
+                    // point
+                    if (ttap >= midTap) {
+                        while (ttap > midTap) {
+                            ttap -= stepSize;
+                        }
+                        tapAngle = ((midTap - ttap) < (ttap + stepSize - midTap)) ?
+                            ttap :
+                            (ttap + stepSize);
+                    } else {
+                        while (ttap < midTap) {
+                            ttap += stepSize;
+                        }
+                        tapAngle = ((ttap - midTap) < (midTap - ttap + stepSize)) ?
+                            ttap :
+                            (ttap - stepSize);
+                    }
+                    tapAngle0 = tapAngle;
+                }
+            } break;
+        }
+    }
+}
+
+ChangeCode AdjustableTransformer::powerFlowAdjust(const IOdata& /*inputs*/,
+                                                  std::uint32_t flags,
+                                                  CheckLevel /*level*/)
+{
+    if (CHECK_CONTROLFLAG(flags, DISABLE_LINK_ADJUSTMENTS) ||
+        (CHECK_CONTROLFLAG(flags, DISABLE_TAP_CHANGER_ADJUSTMENTS) && (!opFlags[CONTINUOUS_FLAG]) &&
+         (cMode != ControlMode::MANUAL_CONTROL))) {
+        return ChangeCode::NO_CHANGE;
+    }
+    auto ret = ChangeCode::NO_CHANGE;
+    if (cMode == ControlMode::MW_CONTROL) {
+        if (opFlags[CONTINUOUS_FLAG])  // if continuous mode just check the min and max angle
+        {
+            if (tapAngle < minTapAngle) {
+                tapAngle = minTapAngle;
+                opFlags.set(AT_LIMIT);
+                alert(this, JAC_COUNT_DECREASE);
+                return ChangeCode::JACOBIAN_CHANGE;
+            }
+            if (tapAngle > maxTapAngle) {
+                tapAngle = maxTapAngle;
+                opFlags.reset(HAS_PFLOW_STATES);
+                alert(this, JAC_COUNT_DECREASE);
+                return ChangeCode::JACOBIAN_CHANGE;
+            }
+        } else {
+            const double angleRangeToMax = maxTapAngle - tapAngle;
+            const double angleRangeToMin = tapAngle - minTapAngle;
+            if (linkFlows.P1 > Pmax) {
+                if (angleRangeToMax > stepSize) {
+                    tapAngle += stepSize;
+                    ret = ChangeCode::PARAMETER_CHANGE;
+                }
+                if (adjCount > 0) {
+                    if (signn(prevAdjust) != 1) {
+                        boundedIncrement(oCount);
+                        if (oCount > 5) {
+                            const double currentUpperDeviation = linkFlows.P1 - Pmax;
+                            const double previousLowerDeviation = Pmin - prevValue;
+                            if (currentUpperDeviation < previousLowerDeviation) {
+                                ret = ChangeCode::NO_CHANGE;
+                            }
+                        }
+                    }
+                }
+                if (ret > ChangeCode::NO_CHANGE) {
+                    prevAdjust = stepSize;
+                }
+            } else if (linkFlows.P1 < Pmin) {
+                if (angleRangeToMin > stepSize) {
+                    tapAngle -= stepSize;
+                    ret = ChangeCode::PARAMETER_CHANGE;
+                }
+                if (adjCount > 0) {
+                    if (signn(prevAdjust) != -1) {
+                        boundedIncrement(oCount);
+                        if (oCount > 5) {
+                            const double previousUpperDeviation = prevValue - Pmax;
+                            const double currentLowerDeviation = Pmin - linkFlows.P1;
+                            if (previousUpperDeviation > currentLowerDeviation) {
+                                ret = ChangeCode::NO_CHANGE;
+                            }
+                        }
+                    }
+                }
+                if (ret > ChangeCode::NO_CHANGE) {
+                    prevAdjust = -stepSize;
+                }
+            }
+
+            prevValue = linkFlows.P1;
+        }
+    } else if (cMode == ControlMode::VOLTAGE_CONTROL) {
+        if (opFlags[CONTINUOUS_FLAG]) {
+            // if continuous mode just check the min and max tap angle
+            if (tap < minTap) {
+                tap = minTap;
+                opFlags.set(AT_LIMIT);
+                alert(this, JAC_COUNT_DECREASE);
+                return ChangeCode::JACOBIAN_CHANGE;
+            }
+            if (tap > maxTap) {
+                tap = maxTap;
+                opFlags.set(AT_LIMIT);
+                alert(this, JAC_COUNT_DECREASE);
+                return ChangeCode::JACOBIAN_CHANGE;
+            }
+        } else {
+            ret = voltageControlAdjust();
+        }
+    } else if (cMode == ControlMode::MVAR_CONTROL) {
+        if (opFlags[CONTINUOUS_FLAG]) {
+            if (tap < minTap) {
+                tap = minTap;
+                opFlags.set(AT_LIMIT);
+                alert(this, JAC_COUNT_DECREASE);
+                return ChangeCode::JACOBIAN_CHANGE;
+            }
+            if (tap > maxTap) {
+                tap = maxTap;
+                opFlags.set(AT_LIMIT);
+                alert(this, JAC_COUNT_DECREASE);
+                return ChangeCode::JACOBIAN_CHANGE;
+            }
+        } else {
+            const double tapRangeToMax = maxTap - tap;
+            const double tapRangeToMin = tap - minTap;
+            if (linkFlows.Q2 < Qmin) {
+                if (tapRangeToMax > stepSize) {
+                    tap += stepSize;
+                    ret = ChangeCode::PARAMETER_CHANGE;
+                }
+                if (adjCount > 0) {
+                    if (signn(prevAdjust) != 1) {
+                        boundedIncrement(oCount);
+                        if (oCount > 5) {
+                            const double previousUpperDeviation = prevValue - Qmax;
+                            const double currentLowerDeviation = Qmin - linkFlows.Q2;
+                            if (previousUpperDeviation > currentLowerDeviation) {
+                                ret = ChangeCode::NO_CHANGE;
+                            }
+                        }
+                    }
+                }
+                if (ret > ChangeCode::NO_CHANGE) {
+                    prevAdjust = stepSize;
+                }
+            } else if (linkFlows.Q2 > Qmax) {
+                if (tapRangeToMin > stepSize) {
+                    tap -= stepSize;
+                    ret = ChangeCode::PARAMETER_CHANGE;
+                }
+                if (adjCount > 0) {
+                    if (signn(prevAdjust) != -1) {
+                        boundedIncrement(oCount);
+                        if (oCount > 5) {
+                            const double currentUpperDeviation = linkFlows.Q2 - Qmax;
+                            const double previousLowerDeviation = Qmin - prevValue;
+                            if (currentUpperDeviation < previousLowerDeviation) {
+                                ret = ChangeCode::NO_CHANGE;
+                            }
+                        }
+                    }
+                }
+                if (ret > ChangeCode::NO_CHANGE) {
+                    prevAdjust = -stepSize;
+                }
+            }
+
+            prevValue = linkFlows.Q2;
+        }
+    }
+    if (ret > ChangeCode::NO_CHANGE) {
+        boundedIncrement(adjCount);
+    }
+    return ret;
+}
+
+void AdjustableTransformer::guessState(CoreTime /*time*/,
+                                       double state[],
+                                       double dstateDt[],
+                                       const SolverMode& sMode)
+{
+    auto offset = offsets.getAlgOffset(sMode);
+    if ((!(isDynamic(sMode))) && (opFlags[HAS_PFLOW_STATES])) {
+        if (cMode == ControlMode::MW_CONTROL) {
+            state[offset] = tapAngle0;
+        } else {
+            state[offset] = tap0;
+        }
+    } else if ((isDynamic(sMode)) && (opFlags[HAS_DYN_STATES])) {
+        auto dOffset = offsets.getDiffOffset(sMode);
+        dstateDt[dOffset] = 0;
+        // TODO(PT): guessState dynamic states
+    }
+}
+
+void AdjustableTransformer::ioPartialDerivatives(id_type_t busId,
+                                                 const StateData& stateData,
+                                                 MatrixData<double>& matrixDataRef,
+                                                 const IOlocs& inputLocs,
+                                                 const SolverMode& sMode)
+{
+    if ((!(isDynamic(sMode))) && (opFlags[HAS_PFLOW_STATES])) {
+        auto offset = offsets.getAlgOffset(sMode);
+        if (cMode == ControlMode::MW_CONTROL) {
+            tapAngle = stateData.state[offset];
+        } else {
+            tap = stateData.state[offset];
+        }
+    } else if ((isDynamic(sMode)) && (opFlags[HAS_DYN_STATES])) {
+    }
+    AcLine::ioPartialDerivatives(busId, stateData, matrixDataRef, inputLocs, sMode);
+}
+
+void AdjustableTransformer::outputPartialDerivatives(const IOdata& inputs,
+                                                     const StateData& stateData,
+                                                     MatrixData<double>& matrixDataRef,
+                                                     const SolverMode& sMode)
+{
+    // if the terminal is not specified assume there are 4 outputs
+    if ((!(isDynamic(sMode))) && (opFlags[HAS_PFLOW_STATES])) {
+        auto offset = offsets.getAlgOffset(sMode);
+        MatrixDataTranslate<2> mtrans(matrixDataRef);
+        mtrans.setTranslation(0, 2);
+        mtrans.setTranslation(1, 3);
+        if (cMode == ControlMode::MW_CONTROL) {
+            tapAngle = stateData.state[offset];
+            tapAnglePartial(1, stateData, matrixDataRef, sMode);
+            tapAnglePartial(2, stateData, mtrans, sMode);
+        } else {
+            tap = stateData.state[offset];
+            tapPartial(1, stateData, matrixDataRef, sMode);
+            tapPartial(2, stateData, mtrans, sMode);
+        }
+    } else if ((isDynamic(sMode)) && (opFlags[HAS_DYN_STATES])) {
+    }
+    AcLine::outputPartialDerivatives(inputs, stateData, matrixDataRef, sMode);
+}
+
+void AdjustableTransformer::outputPartialDerivatives(id_type_t busId,
+                                                     const StateData& stateData,
+                                                     MatrixData<double>& matrixDataRef,
+                                                     const SolverMode& sMode)
+{
+    if ((!(isDynamic(sMode))) && (opFlags[HAS_PFLOW_STATES])) {
+        auto offset = offsets.getAlgOffset(sMode);
+        if (cMode == ControlMode::MW_CONTROL) {
+            tapAngle = stateData.state[offset];
+            tapAnglePartial(static_cast<index_t>(busId), stateData, matrixDataRef, sMode);
+        } else {
+            tap = stateData.state[offset];
+            tapPartial(static_cast<index_t>(busId), stateData, matrixDataRef, sMode);
+        }
+    } else if ((isDynamic(sMode)) && (opFlags[HAS_DYN_STATES])) {
+    }
+    AcLine::outputPartialDerivatives(busId, stateData, matrixDataRef, sMode);
+}
+
+void AdjustableTransformer::jacobianElements(const IOdata& /*inputs*/,
+                                             const StateData& stateData,
+                                             MatrixData<double>& matrixDataRef,
+                                             const IOlocs& /*inputLocs*/,
+                                             const SolverMode& sMode)
+{
+    if ((!(isDynamic(sMode))) && (opFlags[HAS_PFLOW_STATES])) {
+        auto offset = offsets.getAlgOffset(sMode);
+        if (cMode == ControlMode::MW_CONTROL) {
+            tapAngle = stateData.state[offset];
+        } else {
+            tap = stateData.state[offset];
+        }
+        if (opFlags[AT_LIMIT]) {
+            matrixDataRef.assign(offset, offset, 1);
+        } else {
+            if (cMode == ControlMode::MW_CONTROL) {
+                MWJac(stateData, matrixDataRef, sMode);
+            } else if (cMode == ControlMode::VOLTAGE_CONTROL) {
+                matrixDataRef.assignCheckCol(offset,
+                                             controlBus->getOutputLoc(sMode, VOLTAGE_IN_LOCATION),
+                                             1);
+            } else if (cMode == ControlMode::MVAR_CONTROL) {
+                MVarJac(stateData, matrixDataRef, sMode);
+            }
+        }
+    } else if ((isDynamic(sMode)) && (opFlags[HAS_DYN_STATES])) {
+    }
+}
+
+void AdjustableTransformer::residual(const IOdata& /*inputs*/,
+                                     const StateData& stateData,
+                                     double resid[],
+                                     const SolverMode& sMode)
+{
+    double voltage1;
+
+    auto offset = offsets.getAlgOffset(sMode);
+    if ((!(isDynamic(sMode))) && (opFlags[HAS_PFLOW_STATES])) {
+        switch (cMode) {
+            case ControlMode::VOLTAGE_CONTROL:
+                if (opFlags[AT_LIMIT]) {
+                    if (tap > tap0) {
+                        resid[offset] = stateData.state[offset] - maxTap;
+                    } else {
+                        resid[offset] = stateData.state[offset] - minTap;
+                    }
+                } else {
+                    voltage1 = controlBus->getVoltage(stateData, sMode);
+                    resid[offset] = voltage1 - Vtarget;
+                }
+                break;
+            case ControlMode::MW_CONTROL:
+                if (opFlags[AT_LIMIT]) {
+                    if (tapAngle > tapAngle0) {
+                        resid[offset] = stateData.state[offset] - maxTapAngle;
+                    } else {
+                        resid[offset] = stateData.state[offset] - minTapAngle;
+                    }
+                } else {
+                    tapAngle = stateData.state[offset];
+                    updateLocalCache(noInputs, stateData, sMode);
+                    resid[offset] = linkFlows.P1 - Ptarget;
+                }
+                break;
+            case ControlMode::MVAR_CONTROL:
+                tap = stateData.state[offset];
+                if (opFlags[AT_LIMIT]) {
+                    if (tap > tap0) {
+                        resid[offset] = stateData.state[offset] - maxTap;
+                    } else {
+                        resid[offset] = stateData.state[offset] - minTap;
+                    }
+                } else {
+                    updateLocalCache(noInputs, stateData, sMode);
+                    resid[offset] = linkFlows.Q2 - Qtarget;
+                }
+
+                break;
+            default:
+                assert(false);
+        }
+    } else if (isDynamic(sMode) && (opFlags[HAS_DYN_STATES])) {
+    }
+}
+
+void AdjustableTransformer::setState(CoreTime time,
+                                     const double state[],
+                                     const double dstateDt[],
+                                     const SolverMode& sMode)
+{
+    auto offset = offsets.getAlgOffset(sMode);
+    if ((!(isDynamic(sMode))) && (opFlags[HAS_PFLOW_STATES])) {
+        if (cMode == ControlMode::MW_CONTROL) {
+            tapAngle = state[offset];
+            if (tapAngle < maxTapAngle && tapAngle > minTapAngle) {
+                tapAngle0 = tapAngle;
+            }
+        } else {
+            tap = state[offset];
+            if (tap < maxTap && tap > minTap) {
+                tap0 = tap;
+            }
+        }
+    } else if ((isDynamic(sMode)) && (opFlags[HAS_DYN_STATES])) {
+    }
+    AcLine::setState(time, state, dstateDt, sMode);
+}
+
+void AdjustableTransformer::dynObjectInitializeA(CoreTime time0, std::uint32_t flags)
+{
+    AcLine::dynObjectInitializeA(time0, flags);
+}
+
+void AdjustableTransformer::updateLocalCache()
+{
+    AcLine::updateLocalCache();
+}
+void AdjustableTransformer::updateLocalCache(const IOdata& inputs,
+                                             const StateData& stateData,
+                                             const SolverMode& sMode)
+{
+    if ((!(isDynamic(sMode))) && (opFlags[HAS_PFLOW_STATES])) {
+        auto offset = offsets.getAlgOffset(sMode);
+        if (cMode == ControlMode::MW_CONTROL) {
+            tapAngle = stateData.state[offset];
+        } else {
+            tap = stateData.state[offset];
+        }
+        AcLine::updateLocalCache(inputs, stateData, sMode);
+    } else if ((isDynamic(sMode)) && (opFlags[HAS_DYN_STATES])) {
+    } else {
+        AcLine::updateLocalCache(inputs, stateData, sMode);
+    }
+}
+
+count_t AdjustableTransformer::outputDependencyCount(index_t /*num*/, const SolverMode& sMode) const
+{
+    if ((!(isDynamic(sMode))) && (opFlags[HAS_PFLOW_STATES])) {
+        return 3;
+    }
+    return 2;
+}
+
+void AdjustableTransformer::rootTest(const IOdata& /*inputs*/,
+                                     const StateData& stateData,
+                                     double roots[],
+                                     const SolverMode& sMode)
+{
+    double controlVoltage;
+
+    auto offset = offsets.getAlgOffset(sMode);
+    auto rootOffset = offsets.getRootOffset(sMode);
+    switch (cMode) {
+        case ControlMode::VOLTAGE_CONTROL:
+            controlVoltage = controlBus->getVoltage(stateData, sMode);
+            roots[rootOffset] = std::min(Vmax - controlVoltage, controlVoltage - Vmin);
+            break;
+        case ControlMode::MW_CONTROL:
+            tap = stateData.state[offset];
+            updateLocalCache(noInputs, stateData, sMode);
+            roots[rootOffset] = std::min(Pmax - linkFlows.P1, linkFlows.P1 - Pmin);
+            break;
+        case ControlMode::MVAR_CONTROL:
+            tap = stateData.state[offset];
+            updateLocalCache(noInputs, stateData, sMode);
+            roots[rootOffset] = std::min(Qmax - linkFlows.Q2, linkFlows.Q2 - Qmin);
+            break;
+        default:
+            assert(false);
+    }
+}
+
+void AdjustableTransformer::rootTrigger(CoreTime /*time*/,
+                                        const IOdata& /*inputs*/,
+                                        const std::vector<int>& /*rootMask*/,
+                                        const SolverMode& /*sMode*/)
+{
+    [[maybe_unused]] double voltage1;
+    switch (cMode) {
+        case ControlMode::VOLTAGE_CONTROL:
+            //       v1 = controlBus->getVoltage();
+            //            if (v1 > Vmax) {
+            //          } else if (v1 < Vmin) {
+            //         }
+            break;
+        case ControlMode::MW_CONTROL:  // NOLINT
+
+            updateLocalCache();
+            //        if (linkFlows.P1 > Pmax) {
+            //       } else if (linkFlows.P1 < Pmin) {
+            //       }
+            break;
+        case ControlMode::MVAR_CONTROL:
+            updateLocalCache();
+            //       if (linkFlows.Q2 > Qmax) {
+            //       } else if (linkFlows.Q2 < Qmin) {
+            //       }
+            break;
+        default:
+            assert(false);
+    }
+}
+
+void AdjustableTransformer::tapAnglePartial(index_t busId,
+                                            const StateData& /*sD*/,
+                                            MatrixData<double>& matrixDataRef,
+                                            const SolverMode& sMode)
+{
+    if (!(isEnabled())) {
+        return;
+    }
+
+    const double voltage1 = linkInfo.v1;
+    const double voltage2 = linkInfo.v2;
+
+    const double cosTheta1 = linkComp.cosTheta1;
+    const double sinTheta1 = linkComp.sinTheta1;
+    const double cosTheta2 = linkComp.cosTheta2;
+    const double sinTheta2 = linkComp.sinTheta2;
+
+    const double tvg = g / tap * voltage1 * voltage2;
+    const double tvb = b / tap * voltage1 * voltage2;
+
+    auto offset = offsets.getAlgOffset(sMode);
+
+    if ((busId == 2) || (busId == B2->getID())) {
+        // dP2/dta
+        double temp = (tvg * sinTheta2) - (tvb * cosTheta2);
+        matrixDataRef.assign(POUT_LOCATION, offset, temp);
+        // dQ2/dta
+        temp = (-tvg * cosTheta2) - (tvb * sinTheta2);
+        matrixDataRef.assign(QOUT_LOCATION, offset, temp);
+    } else {
+        // dP1/dta
+        double temp = (-tvg * sinTheta1) + (tvb * cosTheta1);
+        matrixDataRef.assign(POUT_LOCATION, offset, temp);
+        // dQ1/dta
+        temp = (tvg * cosTheta1) - (tvb * sinTheta1);
+        matrixDataRef.assign(QOUT_LOCATION, offset, temp);
+    }
+}
+
+void AdjustableTransformer::tapPartial(index_t busId,
+                                       const StateData& /*sD*/,
+                                       MatrixData<double>& matrixDataRef,
+                                       const SolverMode& sMode)
+{
+    if (!(isEnabled())) {
+        return;
+    }
+
+    const double voltage1 = linkInfo.v1;
+    const double voltage2 = linkInfo.v2;
+
+    const double cosTheta1 = linkComp.cosTheta1;
+    const double sinTheta1 = linkComp.sinTheta1;
+    const double cosTheta2 = linkComp.cosTheta2;
+    const double sinTheta2 = linkComp.sinTheta2;
+
+    const double tvg = g / tap * voltage1 * voltage2;
+    const double tvb = b / tap * voltage1 * voltage2;
+
+    auto offset = offsets.getAlgOffset(sMode);
+
+    double realPower1 = ((g + shuntG1()) / (tap * tap)) * voltage1 * voltage1;
+    realPower1 -= tvg * cosTheta1;
+    realPower1 -= tvb * sinTheta1;
+
+    double reactivePower1 = (-(b + shuntB1()) / (tap * tap)) * voltage1 * voltage1;
+    reactivePower1 -= tvg * sinTheta1;
+    reactivePower1 += tvb * cosTheta1;
+
+    if ((busId == 2) || (busId == B2->getID())) {
+        // dP2/dtap
+        double temp = ((tvg / tap) * cosTheta2) + ((tvb / tap) * sinTheta2);
+        matrixDataRef.assign(POUT_LOCATION, offset, temp);
+        // dQ2/dtap
+        temp = ((-tvg / tap) * sinTheta2) - ((tvb / tap) * cosTheta2);
+        matrixDataRef.assign(QOUT_LOCATION, offset, temp);
+    } else {
+        // dP1/dtap
+        double temp =
+            (-realPower1 / tap) - (((g + shuntG1()) / (tap * tap * tap)) * voltage1 * voltage1);
+        matrixDataRef.assign(POUT_LOCATION, offset, temp);
+        // dQ1/dtap
+        temp =
+            (-reactivePower1 / tap) + (((b + shuntB1()) / (tap * tap * tap)) * voltage1 * voltage1);
+        matrixDataRef.assign(QOUT_LOCATION, offset, temp);
+    }
+}
+
+void AdjustableTransformer::MWJac(const StateData& /*sD*/,
+                                  MatrixData<double>& matrixDataRef,
+                                  const SolverMode& sMode)
+{
+    if (!(isEnabled())) {
+        return;
+    }
+
+    const double voltage1 = linkInfo.v1;
+    const double voltage2 = linkInfo.v2;
+
+    const double cosTheta1 = linkComp.cosTheta1;
+    const double sinTheta1 = linkComp.sinTheta1;
+
+    const double tvg = g / tap * voltage1 * voltage2;
+    const double tvb = b / tap * voltage1 * voltage2;
+
+    auto offset = offsets.getAlgOffset(sMode);
+    const int bus1AngleOffset = B1->getOutputLoc(sMode, ANGLE_IN_LOCATION);
+    const int bus2AngleOffset = B2->getOutputLoc(sMode, ANGLE_IN_LOCATION);
+    const int bus1VoltageOffset = B1->getOutputLoc(sMode, VOLTAGE_IN_LOCATION);
+    const int bus2VoltageOffset = B2->getOutputLoc(sMode, VOLTAGE_IN_LOCATION);
+
+    // compute the DP1/dta
+    double temp = (-tvg * sinTheta1) + (tvb * cosTheta1);
+    matrixDataRef.assign(offset, offset, temp);
+
+    temp = (tvg * sinTheta1) - (tvb * cosTheta1);
+    matrixDataRef.assignCheckCol(offset, bus1AngleOffset, temp);
+
+    // dP1/dV1
+    temp = ((-voltage2 * ((g * cosTheta1) + (b * sinTheta1))) / tap) +
+        ((2 * (g + shuntG1()) / (tap * tap)) * voltage1);
+    matrixDataRef.assignCheckCol(offset, bus1VoltageOffset, temp);
+
+    // dP1/dA2
+    temp = (-tvg * sinTheta1) - (tvb * cosTheta1);
+    matrixDataRef.assignCheckCol(offset, bus2AngleOffset, temp);
+
+    // dP1/dV2
+    temp = (-voltage1 * ((g * cosTheta1) + (b * sinTheta1))) / tap;
+    matrixDataRef.assignCheckCol(offset, bus2VoltageOffset, temp);
+}
+
+void AdjustableTransformer::MVarJac(const StateData& /*sD*/,
+                                    MatrixData<double>& matrixDataRef,
+                                    const SolverMode& sMode)
+{
+    if (!(isEnabled())) {
+        return;
+    }
+
+    const double voltage1 = linkInfo.v1;
+    const double voltage2 = linkInfo.v2;
+
+    // cosTheta1 = linkComp.cosTheta1;
+    // sinTheta1 = linkComp.sinTheta1;
+    const auto cosTheta2 = linkComp.cosTheta2;
+    const auto sinTheta2 = linkComp.sinTheta2;
+
+    const double tvg = g / tap * voltage1 * voltage2;
+    const double tvb = b / tap * voltage1 * voltage2;
+
+    auto offset = offsets.getAlgOffset(sMode);
+    const int bus1AngleOffset = B1->getOutputLoc(sMode, ANGLE_IN_LOCATION);
+    const int bus2AngleOffset = B2->getOutputLoc(sMode, ANGLE_IN_LOCATION);
+    const int bus1VoltageOffset = B1->getOutputLoc(sMode, VOLTAGE_IN_LOCATION);
+    const int bus2VoltageOffset = B2->getOutputLoc(sMode, VOLTAGE_IN_LOCATION);
+    /*
+double P1 = (g + shuntG1()) / (tap * tap) * v1 * v1;
+P1 -= tvg * cosTheta1;
+P1 -= tvb * sinTheta1;
+
+double Q1 = -(b + shuntB1()) / (tap * tap) * v1 * v1;
+Q1 -= tvg * sinTheta1;
+Q1 += tvb * cosTheta1;
+*/
+    // compute the DQ2/dta
+    double temp = ((-tvg / tap) * sinTheta2) - ((tvb / tap) * cosTheta2);
+    matrixDataRef.assign(offset, offset, temp);
+
+    // dQ2/dA1
+    temp = (tvg * cosTheta2) + (tvb * sinTheta2);
+    matrixDataRef.assignCheckCol(offset, bus1AngleOffset, temp);
+
+    // dQ2/dV1
+    temp = (-voltage2 * ((g * sinTheta2) - (b * cosTheta2))) / tap;
+    matrixDataRef.assignCheckCol(offset, bus1VoltageOffset, temp);
+
+    // dQ2/dA2
+    temp = (-tvg * cosTheta2) - (tvb * sinTheta2);
+    matrixDataRef.assignCheckCol(offset, bus2AngleOffset, temp);
+
+    // dQ2/dV2
+    temp = (-2.0 * (b + shuntB2()) * voltage2) - ((g * voltage1 / tap) * sinTheta2) +
+        ((b * voltage1 / tap) * cosTheta2);
+    matrixDataRef.assignCheckCol(offset, bus2VoltageOffset, temp);
+}
+
+ChangeCode AdjustableTransformer::voltageControlAdjust()
+{
+    auto ret = ChangeCode::NO_CHANGE;
+    const double tapStep = direction * stepSize;
+    const double reverseTapStep = -tapStep;
+
+    // check the voltage to make it is within the appropriate band
+    const double voltage = controlBus->getVoltage();
+    if (!(opFlags[USE_TARGET_MODE])) {
+        if (voltage > Vmax) {
+            tap += tapStep;
+            ret = ChangeCode::PARAMETER_CHANGE;
+            if (adjCount > 0) {
+                if (signn(prevAdjust) != signn(tapStep)) {
+                    boundedIncrement(oCount);
+                    if (oCount > 5) {
+                        ret = ChangeCode::NO_CHANGE;
+                    }
+                }
+            }
+            if (ret > ChangeCode::NO_CHANGE) {
+                prevAdjust = tapStep;
+            }
+        } else if (voltage < Vmin) {
+            tap += reverseTapStep;
+            ret = ChangeCode::PARAMETER_CHANGE;
+            if (adjCount > 0) {
+                if (signn(prevAdjust) != signn(reverseTapStep)) {
+                    boundedIncrement(oCount);
+                    // we are giving the Vmin priority here so it will always err on protecting
+                    // the low voltage side if it can. if it is oscillating and goes over Vmax
+                    // it will end in a state that leaves it there.
+                }
+            }
+            if (ret > ChangeCode::NO_CHANGE) {
+                prevAdjust = reverseTapStep;
+            }
+        }
+        // check the taps to make sure they are within the appropriate range
+        if (tap > maxTap) {
+            tap -= prevAdjust;
+            prevAdjust = 0;
+            ret = ChangeCode::NO_CHANGE;
+        }
+        if (tap < minTap) {
+            tap -= prevAdjust;
+            prevAdjust = 0;
+            ret = ChangeCode::NO_CHANGE;
+        }
+        prevValue = voltage;
+    } else {
+        double shift = 0;
+        const double dev = voltage - Vtarget;
+        if (std::abs(dev) < stepSize / 2.0) {
+            ret = ChangeCode::NO_CHANGE;
+        } else {
+            shift = direction * dev;
+            if (shift > 0) {
+                shift = stepSize * round(shift / stepSize);
+            } else {
+                shift = -stepSize * round(-shift / stepSize);
+            }
+            const double maxShift = maxTap - tap;
+            const double minShift = minTap - tap;
+            shift = std::min(shift, maxShift);
+            shift = std::max(shift, minShift);
+            tap += shift;
+            if (std::abs(shift) < stepSize) {
+                ret = ChangeCode::NO_CHANGE;
+            } else {
+                ret = ChangeCode::PARAMETER_CHANGE;
+            }
+            if (adjCount > 0) {
+                const double netAdjust = prevAdjust + shift;
+                if (std::abs(netAdjust) < stepSize / 2.0) {
+                    boundedIncrement(oCount);
+                    if (oCount > 3) {
+                        if (voltage > prevValue) {
+                            ret = ChangeCode::NO_CHANGE;
+                            tap -= shift;
+                        }
+                    }
+                }
+            }
+            if (ret > ChangeCode::NO_CHANGE) {
+                prevAdjust = shift;
+                prevValue = voltage;
+            }
+        }
+    }
+    return ret;
+}
+
+ChangeCode AdjustableTransformer::MWControlAdjust()  // NOLINT
+{
+    auto ret = ChangeCode::NO_CHANGE;
+    return ret;
+}
+
+ChangeCode AdjustableTransformer::MVarControlAdjust()  // NOLINT
+{
+    auto ret = ChangeCode::NO_CHANGE;
+    return ret;
+}
+
+double AdjustableTransformer::getValidTapRatio(double testTapValue) const
+{
+    const auto boundedTap = std::clamp(testTapValue, minTap, maxTap);
+    if (!std::isfinite(stepSize) || (stepSize <= 0.0)) {
+        return boundedTap;
+    }
+    if (testTapValue >= maxTap) {
+        return maxTap;
+    }
+    if (testTapValue <= minTap) {
+        return minTap;
+    }
+    return (std::round((testTapValue - minTap) / stepSize) * stepSize) + minTap;
+}
+}  // namespace griddyn::links

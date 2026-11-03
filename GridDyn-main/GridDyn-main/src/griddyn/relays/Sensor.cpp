@@ -1,0 +1,977 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "Sensor.h"
+
+#include "../Block.h"
+#include "../Link.h"  //some special features for links
+#include "../comms/Communicator.h"
+#include "../comms/ControlMessage.h"
+#include "../events/Event.h"
+#include "../measurement/Condition.h"
+#include "../measurement/GrabberSet.h"
+#include "core/CoreExceptions.h"
+#include "core/CoreObjectTemplates.hpp"
+#include "gmlc/utilities/TimeSeries.hpp"
+#include "gmlc/utilities/stringConversion.h"
+#include "gmlc/utilities/stringOps.h"
+#include "utilities/MatrixDataSparse.hpp"
+#include "utilities/MatrixDataTranslate.hpp"
+#include <algorithm>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace griddyn {
+using gmlc::utilities::ensureSizeAtLeast;
+
+Sensor::Sensor(const std::string& objName): Relay(objName)
+{
+    opFlags.set(CONTINUOUS_FLAG);
+    opFlags.set(LATE_B_INITIALIZE);
+}
+
+CoreObject* Sensor::clone(CoreObject* obj) const
+{
+    auto* nobj = cloneBase<Sensor, Relay>(this, obj);
+    if (nobj == nullptr) {
+        return obj;
+    }
+
+    nobj->m_terminal = m_terminal;
+    nobj->inputStrings = inputStrings;
+    nobj->blockInputs = blockInputs;
+    nobj->outputs = outputs;
+    nobj->outputStrings = outputStrings;
+    nobj->outputMode = outputMode;
+    nobj->processStatus = processStatus;
+    // clone the dataSources
+
+    for (index_t kk = 0; std::cmp_less(kk, dataSources.size()); ++kk) {
+        if (dataSources[kk]) {
+            if (std::cmp_greater(nobj->dataSources.size(), static_cast<size_t>(kk))) {
+                if (nobj->dataSources[kk]) {
+                    dataSources[kk]->cloneTo(nobj->dataSources[kk].get());
+                } else {
+                    nobj->dataSources[kk] = dataSources[kk]->clone();
+                }
+            } else {
+                nobj->dataSources.push_back(dataSources[kk]->clone());
+            }
+        } else {
+            if (std::cmp_less_equal(nobj->dataSources.size(), static_cast<size_t>(kk))) {
+                nobj->dataSources.push_back(nullptr);
+            }
+        }
+    }
+
+    for (index_t kk = 0; std::cmp_less(kk, outGrabbers.size()); ++kk) {
+        if (outGrabbers[kk]) {
+            if (std::cmp_greater(nobj->outGrabbers.size(), static_cast<size_t>(kk))) {
+                if (nobj->outGrabbers[kk]) {
+                    outGrabbers[kk]->cloneTo(nobj->outGrabbers[kk].get());
+                } else {
+                    nobj->outGrabbers[kk] = outGrabbers[kk]->clone();
+                }
+            } else {
+                nobj->outGrabbers.push_back(outGrabbers[kk]->clone());
+            }
+            nobj->outGrabbers[kk]->updateObject(nobj);
+        } else {
+            if (std::cmp_less_equal(nobj->outGrabbers.size(), static_cast<size_t>(kk))) {
+                nobj->outGrabbers.push_back(nullptr);
+            }
+        }
+    }
+
+    return nobj;
+}
+
+void Sensor::add(CoreObject* obj)
+{
+    if (dynamic_cast<GridBlock*>(obj) != nullptr) {
+        add(static_cast<GridBlock*>(obj));
+    } else {
+        Relay::add(obj);
+    }
+}
+
+void Sensor::add(GridBlock* blk)
+{
+    if (blk->locIndex != kNullLocation) {
+        ensureSizeAtLeast(filterBlocks,
+                          static_cast<size_t>(blk->locIndex) + 1,
+                          static_cast<GridBlock*>(nullptr));
+        filterBlocks[blk->locIndex] = blk;
+    } else {
+        filterBlocks.push_back(blk);
+        blk->locIndex = static_cast<index_t>(filterBlocks.size() - 1);
+    }
+    ensureSizeAtLeast(blockInputs, filterBlocks.size(), -1);
+    addSubObject(blk);
+    blk->parentSetFlag(SEPARATE_PROCESSING, true, this);
+}
+
+void Sensor::add(std::shared_ptr<GrabberSet> grabberSet)
+{
+    if (grabberSet) {
+        auto cnum = inputStrings.size();
+        dataSources.resize(cnum + 1);
+        inputStrings.emplace_back("#");
+
+        if (!(grabberSet->stateCapable())) {
+            opFlags.set(CONTINUOUS_FLAG, false);
+        }
+        dataSources[cnum] = std::move(grabberSet);
+    }
+}
+
+void Sensor::add(std::shared_ptr<GridGrabber> gridGrabber)
+{
+    add(std::make_shared<GrabberSet>(std::move(gridGrabber), nullptr));
+}
+
+std::shared_ptr<GrabberSet> Sensor::getGrabberSet(index_t grabberNum)
+{
+    if (std::cmp_less(grabberNum, dataSources.size())) {
+        return dataSources[grabberNum];
+    }
+    throw(std::out_of_range("invalid index"));
+}
+
+void Sensor::setFlag(std::string_view flag, bool val)
+{
+    if ((flag == "direct_io") || (flag == "direct")) {
+        opFlags.set(DIRECT_IO, val);
+    } else if (flag == "sampled") {
+        opFlags[SAMPLED_ONLY] = val;
+        opFlags[CONTINUOUS_FLAG] = !val;
+    } else if (flag == "continuous") {
+        opFlags[SAMPLED_ONLY] = !val;
+        opFlags[CONTINUOUS_FLAG] = val;
+    } else {
+        Relay::setFlag(flag, val);
+    }
+}
+
+void Sensor::set(std::string_view param, std::string_view val)
+{
+    std::string iparam;
+    int num = gmlc::utilities::stringOps::trailingStringInt(param, iparam);
+    if (iparam == "input") {
+        auto splitValues = gmlc::utilities::stringOps::splitline(val);
+        gmlc::utilities::stringOps::trim(splitValues);
+        if (num >= 0) {
+            if (std::cmp_greater_equal(num + splitValues.size() - 1, inputStrings.size())) {
+                inputStrings.resize(num + splitValues.size());
+            }
+            for (auto& istr : splitValues) {
+                inputStrings[num] = istr + '_';
+                ++num;
+            }
+        } else {
+            inputStrings.reserve(inputStrings.size() + splitValues.size());
+            for (auto& istr : splitValues) {
+                inputStrings.push_back(istr);
+            }
+        }
+        if (opFlags[DIRECT_IO]) {
+            if (num >= 0) {
+                ensureSizeAtLeast(outputStrings, num + splitValues.size());
+
+                for (auto& istr : splitValues) {
+                    outputStrings[num] = {gmlc::utilities::stringOps::getTailString(istr, ':')};
+                    ++num;
+                }
+            } else {
+                outputStrings.reserve(outputStrings.size() + splitValues.size());
+                for (auto& istr : splitValues) {
+                    outputStrings.push_back({gmlc::utilities::stringOps::getTailString(istr, ':')});
+                }
+            }
+            m_outputSize = static_cast<count_t>(outputStrings.size());
+        }
+        m_inputSize = static_cast<count_t>(inputStrings.size());
+    } else if (param == "condition") {
+        add(std::shared_ptr<Condition>(makeCondition(std::string{val}, this)));
+    } else if (iparam == "filter") {
+        auto blk = make_block(std::string{val});
+        if (blk) {
+            if (num >= 0) {
+                blk->locIndex = num;
+            }
+            add(blk.release());
+        } else {
+            throw(InvalidParameterValue(param));
+        }
+    } else if ((iparam == "outputname") || (param == "outputnames") || (param == "outputstring")) {
+        if (num >= 0) {
+            if (std::cmp_greater_equal(num, outputs.size())) {
+                outputStrings.resize(static_cast<size_t>(num) + 1);
+            }
+            outputStrings[num] = gmlc::utilities::stringOps::splitline(val);
+        } else {
+            auto sep = gmlc::utilities::stringOps::splitlineQuotes(val);
+            gmlc::utilities::stringOps::trim(sep);
+
+            for (auto& outputStr : sep) {
+                outputStrings.push_back(gmlc::utilities::stringOps::splitline(outputStr));
+            }
+        }
+        m_outputSize = static_cast<count_t>(outputStrings.size());
+    } else if ((iparam == "output") || (param == "outputs")) {
+        setupOutput(num, std::string{val});
+    } else if ((iparam == "blockinput") || (iparam == "process")) {
+        auto seq = gmlc::utilities::str2vector<int>(std::string{val}, -1, ",: ");
+        if (num >= 0) {
+            if (seq.size() == 2U) {
+                ensureSizeAtLeast(blockInputs, static_cast<size_t>(seq[1]) + 1, -1);
+                blockInputs[seq[1]] = seq[0];
+            } else {
+                throw(InvalidParameterValue(param));
+            }
+        } else {
+            ensureSizeAtLeast(blockInputs, seq.size(), -1);
+            for (index_t kk = 0; std::cmp_less(kk, seq.size()); ++kk) {
+                blockInputs[kk] = seq[kk];
+            }
+        }
+    } else {
+        Relay::set(param, val);
+    }
+}
+
+void Sensor::setupOutput(index_t num, const std::string& outputString)
+{
+    const auto configureOutput = [this](index_t outputIndex, const std::string& outputValue) {
+        auto equalLoc = outputValue.find_first_of('=');
+        const std::string outputSpec =
+            (equalLoc != std::string::npos) ? outputValue.substr(0, equalLoc) : outputValue;
+        std::string sval = (equalLoc != std::string::npos) ? outputValue.substr(equalLoc + 1) : "";
+        ensureSizeAtLeast(outputs, outputIndex + 1, -1);
+        ensureSizeAtLeast(outputStrings, outputIndex + 1);
+        ensureSizeAtLeast(outputMode, outputIndex + 1, OutputMode::BLOCK);
+        ensureSizeAtLeast(outGrabbers, outputIndex + 1);
+        m_outputSize = static_cast<count_t>(outputs.size());
+        if (!sval.empty()) {
+            outputStrings[outputIndex] = {sval};
+        }
+        const auto outputNumber = gmlc::utilities::numeric_conversionComplete<int>(outputSpec, -1);
+        if (outputNumber >= 0) {
+            outputs[outputIndex] = outputNumber;
+            outputMode[outputIndex] = OutputMode::BLOCK;
+        } else {
+            const int keyNum = gmlc::utilities::stringOps::trailingStringInt(outputSpec, sval, 0);
+            if (sval == "input") {
+                outputs[outputIndex] = keyNum;
+                outputMode[outputIndex] = OutputMode::DIRECT;
+            } else if (sval == "block") {
+                outputs[outputIndex] = keyNum;
+                outputMode[outputIndex] = OutputMode::BLOCK;
+            } else if (sval == "blockderiv") {
+                outputs[outputIndex] = keyNum;
+                outputMode[outputIndex] = OutputMode::BLOCK_DERIV;
+            } else {
+                outGrabbers[outputIndex] = std::make_shared<GrabberSet>(outputSpec, this);
+
+                outputMode[outputIndex] = OutputMode::PROCESSED;
+            }
+        }
+    };
+
+    if (num >= 0) {
+        configureOutput(num, outputString);
+    } else {
+        auto sep = gmlc::utilities::stringOps::splitline(outputString);
+        gmlc::utilities::stringOps::trim(sep);
+        auto outputIndex = static_cast<index_t>(outputs.size());
+        for (const auto& outputValue : sep) {
+            configureOutput(outputIndex, outputValue);
+            ++outputIndex;
+        }
+    }
+}
+
+void Sensor::set(std::string_view param, double val, units::unit unitType)
+{
+    std::string iparam;
+    const int num = gmlc::utilities::stringOps::trailingStringInt(param, iparam, -1);
+    if (param == "terminal") {
+        m_terminal = static_cast<int>(val);
+    } else if ((iparam == "blockinput") || (iparam == "process")) {
+        if (num < 0) {
+            blockInputs.push_back(static_cast<int>(val));
+        } else {
+            ensureSizeAtLeast(blockInputs, num + 1, -1);
+            blockInputs[num] = static_cast<int>(val);
+        }
+    } else if (param == "direct") {
+        opFlags.set(DIRECT_IO, (val > 0.1));
+    } else if (iparam == "output") {
+        if (static_cast<int>(val) < 0) {
+            throw(InvalidParameterValue(param));
+        }
+        if (num < 0) {
+            outputs.push_back(static_cast<int>(val));
+        } else {
+            if (std::cmp_less(num, outputs.size())) {
+                outputs[num] = static_cast<int>(val);
+            }
+        }
+    } else {
+        Relay::set(param, val, unitType);
+    }
+}
+
+double Sensor::get(std::string_view param, units::unit unitType) const
+{
+    const index_t ind = lookupOutputIndex(param);
+    if (ind != kNullLocation) {
+        return getOutput(ind);
+    }
+
+    if (param == "terminal") {
+        return static_cast<double>(m_terminal);
+    }
+    return Relay::get(param, unitType);
+}
+
+void Sensor::updateObject(CoreObject* obj, ObjectUpdateMode mode)
+{
+    for (auto& dataSource : dataSources) {
+        if (dataSource) {
+            dataSource->updateObject(obj, mode);
+        }
+    }
+
+    Relay::updateObject(obj, mode);
+}
+
+void Sensor::getObjects(std::vector<CoreObject*>& objects) const
+{
+    for (const auto& dataSource : dataSources) {
+        if (dataSource) {
+            dataSource->getObjects(objects);
+        }
+    }
+
+    Relay::getObjects(objects);
+}
+
+void Sensor::generateInputGrabbers()
+{
+    auto iSize = static_cast<int>(inputStrings.size());
+    ensureSizeAtLeast(dataSources, iSize);
+    for (int ii = 0; ii < iSize; ++ii) {
+        if (inputStrings[ii].empty()) {
+            throw InvalidParameterValue("sensor input expression is empty");
+        }
+        if (inputStrings[ii].front() == '#')  // escape hatch for previously loaded grabbers
+        {
+            continue;
+        }
+        auto istr = inputStrings[ii];
+        if (istr.back() == '_') {
+            istr.pop_back();
+        }
+        if (istr.empty()) {
+            throw InvalidParameterValue("sensor input expression is empty");
+        }
+        auto cloc = istr.find_first_of(':');
+
+        if (cloc == std::string::npos) {  // if there is a colon assume the input is fully specified
+            if ((opFlags[LINK_TYPE_SOURCE]) && (isdigit(istr.back()) == 0)) {
+                if (m_terminal > 0) {
+                    gmlc::utilities::stringOps::appendInteger(istr, m_terminal);
+                }
+            }
+        }
+        CoreObject* targetObj = (m_sourceObject != nullptr) ? m_sourceObject : getParent();
+
+        dataSources[ii] = std::make_shared<GrabberSet>(istr, targetObj, opFlags[SAMPLED_ONLY]);
+    }
+}
+using cm = comms::ControlMessagePayload;
+void Sensor::receiveMessage(std::uint64_t sourceID, std::shared_ptr<CommMessage> message)
+{
+    auto* payload = message->getPayload<cm>();
+
+    double val;
+
+    switch (message->getMessageType()) {
+        case cm::SET:
+            // only local set
+            try {
+                set(gmlc::utilities::convertToLowerCase(payload->m_field),
+                    payload->m_value,
+                    units::unit_cast_from_string(payload->m_units));
+                if (!opFlags[NO_MESSAGE_REPLY])  // unless told not to respond return with the
+                {
+                    auto gres = std::make_shared<CommMessage>(cm::SET_SUCCESS);
+                    assert(gres->getPayload<cm>());
+                    gres->getPayload<cm>()->m_actionID =
+                        (payload->m_actionID > 0) ? payload->m_actionID : instructionCounter;
+                    commLink->transmit(sourceID, gres);
+                }
+            }
+            catch (const std::invalid_argument&) {
+                if (!opFlags[NO_MESSAGE_REPLY])  // unless told not to respond return with the
+                {
+                    auto gres = std::make_shared<CommMessage>(cm::SET_FAIL);
+                    assert(gres->getPayload<cm>());
+                    gres->getPayload<cm>()->m_actionID =
+                        (payload->m_actionID > 0) ? payload->m_actionID : instructionCounter;
+                    commLink->transmit(sourceID, gres);
+                }
+            }
+
+            break;
+        case cm::GET: {
+            val = get(gmlc::utilities::convertToLowerCase(payload->m_field),
+                      units::unit_cast_from_string(payload->m_units));
+            auto reply = std::make_shared<CommMessage>(cm::GET_RESULT);
+            auto* rep = reply->getPayload<cm>();
+            assert(rep);
+            rep->m_field = payload->m_field;
+            rep->m_value = val;
+            rep->m_time = prevTime;
+            commLink->transmit(sourceID, reply);
+
+            break;
+        }
+        case cm::SET_SUCCESS:
+        case cm::SET_FAIL:
+        case cm::GET_RESULT:
+        case cm::SET_SCHEDULED:
+        case cm::GET_SCHEDULED:
+        case cm::CANCEL_FAIL:
+        case cm::CANCEL_SUCCESS:
+        case cm::GET_RESULT_MULTIPLE:
+        case cm::CANCEL:
+            break;
+        case cm::GET_MULTIPLE: {
+            auto reply = std::make_shared<CommMessage>(cm::GET_RESULT_MULTIPLE);
+            auto* rep = reply->getPayload<cm>();
+            if (rep == nullptr) {
+                break;
+            }
+            rep->multiValues.resize(0);
+            rep->multiFields = payload->multiFields;
+            for (const auto& fieldName : payload->multiFields) {
+                val = get(gmlc::utilities::convertToLowerCase(fieldName),
+                          units::unit_cast_from_string(payload->m_units));
+                rep->multiValues.push_back(val);
+            }
+            rep->m_time = prevTime;
+            commLink->transmit(sourceID, reply);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+static const IOdata K_NULL_VEC;
+
+double Sensor::getBlockOutput(const StateData& stateDataValue,
+                              const SolverMode& sMode,
+                              index_t blockNumber) const
+{
+    double ret = kNullVal;
+    if (isLocal(sMode)) {
+        if (isValidIndex(blockNumber, filterBlocks)) {
+            ret = filterBlocks[blockNumber]->getBlockOutput();
+        }
+    } else {
+        if (isValidIndex(blockNumber, filterBlocks)) {
+            ret = filterBlocks[blockNumber]->getBlockOutput(stateDataValue, sMode);
+        }
+    }
+    return ret;
+}
+
+double Sensor::getBlockDerivOutput(const StateData& stateDataValue,
+                                   const SolverMode& sMode,
+                                   index_t blockNumber) const
+{
+    double ret = kNullVal;
+    if (isLocal(sMode)) {
+        if (isValidIndex(blockNumber, filterBlocks)) {
+            ret = filterBlocks[blockNumber]->getBlockDoutDt();
+        }
+    } else {
+        if (isValidIndex(blockNumber, filterBlocks)) {
+            ret = filterBlocks[blockNumber]->getBlockDoutDt(stateDataValue, sMode);
+        }
+    }
+    return ret;
+}
+
+double Sensor::getInput(const StateData& stateDataValue,
+                        const SolverMode& sMode,
+                        index_t inputNumber) const
+{
+    double ret = kNullVal;
+    if (isLocal(sMode)) {
+        if (isValidIndex(inputNumber, dataSources)) {
+            ret = dataSources[inputNumber]->grabData();
+        }
+    } else {
+        if (isValidIndex(inputNumber, dataSources)) {
+            ret = dataSources[inputNumber]->grabData(stateDataValue, sMode);
+        }
+    }
+    return ret;
+}
+
+void Sensor::dynObjectInitializeA(CoreTime time0, std::uint32_t flags)
+{
+    if (dynamic_cast<Link*>(m_sourceObject) != nullptr) {
+        opFlags.set(LINK_TYPE_SOURCE);
+    }
+
+    if (dynamic_cast<Link*>(m_sinkObject) != nullptr) {
+        opFlags.set(LINK_TYPE_SINK);
+    }
+    generateInputGrabbers();
+    // check if we need to go to sampled mode
+    if (opFlags[CONTINUOUS_FLAG]) {
+        for (auto& dataSource : dataSources) {
+            if (dataSource && (!dataSource->stateCapable())) {
+                // TODO(phlpt): Support partially continuous sensors.
+                opFlags.set(CONTINUOUS_FLAG, false);
+                logging::warning(
+                    this,
+                    "not all data sources support continuous operation , reverting to sampled mode");
+                break;
+            }
+        }
+    }
+
+    if (!opFlags[CONTINUOUS_FLAG]) {
+        opFlags.set(SAMPLED_ONLY);
+        for (auto& filterBlock : filterBlocks) {
+            filterBlock->setFlag("SAMPLED_ONLY", true);
+        }
+    }
+
+    Relay::dynObjectInitializeA(time0, flags);
+}
+
+void Sensor::dynObjectInitializeB(const IOdata& inputs,
+                                  const IOdata& /*desiredOutput*/,
+                                  IOdata& fieldSet)
+{
+    if (filterBlocks.empty())  // no filter blocks, use direct output
+    {
+        opFlags.set(DIRECT_IO);
+    }
+    for (size_t kk = 0; kk < filterBlocks.size(); ++kk) {
+        if (blockInputs[kk] < 0) {
+            if (dataSources.size() > kk) {
+                blockInputs[kk] = static_cast<int>(kk);
+            } else if (dataSources.size() == 1) {
+                blockInputs[kk] = 0;
+            } else {
+                logging::warning(this, "unable to uniquely determine filter block input");
+            }
+        }
+    }
+
+    if (outputs.empty()) {
+        if (opFlags[DIRECT_IO]) {
+            for (int kk = 0; std::cmp_less(kk, dataSources.size()); ++kk) {
+                outputs.push_back(kk);
+                outputMode.push_back(OutputMode::DIRECT);
+                outGrabbers.push_back(nullptr);
+            }
+        } else {
+            for (int kk = 0; std::cmp_less(kk, filterBlocks.size()); ++kk) {
+                outputs.push_back(kk);
+                outputMode.push_back(OutputMode::BLOCK);
+                outGrabbers.push_back(nullptr);
+            }
+        }
+    }
+    // do a verification check on the output codes
+    int blkcnt = 0;
+    int ocount = 0;
+    const auto outputCount = m_outputSize;
+    const auto filterBlockCount = static_cast<int>(filterBlocks.size());
+    const auto dataSourceCount = static_cast<int>(dataSources.size());
+    if (outputMode.size() < static_cast<std::size_t>(outputCount) ||
+        outputs.size() < static_cast<std::size_t>(outputCount)) {
+        throw InvalidParameterValue("sensor output names and output sources have different counts");
+    }
+    for (count_t kk = 0; kk < outputCount; ++kk) {
+        switch (outputMode[kk]) {
+            case OutputMode::BLOCK:
+                if (filterBlockCount == 0) {
+                    throw InvalidParameterValue("sensor block output has no filter block");
+                }
+                if ((outputs[kk] < 0) || (outputs[kk] >= filterBlockCount)) {
+                    if (blkcnt < filterBlockCount) {
+                        outputs[kk] = blkcnt;
+                    } else {
+                        outputs[kk] = 0;
+                    }
+                }
+                ++blkcnt;
+                break;
+            case OutputMode::BLOCK_DERIV:
+                if (filterBlockCount == 0) {
+                    throw InvalidParameterValue("sensor derivative output has no filter block");
+                }
+                if ((outputs[kk] < 0) || (outputs[kk] >= filterBlockCount)) {
+                    if (blkcnt < filterBlockCount) {
+                        outputs[kk] = blkcnt;
+                    } else {
+                        outputs[kk] = 0;
+                    }
+                }
+                break;
+            case OutputMode::DIRECT:
+                if (dataSourceCount == 0) {
+                    throw InvalidParameterValue("sensor direct output has no data source");
+                }
+                if ((outputs[kk] < 0) || (outputs[kk] >= dataSourceCount)) {
+                    if (ocount < dataSourceCount) {
+                        outputs[kk] = ocount;
+                    } else {
+                        outputs[kk] = 0;
+                    }
+                }
+                ++ocount;
+                break;
+            case OutputMode::PROCESSED:
+                if (outGrabbers.size() <= static_cast<std::size_t>(kk) ||
+                    outGrabbers[kk] == nullptr) {
+                    throw InvalidParameterValue("sensor processed output has no grabber");
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    // initialization of the blocks
+    const auto filterBlockCountCount = static_cast<count_t>(filterBlocks.size());
+    for (index_t kk = 0; kk < filterBlockCountCount; ++kk) {
+        const double currentValue = getBlockInput(kk, noInputs);
+        filterBlocks[kk]->blockInitialize(currentValue, kNullVal);
+    }
+    m_outputSize = static_cast<index_t>(outputMode.size());
+
+    // generate the output
+    fieldSet = getOutputs(inputs, emptyStateData, cLocalSolverMode);
+}
+
+void Sensor::updateA(CoreTime time)
+{
+    if (time >= m_nextSampleTime) {
+        auto blks = static_cast<index_t>(filterBlocks.size());
+        for (index_t kk = 0; kk < blks; ++kk) {
+            const double inputFB = getBlockInput(kk, noInputs);
+            // make sure the process can be handled in states
+            // printf("%f block %d input=%f\n ", static_cast<double>(time), static_cast<int>(kk),
+            // inputFB);
+            filterBlocks[kk]->step(time, inputFB);
+        }
+    }
+    Relay::updateA(time);
+}
+
+void Sensor::timestep(CoreTime time, const IOdata& inputs, const SolverMode& sMode)
+{
+    auto blks = static_cast<index_t>(filterBlocks.size());
+    for (index_t kk = 0; kk < blks; ++kk) {
+        const double inputFB = getBlockInput(kk, inputs);
+        // make sure the process can be handled in states
+        filterBlocks[kk]->step(time, inputFB);
+    }
+    Relay::timestep(time, inputs, sMode);
+}
+
+void Sensor::jacobianElements(const IOdata& inputs,
+                              const StateData& stateDataValue,
+                              MatrixData<double>& matrixDataValue,
+                              const IOlocs& /*inputLocs*/,
+                              const SolverMode& sMode)
+{
+    if (stateSize(sMode) > 0) {
+        MatrixDataSparse<double> sourceDerivatives;
+        MatrixDataSparse<double> processedDerivatives;
+        auto blks = static_cast<index_t>(filterBlocks.size());
+        for (index_t kk = 0; kk < blks; ++kk) {
+            // TODO(phlpt): This needs some help for performance and organization.
+            const double inputFB = getBlockInput(kk, inputs, stateDataValue, sMode);
+            sourceDerivatives.clear();
+            if (dataSources[blockInputs[kk]]->hasJacobian()) {
+                dataSources[blockInputs[kk]]->outputPartialDerivatives(stateDataValue,
+                                                                       sourceDerivatives,
+                                                                       sMode);
+            }
+
+            // make sure the process can be handled in states
+
+            if (sourceDerivatives.size() == 0) {
+                filterBlocks[kk]->blockJacobianElements(
+                    inputFB, 0, stateDataValue, matrixDataValue, kNullLocation, sMode);
+            } else {
+                filterBlocks[kk]->blockJacobianElements(
+                    inputFB, 0, stateDataValue, processedDerivatives, 0, sMode);
+                processedDerivatives.cascade(sourceDerivatives, 0);
+                matrixDataValue.merge(processedDerivatives);
+            }
+        }
+    }
+}
+
+void Sensor::residual(const IOdata& inputs,
+                      const StateData& stateDataValue,
+                      double resid[],
+                      const SolverMode& sMode)
+{
+    if (stateSize(sMode) > 0) {
+        auto blks = static_cast<index_t>(filterBlocks.size());
+        for (index_t kk = 0; kk < blks; ++kk) {
+            const double inputFB = getBlockInput(kk, inputs, stateDataValue, sMode);
+            // make sure the process can be handled in states
+            // printf("state [4]=%f, state[5]=%f\n", sD.state[4], sD.state[5]);
+            filterBlocks[kk]->blockResidual(inputFB, 0, stateDataValue, resid, sMode);
+        }
+    }
+}
+
+void Sensor::algebraicUpdate(const IOdata& inputs,
+                             const StateData& stateDataValue,
+                             double update[],
+                             const SolverMode& sMode,
+                             double /*alpha*/)
+{
+    if (algSize(sMode) > 0) {
+        auto blks = static_cast<index_t>(filterBlocks.size());
+        for (index_t kk = 0; kk < blks; ++kk) {
+            const double inputFB = getBlockInput(kk, inputs, stateDataValue, sMode);
+            // make sure the process can be handled in states
+            filterBlocks[kk]->blockAlgebraicUpdate(inputFB, stateDataValue, update, sMode);
+        }
+    }
+}
+
+void Sensor::derivative(const IOdata& inputs,
+                        const StateData& stateDataValue,
+                        double deriv[],
+                        const SolverMode& sMode)
+{
+    if (diffSize(sMode) > 0) {
+        auto blks = static_cast<index_t>(filterBlocks.size());
+        for (index_t kk = 0; kk < blks; ++kk) {
+            const double inputFB = getBlockInput(kk, inputs, stateDataValue, sMode);
+            // make sure the process can be handled in states
+            filterBlocks[kk]->blockDerivative(inputFB, 0, stateDataValue, deriv, sMode);
+        }
+    }
+}
+
+double Sensor::getBlockInput(index_t blockNum,
+                             const IOdata& /*inputs*/,
+                             const StateData& stateDataValue,
+                             const SolverMode& sMode) const
+{
+    const double res = dataSources[blockInputs[blockNum]]->grabData(stateDataValue, sMode);
+    return res;
+}
+
+double Sensor::getBlockInput(index_t blockNum, const IOdata& /*inputs*/) const
+{
+    const double res = dataSources[blockInputs[blockNum]]->grabData();
+    return res;
+}
+
+const std::vector<stringVec>& Sensor::outputNames() const
+{
+    if (std::cmp_less(outputStrings.size(), static_cast<size_t>(m_outputSize))) {
+        // TODO(phlpt): Correct this before outputNames is reached.
+        return GridComponent::outputNames();
+    }
+    return outputStrings;
+}
+
+IOdata Sensor::getOutputs(const IOdata& inputs,
+                          const StateData& stateDataValue,
+                          const SolverMode& sMode) const
+{
+    IOdata out(m_outputSize);
+    for (index_t pp = 0; pp < m_outputSize; ++pp) {
+        out[pp] = getOutput(inputs, stateDataValue, sMode, pp);
+    }
+    return out;
+}
+
+double Sensor::getOutput(const IOdata& /*inputs*/,
+                         const StateData& stateDataValue,
+                         const SolverMode& sMode,
+                         index_t outNum) const
+{
+    if (!isValidIndex(outNum, outputMode)) {
+        return kNullVal;
+    }
+    switch (outputMode[outNum]) {
+        case OutputMode::BLOCK:
+            return filterBlocks[outputs[outNum]]->getOutput(noInputs, stateDataValue, sMode);
+        case OutputMode::BLOCK_DERIV:
+            return filterBlocks[outputs[outNum]]->getBlockDoutDt(stateDataValue, sMode);
+        case OutputMode::PROCESSED:
+            return outGrabbers[outNum]->grabData(stateDataValue, sMode);
+        case OutputMode::DIRECT:
+            return dataSources[outputs[outNum]]->grabData(stateDataValue, sMode);
+        default:
+            return kNullVal;
+    }
+}
+
+double Sensor::getOutput(index_t outNum) const
+{
+    double out = kNullVal;
+
+    if (!isValidIndex(outNum, outputMode)) {
+        return out;
+    }
+    switch (outputMode[outNum]) {
+        case OutputMode::BLOCK:
+            out = filterBlocks[outputs[outNum]]->getOutput();
+            break;
+        case OutputMode::BLOCK_DERIV:
+            return filterBlocks[outputs[outNum]]->getBlockDoutDt();
+        case OutputMode::PROCESSED:
+            out = outGrabbers[outNum]->grabData();
+            break;
+        case OutputMode::DIRECT:
+            out = dataSources[outputs[outNum]]->grabData();
+            break;
+        default:
+            break;
+    }
+
+    // printf("sensors %d, output %d val=%f\n", getUserID(),num, out);
+    return out;
+}
+
+index_t Sensor::getOutputLoc(const SolverMode& sMode, index_t outNum) const
+{
+    if (!isValidIndex(outNum, outputMode)) {
+        return kNullLocation;
+    }
+    switch (outputMode[outNum]) {
+        case OutputMode::BLOCK:
+            return filterBlocks[outputs[outNum]]->getOutputLoc(sMode);
+        case OutputMode::PROCESSED:
+        case OutputMode::DIRECT:
+        case OutputMode::BLOCK_DERIV:
+        default:
+            return kNullLocation;
+    }
+}
+
+// TODO(phlpt): Simplify this output-partial-derivatives path.
+void Sensor::outputPartialDerivatives(const IOdata& /*inputs*/,
+                                      const StateData& stateDataValue,
+                                      MatrixData<double>& matrixDataValue,
+                                      const SolverMode& sMode)
+{
+    MatrixDataTranslate<3, double> aDT(matrixDataValue);
+    for (index_t pp = 0; std::cmp_less(pp, outputs.size()); ++pp) {
+        switch (outputMode[pp]) {
+            case OutputMode::BLOCK:
+                aDT.setTranslation(0, pp);
+                filterBlocks[outputs[pp]]->outputPartialDerivatives(noInputs,
+                                                                    stateDataValue,
+                                                                    aDT,
+                                                                    sMode);
+                break;
+            case OutputMode::PROCESSED:
+                if (outGrabbers[pp] && outGrabbers[pp]->hasJacobian()) {
+                    aDT.setTranslation(0, pp);
+                    outGrabbers[pp]->outputPartialDerivatives(stateDataValue, aDT, sMode);
+                }
+                break;
+            case OutputMode::DIRECT:
+                if (dataSources[outputs[pp]] && dataSources[outputs[pp]]->hasJacobian()) {
+                    aDT.setTranslation(0, pp);
+                    dataSources[outputs[pp]]->outputPartialDerivatives(stateDataValue, aDT, sMode);
+                }
+                break;
+            default:
+                // out[pp] = kNullVal;
+                break;
+        }
+    }
+}
+
+void Sensor::rootTest(const IOdata& inputs,
+                      const StateData& stateDataValue,
+                      double roots[],
+                      const SolverMode& sMode)
+{
+    Relay::rootTest(inputs, stateDataValue, roots, sMode);
+    if (stateSize(sMode) > 0) {
+        IOdata localInputs(1);
+
+        auto blks = static_cast<index_t>(filterBlocks.size());
+        for (decltype(blks) kk = 0; kk < blks; ++kk) {
+            localInputs[0] = getBlockInput(kk, inputs, stateDataValue, sMode);
+            // printf("%d root test:%f block %d input=%f\n ", filterBlocks[kk]->getUserID(),
+            // static_cast<double>(sD.time), static_cast<int>(kk), localInputs[0]);  make sure the
+            // process can be handled in states
+            filterBlocks[kk]->rootTest(localInputs, stateDataValue, roots, sMode);
+        }
+    }
+}
+
+void Sensor::rootTrigger(CoreTime time,
+                         const IOdata& inputs,
+                         const std::vector<int>& rootMask,
+                         const SolverMode& sMode)
+{
+    Relay::rootTrigger(time, inputs, rootMask, sMode);
+    if (stateSize(sMode) > 0) {
+        IOdata localInputs(1);
+
+        auto blks = static_cast<index_t>(filterBlocks.size());
+        for (decltype(blks) kk = 0; kk < blks; ++kk) {
+            localInputs[0] = getBlockInput(kk, inputs);
+            // make sure the process can be handled in states
+            // printf("rootTrigger:%f block %d input=%f\n ", static_cast<double>(time),
+            // static_cast<int>(kk), localInputs[0]);
+            filterBlocks[kk]->rootTrigger(time, localInputs, rootMask, sMode);
+        }
+    }
+}
+
+ChangeCode Sensor::rootCheck(const IOdata& inputs,
+                             const StateData& stateDataValue,
+                             const SolverMode& sMode,
+                             CheckLevel level)
+{
+    ChangeCode ret = Relay::rootCheck(inputs, stateDataValue, sMode, level);
+    if (stateSize(sMode) > 0) {
+        IOdata localInputs(1);
+
+        auto blks = static_cast<index_t>(filterBlocks.size());
+        for (decltype(blks) kk = 0; kk < blks; ++kk) {
+            localInputs[0] = getBlockInput(kk, inputs, stateDataValue, sMode);
+            // printf("%d root check:%f block %d input=%f\n ", filterBlocks[kk]->getUserID(),
+            // static_cast<double>(sD.time), static_cast<int>(kk), localInputs[0]);  make sure the
+            // process can be handled in states
+            auto iret = filterBlocks[kk]->rootCheck(localInputs, stateDataValue, sMode, level);
+            ret = std::max(ret, iret);
+        }
+    }
+    return ret;
+}
+}  // namespace griddyn

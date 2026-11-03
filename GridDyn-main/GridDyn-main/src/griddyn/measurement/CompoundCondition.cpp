@@ -1,0 +1,125 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "Condition.h"
+#include "GrabberInterpreter.hpp"
+#include <utility>
+
+namespace griddyn {
+/*
+enum class CompoundMode
+{
+    AND, OR, ANY, XOR, ONE_OF, TWO_OF, THREE_OF
+};
+*/
+double CompoundCondition::evalCondition()
+{
+    return 0.0;
+}
+double CompoundCondition::evalCondition(const StateData& /*sD*/, const SolverMode& /*sMode*/)
+{
+    return 0.0;
+}
+bool CompoundCondition::checkCondition() const
+{
+    unsigned int trueConditionCount = 0;
+    for (const auto& condition : mConditions) {
+        if (condition->checkCondition()) {
+            ++trueConditionCount;
+            if (mBreakTrue) {
+                break;
+            }
+        } else {
+            if (mBreakFalse) {
+                break;
+            }
+        }
+    }
+    return evalCombinations(static_cast<count_t>(trueConditionCount));
+}
+
+bool CompoundCondition::checkCondition(const StateData& stateDataValue,
+                                       const SolverMode& sMode) const
+{
+    unsigned int trueConditionCount = 0;
+    for (const auto& condition : mConditions) {
+        if (condition->checkCondition(stateDataValue, sMode)) {
+            ++trueConditionCount;
+            if (mBreakTrue) {
+                break;
+            }
+        } else {
+            if (mBreakFalse) {
+                break;
+            }
+        }
+    }
+    return evalCombinations(static_cast<count_t>(trueConditionCount));
+}
+
+void CompoundCondition::add(std::shared_ptr<Condition> condition)
+{
+    if (condition) {
+        mConditions.push_back(std::move(condition));
+        return;
+    }
+    throw(AddFailureException());
+}
+
+void CompoundCondition::setMode(CompoundMode newMode)
+{
+    mMode = newMode;
+    switch (mMode) {
+        case CompoundMode::AND:
+            mBreakTrue = false;
+            mBreakFalse = true;
+            break;
+        case CompoundMode::ANY:
+        case CompoundMode::OR:
+        case CompoundMode::NONE:
+            mBreakTrue = true;
+            mBreakFalse = false;
+            break;
+        default:
+            mBreakTrue = false;
+            mBreakFalse = false;
+            break;
+    }
+}
+
+bool CompoundCondition::evalCombinations(count_t trueCount) const
+{
+    switch (mMode) {
+        case CompoundMode::AND:
+        case CompoundMode::ALL:
+        default:
+            return std::cmp_equal(trueCount, mConditions.size());
+        case CompoundMode::ANY:
+        case CompoundMode::OR:
+            return (trueCount > 0);
+        case CompoundMode::ONE_OF:
+            return (trueCount == 1);
+        case CompoundMode::TWO_OF:
+            return (trueCount == 2);
+        case CompoundMode::THREE_OF:
+            return (trueCount == 3);
+        case CompoundMode::TWO_OR_MORE:
+            return (trueCount >= 2);
+        case CompoundMode::THREE_OR_MORE:
+            return (trueCount >= 3);
+        case CompoundMode::XOR:
+        case CompoundMode::ODD:
+            return ((trueCount % count_t{2}) == count_t{1});
+        case CompoundMode::EVEN:
+            return ((trueCount % count_t{2}) == count_t{0});
+        case CompoundMode::EVEN_MIN:
+            return ((trueCount != count_t{0}) && ((trueCount % count_t{2}) == count_t{0}));
+        case CompoundMode::NONE:
+            return (trueCount == count_t{0});
+    }
+}
+
+}  // namespace griddyn

@@ -1,0 +1,544 @@
+/*
+ * Copyright (c) 2014-2026, Lawrence Livermore National Security
+ * See the top-level NOTICE for additional details. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "../paradae/common/MapParam.h"
+#include "../paradae/common/def.h"
+#include "../paradae/equations/EqGridDyn.h"
+#include "../paradae/equations/Equation.h"
+#include "../paradae/math/Vector.h"
+#include "../paradae/math/paradaeArrayData.h"
+#include "../paradae/problems/ODEProblem.h"
+#include "../paradae/timeintegrators/TimeIntegrator.h"
+#include "braidInterface.h"
+#include "braid_driver.h"
+#include "core/CoreObjectTemplates.hpp"
+#include "gmlc/utilities/string_viewConversion.h"
+#include "gmlc/utilities/vectorOps.hpp"
+#include "griddyn/GridDynSimulation.h"
+#include "griddyn/solvers/SolverInterface.h"
+#include "mpi.h"
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <functional>
+#include <iostream>
+#include <limits>
+#include <list>
+#include <memory>
+#include <stdexcept>
+#include <string>
+
+namespace griddyn::braid {
+using griddyn::paradae::BDF;
+using griddyn::paradae::Equation;
+using griddyn::paradae::EquationGridDyn;
+using griddyn::paradae::MapParam;
+using griddyn::paradae::ODE;
+using griddyn::paradae::ODEProblem;
+using griddyn::paradae::PVector;
+using griddyn::paradae::RCODE;
+using griddyn::paradae::Real;
+using griddyn::paradae::SparseMatrix;
+using griddyn::paradae::SVector;
+using griddyn::paradae::TimeIntegrator;
+using std::abort;
+using std::ceil;
+using std::cerr;
+using std::cout;
+using std::endl;
+using std::ifstream;
+using std::list;
+using std::make_unique;
+using std::max;
+using std::memcpy;
+using std::sort;
+using std::string;
+//-------------------------------------------------------------------
+//-------------------------------------------------------------------
+// Functions taken from Matt's paradae/src/programs/rk_braid.cxx
+//-------------------------------------------------------------------
+
+void buildGrid(ODEProblem* ode, const MapParam& param, int& Nsteps, Real*& timegrid)
+{
+    string gridfile = param.GetStrParam("gridfile", "");
+    if (gridfile.empty()) {
+        Real t0 = ode->GetEq()->GetT0();
+        Real Tmax = ode->GetEq()->GetTmax();
+        timegrid = new Real[Nsteps + 1 + ode->GetEq()->GetNSRoots()];
+        timegrid[0] = t0;
+
+        Real dt = (Tmax - t0) / Nsteps;
+        Real t;
+        int idx = 1;
+        bool scheduled_root;
+        int iroot;
+        for (int i = 1; i < Nsteps; i++) {
+            t = t0 + i * dt;
+            scheduled_root = ode->GetEq()->CheckScheduledRoots(timegrid[idx - 1], t, iroot);
+            timegrid[idx] = t;
+            idx++;
+            if (scheduled_root && abs(t - t0 - i * dt) > 1e-12) i--;
+        }
+        Nsteps = idx;
+        timegrid[idx] = Tmax;
+    } else {
+        int refine_by = param.GetIntParam("refine_grid_by", 1);
+        if (!ode->GetTI()->DoBraid()) ode->GetTI()->DoFalseVarstep() = true;
+
+        list<Real> timelist;
+        ifstream infile(gridfile);
+        string line;
+        std::size_t lineNumber = 0;
+        Nsteps = 0;
+        while (getline(infile, line)) {
+            ++lineNumber;
+            Real t = std::numeric_limits<Real>::quiet_NaN();
+            const auto timeValue = gmlc::utilities::string_viewOps::trim(line);
+            try {
+                t = gmlc::utilities::numeric_conversionComplete<Real>(timeValue, t);
+            }
+            catch (const std::out_of_range&) {
+                // Treat out-of-range numeric values like other invalid time-grid entries.
+            }
+            if (!std::isfinite(t)) {
+                cerr << "Error reading the file " << gridfile << " for time grid at line "
+                     << lineNumber << ": expected a finite time value." << endl;
+                abort();
+            }
+            timelist.push_back(t);
+        }
+        Nsteps = timelist.size();
+        int Nfsteps = refine_by * (Nsteps - 1) + 1;
+        if (Nfsteps <= 1) {
+            cerr << "Error reading the file " << gridfile << " for time grid." << endl;
+            abort();
+        }
+        timegrid = new Real[Nfsteps];
+        list<Real>::const_iterator it = timelist.begin();
+        int idx = 0;
+        timegrid[idx] = *it;
+        for (it++; it != timelist.end(); it++) {
+            Real dt = (*it - timegrid[idx]) / refine_by;
+            for (int i = 1; i < refine_by; i++)
+                timegrid[idx + i] = timegrid[idx] + i * dt;
+            timegrid[idx + refine_by] = *it;
+            idx += refine_by;
+        }
+        Nsteps = Nfsteps - 1;
+    }
+}
+
+//-------------------------------------------------------------------
+//-------------------------------------------------------------------
+//-------------------------------------------------------------------
+
+// TODO(phlpt): Confirm whether setting mode.algebraic is sufficient here.
+braidSolver::braidSolver(const std::string& objName): SolverInterface(objName)
+{
+    mode.dynamic = true;
+    mode.differential = true;
+    mode.algebraic = true;
+    flags[BLOCK_MODE_ONLY] = true;
+}
+braidSolver::braidSolver(GridDynSimulation* gds, const SolverMode& sMode):
+    SolverInterface(gds, sMode)
+{
+}
+
+std::unique_ptr<SolverInterface> braidSolver::clone(bool fullCopy) const
+{
+    std::unique_ptr<SolverInterface> si = std::make_unique<braidSolver>();
+    braidSolver::cloneTo(si.get(), fullCopy);
+    return si;
+}
+
+void braidSolver::cloneTo(SolverInterface* si, bool fullCopy) const
+{
+    SolverInterface::cloneTo(si, fullCopy);
+    auto bos = dynamic_cast<braidSolver*>(si);
+    if (bos == nullptr) {
+        return;
+    }
+    bos->deltaT = deltaT;
+}
+
+double* braidSolver::stateData() noexcept
+{
+    return state.data();
+}
+double* braidSolver::derivData() noexcept
+{
+    return deriv.data();
+}
+double* braidSolver::typeData() noexcept
+{
+    return type.data();
+}
+const double* braidSolver::stateData() const noexcept
+{
+    return state.data();
+}
+const double* braidSolver::derivData() const noexcept
+{
+    return deriv.data();
+}
+const double* braidSolver::typeData() const noexcept
+{
+    return type.data();
+}
+
+void braidSolver::allocate(count_t stateCount, count_t numRoots)
+{
+    // load the vectors
+    if (stateCount != svsize) {
+        state.resize(stateCount);
+        deriv.resize(stateCount);
+        state2.resize(stateCount);
+        svsize = stateCount;
+        flags.reset(INITIALIZED_FLAG);
+        flags.set(ALLOCATED_FLAG);
+    }
+    rootCount = numRoots;
+    rootsfound.resize(numRoots);
+}
+
+void braidSolver::initialize(CoreTime t0)
+{
+    if (!flags[ALLOCATED_FLAG]) {
+        throw(InvalidSolverOperation(-2));
+    }
+    flags.set(INITIALIZED_FLAG);
+    solverCallCount = 0;
+    solveTime = t0;
+
+    // USE  EquationGridDyn(t0_,Tmax_,N_unistep_,gds_,y0_);
+    int n = m_gds->stateSize(mode);  // cDaeSolverMode);
+    SVector y0_(n, 0.0), y0p_(n, 0.0);
+
+    // Compute global time domain values
+    double stopTime = static_cast<double>(m_gds->getStopTime());
+    tStart = t0;
+    double dt = static_cast<double>(m_gds->getStepTime());
+    int N_unistep_ = ceil((stopTime - static_cast<double>(tStart)) / dt);
+
+    m_gds->guessState(t0, y0_.GetData(), y0p_.GetData(), mode);  // cDaeSolverMode);
+    // y0_.dump("new_code_init_con.txt");
+    equation = new EquationGridDyn(static_cast<double>(tStart),
+                                   stopTime,
+                                   N_unistep_,
+                                   m_gds,
+                                   y0_,
+                                   &mode,
+                                   discontinuities,
+                                   rootsfound);
+}
+
+double braidSolver::get(std::string_view param) const
+{
+    if (param == "deltat") {
+        return deltaT;
+    } else {
+        return SolverInterface::get(param);
+    }
+}
+void braidSolver::set(std::string_view param, std::string_view val)
+{
+    if ((param == "configfile") || (param == "file") || (param == "config_file")) {
+        configFile = std::string{val};
+    } else if (param == "discontinuities") {
+        discontinuities = gmlc::utilities::str2vector<double>(std::string{val}, 0.0);
+        std::sort(discontinuities.begin(), discontinuities.end(), std::less<>());
+    } else {
+        SolverInterface::set(param, val);
+    }
+}
+void braidSolver::set(std::string_view param, double val)
+{
+    if ((param == "delta") || (param == "deltat") || (param == "step") || (param == "steptime")) {
+        deltaT = val;
+    } else {
+        SolverInterface::set(param, val);
+    }
+}
+
+int braidSolver::runBraid(ODEProblem* ode, MapParam* param, Real*& timegrid, int Ngridpoints)
+{
+    TimeIntegrator* TI = ode->GetTI();
+    Equation* odeEquation = ode->GetEq();
+    BdfStrat bdf_strat = NO_BDF;
+    int lowered_by_level = 1;
+    int min_order = 1;
+
+    Real t0 = odeEquation->GetT0();
+    Real Tmax = odeEquation->GetTmax();
+    int Nsteps = Ngridpoints - 1;
+    int braid_Nsteps = Nsteps;
+    Real udt = (Tmax - t0) / Nsteps;
+
+    ode->SetOutputFile(*param);
+
+    Braid_App* app = new Braid_App(ode);
+    Real* braid_timegrid = timegrid;
+    if (TI->GetType() == BDF) {
+        int toadd = (TI->GetNbSteps() - (Ngridpoints % TI->GetNbSteps())) % TI->GetNbSteps();
+        Tmax += udt * toadd;
+        Nsteps += toadd;
+
+        odeEquation->SetTmax(Tmax);
+        odeEquation->SetNsteps(Nsteps);
+        braid_Nsteps = (Nsteps) / TI->GetNbSteps();
+        if (toadd > 0) {
+            Real* new_timegrid = new Real[Nsteps + 1];
+            memcpy(new_timegrid, timegrid, Ngridpoints * sizeof(Real));
+            for (int i = 0; i < toadd - 1; i++)
+                new_timegrid[Ngridpoints + i] = new_timegrid[Ngridpoints + i - 1] + udt;
+            new_timegrid[Ngridpoints + toadd - 1] = Tmax;
+            delete[] timegrid;
+            timegrid = new_timegrid;
+        }
+        braid_timegrid = new Real[braid_Nsteps + 1];
+        for (int i = 0; i < braid_Nsteps + 1; i++)
+            braid_timegrid[i] = timegrid[i * TI->GetNbSteps()];
+
+        string str_bdf_strat = param->GetStrParam("braid_bdf_strat", "usual-c");
+        if (!strcmp(str_bdf_strat.c_str(), "usual"))
+            bdf_strat = USUAL;
+        else if (!strcmp(str_bdf_strat.c_str(), "usual-c"))
+            bdf_strat = USUAL_C;
+        else if (!strcmp(str_bdf_strat.c_str(), "inject"))
+            bdf_strat = INJECT;
+        else if (!strcmp(str_bdf_strat.c_str(), "inject-c"))
+            bdf_strat = INJECT_C;
+        else if (!strcmp(str_bdf_strat.c_str(), "extrap"))
+            bdf_strat = EXTRAP;
+        else if (!strcmp(str_bdf_strat.c_str(), "extrap-c"))
+            bdf_strat = EXTRAP_C;
+        else if (!strcmp(str_bdf_strat.c_str(), "uni0"))
+            bdf_strat = UNI0;
+        else if (!strcmp(str_bdf_strat.c_str(), "uni0-c"))
+            bdf_strat = UNI0_C;
+        else if (!strcmp(str_bdf_strat.c_str(), "uni1"))
+            bdf_strat = UNI1;
+        else if (!strcmp(str_bdf_strat.c_str(), "uni1-c"))
+            bdf_strat = UNI1_C;
+        else {  // NOLINT
+            cerr << "Wrong bdf strategy" << endl;
+            abort();
+        }
+
+        lowered_by_level = param->GetIntParam("braid_bdf_loweredbylvl", 1);
+        if (lowered_by_level < 0) lowered_by_level = 0;
+
+        min_order = param->GetIntParam("braid_bdf_minorder", 1);
+        if (min_order < 1) min_order = 1;
+        if (min_order > app->nb_multisteps) min_order = app->nb_multisteps;
+
+        /*
+       do_bdf_uniform=param->GetBoolParam("braid_bdf_uniform",false);
+       do_lowerorder=param->GetBoolParam("braid_bdf_lowerorder",true);
+       do_paracoarse=param->GetBoolParam("braid_bdf_paracoarse",false);
+       do_interp=param->GetStrParam("braid_bdf_interp","none");
+       if (do_bdf_uniform)
+       do_interp="none";
+       */
+    }
+    app->nb_initial = Ngridpoints;
+    app->grid_initial = timegrid;
+    app->braid_grid_initial = braid_timegrid;
+    /*
+   app->do_bdf_uniform=do_bdf_uniform;
+   app->do_lowerorder=do_lowerorder;
+   app->do_interp=do_interp;
+   */
+    app->bdf_strat = bdf_strat;
+    app->lowered_by_level = lowered_by_level;
+    app->min_order = min_order;
+
+    braid_Core core;
+    braid_Init(MPI_COMM_WORLD,
+               ode->GetComm(),
+               t0,
+               Tmax,
+               braid_Nsteps,
+               app,
+               braidStep,
+               braidInit,
+               braidClone,
+               braidFree,
+               braidSum,
+               braidSpatialNorm,
+               braidAccess,
+               braidBufSize,
+               braidBufPack,
+               braidBufUnpack,
+               &core);
+    braid_SetTimeGrid(core, braidTimeGrid);
+    braid_SetSpatialRefine(core, braidSpatialRefine);
+    braid_SetSpatialCoarsen(core, braidSpatialCoarsen);
+    // braid_SetShell(core, braidInitShell, braidCloneShell, braidFreeShell, braidPropagateShell);
+    braid_SetShell(core, braidInitShell, braidCloneShell, braidFreeShell);
+
+    // User-specified parameters
+    int cutoff = param->GetIntParam("braid_cutoff", 100000);
+    int max_refinements = param->GetIntParam("braid_max_refinements", 10);
+    int min_coarse = param->GetIntParam("braid_min_coarse", 16);
+    int max_levels = param->GetIntParam("braid_max_lvl", 100);
+    int cfactor = param->GetIntParam("braid_coarsening", 2);
+    int cfactor0 = param->GetIntParam("braid_coarsening0", 2);
+    int max_iter = param->GetIntParam("braid_max_iter", 100);
+    bool fmg = param->GetBoolParam("braid_fmg", true);
+    bool seq_soln = param->GetBoolParam("braid_seqsoln", false);
+    Real tol = param->GetRealParam("braid_tol", 1e-10);
+    int access_lvl = param->GetIntParam("braid_access_lvl", 1);
+    int io_lvl = param->GetIntParam("braid_io_lvl", 1);
+    int skip = param->GetIntParam("braid_skip", 1);
+    braid_SetMaxRefinements(core, max_refinements);
+    braid_SetTPointsCutoff(core, cutoff);
+    braid_SetSeqSoln(core, seq_soln);
+    braid_SetFileIOLevel(core, io_lvl);
+    braid_SetMaxLevels(core, max_levels);
+    braid_SetAbsTol(core, tol);
+    braid_SetCFactor(core, -1, cfactor);
+    braid_SetCFactor(core, 0, cfactor0);
+    braid_SetMinCoarse(core, min_coarse);
+    if (bdf_strat == USUAL || bdf_strat == INJECT || bdf_strat == EXTRAP) {
+        if (lowered_by_level == 0) {
+            cerr << "Wrong lowered_by_level option with this BDF strategy" << endl;
+            abort();
+        }
+        int nblvl = ceil(Real(TI->GetOrder() - min_order) / Real(lowered_by_level));
+        for (int i = 0; i < nblvl; i++)
+            braid_SetCFactor(core, i, 1);
+    } else if (bdf_strat == UNI0 || bdf_strat == UNI1) {
+        braid_SetCFactor(core, 0, 1);
+    }
+    braid_SetMaxIter(core, max_iter);
+    braid_SetAccessLevel(core, access_lvl);
+    braid_SetSkip(core, skip);
+    if (fmg) {
+        braid_SetFMG(core);
+    }
+
+    // Hard-coded parameters
+    int nrelax = 1;
+    int nrelax0 = -1;
+    braid_SetStorage(core, -1);
+    braid_SetPrintLevel(core, 2);
+    braid_SetRefine(core, 1);
+    braid_SetNRelax(core, -1, nrelax);
+    if (nrelax0 > -1) {
+        braid_SetNRelax(core, 0, nrelax0);
+    }
+
+    // Run Braid simulation
+    braid_Drive(core);
+
+    // Last processor owns the solution at t-final. Extract the t-final solution
+    // and broadcast to all other processors
+    MPI_Comm comm = ode->GetComm();
+    int mpi_rank, mpi_size;
+    MPI_Comm_rank(comm, &mpi_rank);
+    MPI_Comm_size(comm, &mpi_size);
+    braid_BufferStatus bstatus = (braid_BufferStatus)core;
+    int bsize = -1;
+    void* buffer;
+    braidBufSize(app, &bsize, bstatus);
+    buffer = malloc(bsize);
+    if (mpi_rank == mpi_size - 1) {
+        braidBufPack(app, app->solution_tfinal, buffer, bstatus);
+    }
+    MPI_Bcast(buffer, bsize, MPI_BYTE, mpi_size - 1, comm);
+    if (mpi_rank < mpi_size - 1) {
+        braidBufUnpack(app, buffer, &(app->solution_tfinal), bstatus);
+    }
+    // Move the data from the app to GridDyn internals
+    double* data = app->solution_tfinal->xprev.GetData();
+    state.insert(state.end(), &data[0], &data[ode->GetEq()->GetM()]);
+    data = app->solution_tfinal->dxprev.GetData();
+    deriv.insert(deriv.end(), &data[0], &data[ode->GetEq()->GetM()]);
+    free(buffer);
+
+    // Clean up
+    braid_Destroy(core);
+    if (TI->GetType() == BDF) delete[] braid_timegrid;
+    delete app;
+
+    return 0;
+}
+
+int braidSolver::solve(CoreTime tStop, CoreTime& tReturn, StepMode /*stepMode*/)
+{
+    int mpi_rank;
+    MPI_Comm comm = MPI_COMM_WORLD;
+    MPI_Comm_rank(comm, &mpi_rank);
+
+    if (solveTime == tStop) {
+        tReturn = tStop;
+        return FUNCTION_EXECUTION_SUCCESS;
+    }
+
+    MapParam param(comm);
+    param.ReadFile(configFile);
+
+    int Nsteps = equation->GetNsteps();
+    ODEProblem ode(comm);
+    ode.SetEquation(equation, tStart, tStop, Nsteps);
+    ode.SetTimeIntegrator(param);
+
+    double* timegrid;
+    ode.GetTI()->DoBraid() = true;
+    buildGrid(&ode, param, Nsteps, timegrid);
+    this->runBraid(&ode, &param, timegrid, Nsteps + 1);
+    delete[] timegrid;
+
+    // Begin diagnostic output on Braid run
+    int loc_nbfuncalls = ode.GetEq()->GetNbFunCalls();
+    int loc_nbjaccalls = ode.GetEq()->GetNbJacCalls();
+    int loc_nbrootcalls = ode.GetEq()->GetNbRootCalls();
+    int loc_nbstepsdone = ode.GetTI()->GetNbStepsDone();
+    int nbfuncalls, nbjaccalls, nbrootcalls, nbstepsdone;
+    MPI_Reduce(&loc_nbfuncalls, &nbfuncalls, 1, MPI_INT, MPI_SUM, 0, comm);
+    MPI_Reduce(&loc_nbjaccalls, &nbjaccalls, 1, MPI_INT, MPI_SUM, 0, comm);
+    MPI_Reduce(&loc_nbrootcalls, &nbrootcalls, 1, MPI_INT, MPI_SUM, 0, comm);
+    MPI_Reduce(&loc_nbstepsdone, &nbstepsdone, 1, MPI_INT, MPI_SUM, 0, comm);
+
+    if (ode.PrintSolution()) {
+        ode.GetOutput()->close();
+    }
+
+    if (mpi_rank == 0) {
+        cout << "Number of steps done : " << nbstepsdone << endl;
+        cout << "Number of fun call   : " << nbfuncalls << endl;
+        cout << "Number of jac call   : " << nbjaccalls << endl;
+        cout << "Number of root call  : " << nbrootcalls << endl;
+    }
+
+    tReturn = tStop;
+    return FUNCTION_EXECUTION_SUCCESS;
+}
+
+int braidSolver::calcIC(CoreTime /*t0*/,
+                        CoreTime /*tstep0*/,
+                        IcModes /*mode*/,
+                        bool /*constraints*/)
+{
+    return 0;
+}
+
+void braidSolver::getRoots()
+{
+    if (equation == nullptr) {
+        return;
+    }
+    const auto& rootData = equation->GetRoots();
+    if (rootData.GetNURoots() != static_cast<int>(rootsfound.size())) {
+        rootsfound.resize(rootData.GetNURoots());
+    }
+    for (int ii = 0; ii < rootData.GetNURoots(); ++ii) {
+        rootsfound[ii] = static_cast<int>(rootData.iroot(rootData.n_sroots + ii));
+    }
+}
+}  // namespace griddyn::braid
