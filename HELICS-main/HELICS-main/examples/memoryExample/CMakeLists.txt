@@ -1,3 +1,0 @@
-add_executable(helicsCppFederate helicsCppFederate.cpp)
-target_link_libraries(helicsCppFederate PUBLIC helics_base)
-target_link_libraries(helicsCppFederate PUBLIC helicsCpp98)
